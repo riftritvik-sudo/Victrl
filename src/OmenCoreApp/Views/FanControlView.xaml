@@ -1,0 +1,95 @@
+<UserControl x:Class="OmenCore.Views.FanControlView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             mc:Ignorable="d"
+             d:DesignHeight="500" d:DesignWidth="1100">
+    <Grid Margin="4">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,18">
+            <TextBlock Text="FAN CONTROL" FontSize="16" FontWeight="Bold"
+                       Foreground="{StaticResource TextPrimaryBrush}"/>
+            <TextBlock Text="Set a direct fan level for your Victus laptop."
+                       FontSize="11" Foreground="{StaticResource TextTertiaryBrush}" Margin="0,4,0,0"/>
+        </StackPanel>
+
+        <Border Grid.Row="1" Style="{StaticResource PremiumPanelCardAnimated}" Padding="20">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <Grid Grid.Row="0" Margin="0,0,0,18">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock Text="DIRECT FAN LEVEL" FontSize="11" FontWeight="Bold"
+                                   Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                        <Border Background="#2026C6DA" CornerRadius="4" Padding="7,3" Margin="10,0,0,0">
+                            <TextBlock Text="{Binding CurrentFanModeName}" FontSize="10" FontWeight="SemiBold"
+                                       Foreground="#26C6DA"/>
+                        </Border>
+                    </StackPanel>
+                    <Button Grid.Column="1" Command="{Binding RestoreOemAutoCommand}"
+                            Style="{StaticResource OutlineButtonSmall}" Padding="10,6"
+                            ToolTip="Return fan control to the laptop firmware"
+                            AutomationProperties.Name="Restore OEM automatic fan control">
+                        <TextBlock Text="Restore OEM Auto" FontSize="10"/>
+                    </Button>
+                </Grid>
+
+                <Grid Grid.Row="1" Margin="0,0,0,16">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0" Width="150" Margin="0,0,18,0" VerticalAlignment="Center">
+                        <TextBlock Text="{Binding ConstantFanPercent, StringFormat='{}{0}% requested'}"
+                                   FontSize="22" FontWeight="Bold" Foreground="#26C6DA"/>
+                        <TextBlock Text="{Binding ConstantFanRpmEstimate, StringFormat='~{0} RPM estimate'}"
+                                   FontSize="10" Foreground="{StaticResource TextTertiaryBrush}" Margin="0,3,0,0"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                        <Slider Minimum="0" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True"
+                                Value="{Binding ConstantFanPercent, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                Style="{StaticResource ModernSlider}"
+                                IsEnabled="{Binding ManualFanControlAvailable}"
+                                ToolTip="Choose the direct fan level"
+                                AutomationProperties.Name="Direct fan level percentage"/>
+                        <Grid Margin="0,5,0,0">
+                            <TextBlock Text="0%" FontSize="10" Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Left"/>
+                            <TextBlock Text="50%" FontSize="10" Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Center"/>
+                            <TextBlock Text="100%" FontSize="10" Foreground="{StaticResource TextTertiaryBrush}" HorizontalAlignment="Right"/>
+                        </Grid>
+                    </StackPanel>
+                    <Button Grid.Column="2" Command="{Binding ApplyConstantSpeedCommand}"
+                            Style="{StaticResource ModernButton}" Height="34" Padding="16,0" Margin="18,0,0,0"
+                            VerticalAlignment="Center" IsEnabled="{Binding ManualFanControlAvailable}"
+                            ToolTip="Apply this direct fan level now"
+                            AutomationProperties.Name="Apply direct fan level">
+                        <TextBlock Text="Apply" FontSize="11"/>
+                    </Button>
+                </Grid>
+
+                <StackPanel Grid.Row="2">
+                    <TextBlock Text="{Binding FanCapabilityBadgeText}" FontSize="10"
+                               Foreground="{StaticResource TextSecondaryBrush}"
+                               TextWrapping="Wrap"/>
+                    <TextBlock Text="{Binding CurveApplyStatus}" FontSize="10"
+                               Foreground="{StaticResource TextSecondaryBrush}"
+                               TextWrapping="Wrap" Margin="0,6,0,0"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</UserControl>

@@ -1,0 +1,2043 @@
+using System.Collections.Concurrent;
+using System.IO.Pipes;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Text;
+using System.Text.Json;
+using LibreHardwareMonitor.Hardware;
+
+namespace OmenCore.HardwareWorker;
+
+/// <summary>
+/// Out-of-process hardware monitoring worker.
+/// Hosts LibreHardwareMonitor in a separate process to isolate crashes (especially NVML).
+/// Communicates with main OmenCore app via named pipes.
+/// 
+/// If this process crashes due to driver issues, the main app continues running
+/// and can restart this worker automatically.
+/// </summary>
+[SupportedOSPlatform("windows")]
+class Program
+{
+    private const string PipeName = "OmenCore_HardwareWorker";
+    private const int UpdateIntervalMs = 500;
+    private const int IdleUpdateIntervalMs = 1500;
+    private const int OrphanIdleUpdateIntervalMs = 3000;
+    private const int DefaultOrphanTimeoutMs = 5 * 60 * 1000; // 5 minutes with no client before self-exit
+    private const string MutexName = "Global\\OmenCore_HardwareWorker_Mutex";
+    
+    private static Computer? _computer;
+    private static OmenCore.Hardware.GpuPowerStateProbe? _gpuSleepProbe;
+    private static readonly object _lock = new();
+    private static HardwareSample _lastSample = new();
+    private static bool _running = true;
+    private static DateTime _lastUpdate = DateTime.MinValue;
+    private static int _parentProcessId = -1;
+    private static readonly Dictionary<string, DateTime> _lastErrorLog = new(); // Rate-limit error logging
+    private static DateTime _lastErrorLogPruneUtc = DateTime.MinValue;
+    private const int ErrorLogPruneIntervalMinutes = 15;
+    private const int ErrorLogRetentionHours = 6;
+    private static bool _hasInitialized = false; // Track if we've done at least one full hardware update cycle
+    
+    // Configurable orphan timeout
+    private static bool _orphanTimeoutEnabled = true;
+    private static int _orphanTimeoutMinutes = 5;
+    
+    // Resilience: worker survives parent exit and waits for new connections
+    private static bool _parentAlive = false;
+    private static DateTime _lastClientActivity = DateTime.Now;
+    private static Mutex? _singleInstanceMutex;
+    
+    // PawnIO fallback for CPU temp when direct monitoring is blocked by security policy.
+    private static PawnIOCpuTemp? _pawnIOCpuTemp;
+    private static bool _pawnIOFallbackActive = false;
+    private static int _consecutiveNullCpuTemp = 0;
+    private const int NullTempThresholdForFallback = 3; // Switch to PawnIO after 3 null readings
+    
+    // v2.8.6: Fallback sensor logging for Intel Core Ultra / Arrow Lake
+    private static bool _cpuTempFallbackLogged = false;
+
+    // Frozen temperature recovery: detect implausible "stuck hot" readings and force re-probe.
+    private static int _consecutiveCpuTempFrozenReads = 0;
+    private static DateTime _lastCpuTempRecoveryAttemptUtc = DateTime.MinValue;
+    private const int FrozenCpuTempTriggerCycles = 120; // ~60s at 500ms active poll
+    private const double FrozenCpuTempThresholdC = 75.0;
+    private const double FrozenCpuLoadMaxPercent = 25.0;
+    private const int FrozenCpuRecoveryCooldownSeconds = 120;
+    
+    // Dead battery protection: disable battery sensor polling to prevent EC timeouts
+    private static bool _batteryMonitoringDisabled = false;
+    private static int _consecutiveZeroBatteryReads = 0;
+    private const int MaxZeroBatteryReadsBeforeDisable = 3;
+
+    // AMD ADL crash containment: if LHM triggers access violations in the AMD GPU path,
+    // quarantine AMD GPU telemetry and keep CPU/fan/memory reporting alive.
+    private static bool _amdGpuTelemetryQuarantined = false;
+    private static string _amdGpuTelemetryQuarantineReason = string.Empty;
+    private static int _amdGpuTelemetryAccessViolationCount = 0;
+
+    // Buffered file logging to avoid high-frequency synchronous disk writes.
+    private static readonly ConcurrentQueue<string> _pendingLogLines = new();
+    private static readonly AutoResetEvent _logSignal = new(false);
+    private static CancellationTokenSource? _logWriterCts;
+    private static Task? _logWriterTask;
+    private static volatile bool _logWriterStarted;
+    private const int LogFlushIntervalMs = 1000;
+    private const int MaxLogBatchLines = 128;
+
+    static async Task Main(string[] args)
+    {
+        // Parse command line arguments
+        // args[0]: parent process ID
+        // args[1]: orphan timeout enabled (bool)
+        // args[2]: orphan timeout minutes (int)
+        if (args.Length > 0 && int.TryParse(args[0], out var ppid))
+        {
+            _parentProcessId = ppid;
+            _parentAlive = true;
+            Console.WriteLine($"Parent process ID: {_parentProcessId}");
+        }
+        
+        if (args.Length > 1 && bool.TryParse(args[1], out var orphanEnabled))
+        {
+            _orphanTimeoutEnabled = orphanEnabled;
+            Console.WriteLine($"Orphan timeout enabled: {_orphanTimeoutEnabled}");
+        }
+        
+        if (args.Length > 2 && int.TryParse(args[2], out var orphanMinutes))
+        {
+            _orphanTimeoutMinutes = Math.Clamp(orphanMinutes, 1, 60);
+            Console.WriteLine($"Orphan timeout minutes: {_orphanTimeoutMinutes}");
+        }
+        
+        // Single-instance check: if another worker is already running, exit quietly
+        try
+        {
+            _singleInstanceMutex = new Mutex(true, MutexName, out var createdNew);
+            if (!createdNew)
+            {
+                Console.WriteLine("Another HardwareWorker is already running. Exiting.");
+                DirectAppendLog($"[{DateTime.Now:O}] Another worker already running (mutex held). Exiting duplicate.\n");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            // Can't acquire mutex — proceed anyway (don't block on mutex issues)
+            Console.WriteLine($"Mutex check failed: {ex.Message}");
+        }
+        
+        // Rotate old log files
+        RotateLogIfNeeded();
+
+        StartLogWriter();
+
+        LogToFile($"[{DateTime.Now:O}] Worker starting. PID={Environment.ProcessId}, ParentPID={_parentProcessId}, OrphanTimeoutEnabled={_orphanTimeoutEnabled}, OrphanTimeoutMinutes={_orphanTimeoutMinutes}\n");
+        
+        // Set up crash handler to log before exit
+        AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+        {
+            var ex = e.ExceptionObject as Exception;
+            DirectAppendLog($"[{DateTime.Now:O}] WORKER CRASH: {ex?.GetType().Name}: {ex?.Message}\n{ex?.StackTrace}\n");
+        };
+
+        Console.WriteLine($"OmenCore Hardware Worker starting... PID={Environment.ProcessId}");
+        
+        try
+        {
+            InitializeHardware();
+            
+            // Start background update thread
+            var updateTask = Task.Run(UpdateLoop);
+            
+            // Start parent process monitor (notifies worker but does NOT exit)
+            var parentMonitorTask = Task.Run(MonitorParentProcess);
+            
+            // Start orphan watchdog (exits if no client connects for 5 minutes after parent dies)
+            var orphanWatchdogTask = Task.Run(OrphanWatchdog);
+            
+            // Run pipe server
+            await RunPipeServer();
+        }
+        catch (Exception ex)
+        {
+            LogToFile($"[{DateTime.Now:O}] WORKER ERROR: {ex}\n");
+            throw;
+        }
+        finally
+        {
+            CleanupHardware();
+            StopLogWriter();
+        }
+    }
+    
+    /// <summary>
+    /// Monitor parent process and exit if it dies (prevents orphaned workers).
+    /// Worker no longer exits when parent dies — it continues running and waits
+    /// for a new OmenCore instance to connect. This eliminates temperature gaps
+    /// across app restarts. The OrphanWatchdog handles cleanup if no client reconnects.
+    /// </summary>
+    private static async Task MonitorParentProcess()
+    {
+        if (_parentProcessId <= 0) return;
+        
+        try
+        {
+            using var parentProcess = System.Diagnostics.Process.GetProcessById(_parentProcessId);
+            
+            // Poll every 2 seconds to check if parent is still alive
+            while (_running && !parentProcess.HasExited)
+            {
+                await Task.Delay(2000);
+            }
+            
+            if (parentProcess.HasExited)
+            {
+                Console.WriteLine($"Parent process {_parentProcessId} exited. Worker continuing — waiting for new connection...");
+                LogToFile($"[{DateTime.Now:O}] Parent process {_parentProcessId} exited. Worker staying alive for reconnection.\n");
+                _parentAlive = false;
+                // Do NOT exit — keep running so the next OmenCore instance can reuse us
+                // The OrphanWatchdog will handle cleanup if no client reconnects
+            }
+        }
+        catch (ArgumentException)
+        {
+            // Parent process doesn't exist (already exited)
+            Console.WriteLine($"Parent process {_parentProcessId} not found. Worker continuing — waiting for new connection...");
+            LogToFile($"[{DateTime.Now:O}] Parent process {_parentProcessId} not found. Worker staying alive for reconnection.\n");
+            _parentAlive = false;
+        }
+        catch (Exception ex)
+        {
+            LogToFile($"[{DateTime.Now:O}] Parent monitor error: {ex.Message}\n");
+        }
+    }
+
+    /// <summary>
+    /// Exits the worker once no client has talked to it for the configured timeout.
+    ///
+    /// The timeout turns on client silence alone, and deliberately not on whether the parent looks
+    /// alive. <see cref="_parentAlive"/> is a guess: it is cleared only by
+    /// <see cref="MonitorParentProcess"/> noticing an exit, and that can miss - the PID can be reused
+    /// by an unrelated long-lived process, or the parent can still be running while hung before it
+    /// ever connects. Either way the flag stays true, and gating the exit on it meant a worker with
+    /// no client ran unbounded.
+    ///
+    /// It is not a hypothetical. On 2026-08-08 a worker outlived its parent by 22 minutes that way,
+    /// polling the discrete GPU twice a second on battery and waking it out of D3 each time, until
+    /// the video watchdog timed out and took the machine down with a 0x116.
+    ///
+    /// Client silence is the signal that actually answers "is anyone using this": a live OmenCore
+    /// polls on its monitoring interval, a second by default, so a five-minute silence is three
+    /// hundred missed polls rather than a slow client.
+    /// </summary>
+    private static async Task OrphanWatchdog()
+    {
+        while (_running)
+        {
+            await Task.Delay(30_000); // Check every 30 seconds
+
+            // Skip timeout check if disabled
+            if (!_orphanTimeoutEnabled) continue;
+
+            var timeSinceActivity = DateTime.Now - _lastClientActivity;
+            var timeoutMs = _orphanTimeoutMinutes * 60 * 1000;
+            if (timeSinceActivity.TotalMilliseconds > timeoutMs)
+            {
+                // Whether the parent still looks alive is worth recording rather than acting on: a
+                // worker exiting here while _parentAlive is true is the case that used to run forever.
+                Console.WriteLine($"No client activity for {timeSinceActivity.TotalMinutes:F1} minutes. Exiting orphaned worker.");
+                LogToFile($"[{DateTime.Now:O}] Orphan timeout: no client for {timeSinceActivity.TotalMinutes:F1} min " +
+                          $"(parent PID {_parentProcessId} {(_parentAlive ? "still looks alive" : "gone")}). Worker exiting.\n");
+                _running = false;
+
+                try { _singleInstanceMutex?.ReleaseMutex(); } catch { }
+                Environment.Exit(0);
+            }
+        }
+    }
+
+    private static string GetLogPath()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var logDir = Path.Combine(localAppData, "OmenCore");
+        Directory.CreateDirectory(logDir);
+        return Path.Combine(logDir, "HardwareWorker.log");
+    }
+
+    private static void StartLogWriter()
+    {
+        if (_logWriterStarted)
+        {
+            return;
+        }
+
+        _logWriterCts = new CancellationTokenSource();
+        _logWriterTask = Task.Run(() => LogWriterLoop(_logWriterCts.Token));
+        _logWriterStarted = true;
+    }
+
+    private static void StopLogWriter()
+    {
+        if (!_logWriterStarted)
+        {
+            return;
+        }
+
+        try
+        {
+            _logWriterCts?.Cancel();
+            _logSignal.Set();
+            _logWriterTask?.Wait(2000);
+        }
+        catch
+        {
+            // Best-effort shutdown only.
+        }
+        finally
+        {
+            FlushPendingLogLines();
+            _logWriterCts?.Dispose();
+            _logWriterCts = null;
+            _logWriterTask = null;
+            _logWriterStarted = false;
+        }
+    }
+
+    private static async Task LogWriterLoop(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            _logSignal.WaitOne(LogFlushIntervalMs);
+            FlushPendingLogLines();
+            await Task.Yield();
+        }
+
+        FlushPendingLogLines();
+    }
+
+    private static void LogToFile(string line)
+    {
+        if (_logWriterStarted)
+        {
+            _pendingLogLines.Enqueue(line);
+            _logSignal.Set();
+            return;
+        }
+
+        DirectAppendLog(line);
+    }
+
+    private static void FlushPendingLogLines()
+    {
+        if (_pendingLogLines.IsEmpty)
+        {
+            return;
+        }
+
+        try
+        {
+            var logPath = GetLogPath();
+            var sb = new StringBuilder();
+            var drained = 0;
+            while (drained < MaxLogBatchLines && _pendingLogLines.TryDequeue(out var line))
+            {
+                sb.Append(line);
+                drained++;
+            }
+
+            if (sb.Length > 0)
+            {
+                File.AppendAllText(logPath, sb.ToString());
+            }
+        }
+        catch
+        {
+            // Never crash worker due to logging failures.
+        }
+    }
+
+    private static void DirectAppendLog(string line)
+    {
+        try
+        {
+            File.AppendAllText(GetLogPath(), line);
+        }
+        catch
+        {
+            // Ignore logging errors.
+        }
+    }
+    
+    /// <summary>
+    /// Rotate log file if it's too large (> 1MB) or too old (> 7 days).
+    /// </summary>
+    private static void RotateLogIfNeeded()
+    {
+        try
+        {
+            var logPath = GetLogPath();
+            if (!File.Exists(logPath)) return;
+            
+            var info = new FileInfo(logPath);
+            var shouldRotate = info.Length > 1024 * 1024 || // > 1MB
+                               info.LastWriteTime < DateTime.Now.AddDays(-7); // > 7 days old
+            
+            if (shouldRotate)
+            {
+                var backupPath = logPath + ".old";
+                if (File.Exists(backupPath))
+                    File.Delete(backupPath);
+                File.Move(logPath, backupPath);
+            }
+        }
+        catch
+        {
+            // Ignore rotation errors
+        }
+    }
+
+    private static void InitializeHardware()
+    {
+        Console.WriteLine("Initializing LibreHardwareMonitor...");
+        
+        _computer = new Computer
+        {
+            IsCpuEnabled = true,
+            IsGpuEnabled = true,
+            IsMemoryEnabled = true,
+            // Storage stays off by default: LibreHardwareMonitor's SMART backend spins up its
+            // own background hot-plug listener thread once storage is enabled, and a
+            // NullReferenceException inside that thread (DiskInfoToolkit.Smart.SmartAttributeHandler
+            // .CheckSmartAttributeCorrect, seen via StorageManager.HandleUnpartitionedDrive on a
+            // plugged-in unpartitioned/raw drive) is unhandled-exception-fatal for the whole worker
+            // process - it takes down live fan/temperature telemetry until the worker respawns, not
+            // just the SSD-temperature reading it was there to provide. Confirmed from a field bundle
+            // on #199. SsdTemperature-based notifications simply won't fire while this is off.
+            IsStorageEnabled = false,
+            IsBatteryEnabled = !_batteryMonitoringDisabled,
+            IsMotherboardEnabled = true
+        };
+        
+        _computer.Open();
+        Console.WriteLine("LibreHardwareMonitor initialized.");
+        QuarantineHybridAmdGpuTelemetryIfNeeded();
+        
+        // Initialize PawnIO fallback for CPU temp when primary sensor path returns null/zero.
+        try
+        {
+            _pawnIOCpuTemp = new PawnIOCpuTemp();
+            if (_pawnIOCpuTemp.IsAvailable)
+            {
+                Console.WriteLine("PawnIO CPU temp fallback available.");
+                LogToFile($"[{DateTime.Now:O}] PawnIO CPU temp fallback initialized for null/zero CPU temp recovery\n");
+            }
+            else
+            {
+                Console.WriteLine("PawnIO not available (primary sensor path only).");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"PawnIO init failed: {ex.Message}");
+            _pawnIOCpuTemp = null;
+        }
+        
+        // Log detected GPUs for diagnostics
+        LogDetectedHardware();
+    }
+
+    private static void QuarantineHybridAmdGpuTelemetryIfNeeded()
+    {
+        try
+        {
+            var hardware = _computer?.Hardware?.ToList();
+            if (hardware == null || hardware.Count == 0)
+            {
+                return;
+            }
+
+            var hasAmdGpu = hardware.Any(h => h.HardwareType == HardwareType.GpuAmd);
+            var hasNvidiaGpu = hardware.Any(h => h.HardwareType == HardwareType.GpuNvidia);
+            if (!hasAmdGpu || !hasNvidiaGpu)
+            {
+                return;
+            }
+
+            ActivateAmdGpuTelemetryQuarantine(
+                "Hybrid AMD+NVIDIA laptop detected; AMD ADL telemetry is disabled to avoid LibreHardwareMonitor ADL frame-metrics access violations");
+        }
+        catch (Exception ex)
+        {
+            LogToFile($"[{DateTime.Now:O}] Failed to evaluate hybrid AMD GPU telemetry quarantine: {ex.Message}\n");
+        }
+    }
+    
+    private static void LogDetectedHardware()
+    {
+        if (_computer?.Hardware == null) return;
+        
+        var logPath = GetLogPath();
+        
+        // Log CPU sensors first (critical for fan control)
+        foreach (var hw in _computer.Hardware)
+        {
+            if (hw.HardwareType == HardwareType.Cpu)
+            {
+                hw.Update();
+                var tempSensors = hw.Sensors.Where(s => s.SensorType == SensorType.Temperature).ToList();
+                var loadSensors = hw.Sensors.Where(s => s.SensorType == SensorType.Load).ToList();
+                var powerSensors = hw.Sensors.Where(s => s.SensorType == SensorType.Power).ToList();
+                
+                Console.WriteLine($"[CPU Detected] {hw.Name}");
+                Console.WriteLine($"  Temp sensors ({tempSensors.Count}): [{string.Join(", ", tempSensors.Select(s => $"{s.Name}={s.Value:F0}°C"))}]");
+                Console.WriteLine($"  Load sensors ({loadSensors.Count}): [{string.Join(", ", loadSensors.Select(s => $"{s.Name}={s.Value:F0}%"))}]");
+                Console.WriteLine($"  Power sensors ({powerSensors.Count}): [{string.Join(", ", powerSensors.Select(s => $"{s.Name}={s.Value:F1}W"))}]");
+                
+                LogToFile($"[{DateTime.Now:O}] [CPU Detected] {hw.Name}\n");
+                LogToFile($"  Temp sensors ({tempSensors.Count}): [{string.Join(", ", tempSensors.Select(s => $"{s.Name}={s.Value:F0}°C"))}]\n");
+                LogToFile($"  Load sensors ({loadSensors.Count}): [{string.Join(", ", loadSensors.Select(s => $"{s.Name}={s.Value:F0}%"))}]\n");
+                LogToFile($"  Power sensors ({powerSensors.Count}): [{string.Join(", ", powerSensors.Select(s => $"{s.Name}={s.Value:F1}W"))}]\n");
+                
+                if (tempSensors.Count == 0)
+                {
+                    LogToFile("  ⚠️ WARNING: No CPU temperature sensors detected!\n");
+                    Console.WriteLine("  ⚠️ WARNING: No CPU temperature sensors detected!");
+                }
+            }
+        }
+        
+        // Log GPU sensors
+        foreach (var hw in _computer.Hardware)
+        {
+            if (hw.HardwareType == HardwareType.GpuNvidia ||
+                hw.HardwareType == HardwareType.GpuAmd ||
+                hw.HardwareType == HardwareType.GpuIntel)
+            {
+                if (_amdGpuTelemetryQuarantined && hw.HardwareType == HardwareType.GpuAmd)
+                {
+                    LogToFile($"[{DateTime.Now:O}] [GPU Detected] AMD telemetry skipped: {hw.Name} ({_amdGpuTelemetryQuarantineReason})\n");
+                    continue;
+                }
+
+                // A diagnostic line is not worth waking a parked dGPU for. This runs from
+                // InitializeHardware, so once every time the worker starts - and the worker is
+                // started by the app, restarted after a resume, and respawned when it is orphaned.
+                // The update loop was taught to leave a D3 dGPU alone; this path was still pulling
+                // it back to D0 behind it.
+                // Renamed by the NVML quiesce: the same question now has a second reason to answer
+                // yes, and a re-open triggered by a restart must not read the card either.
+                if (ShouldSkipNvidiaGpu(hw))
+                {
+                    LogToFile($"[{DateTime.Now:O}] [GPU Detected] NVIDIA: {hw.Name} — parked or restarting, sensors not read\n");
+                    Console.WriteLine($"[GPU Detected] NVIDIA: {hw.Name} (parked or restarting, sensors not read)");
+                    continue;
+                }
+
+                hw.Update();
+                var tempSensors = hw.Sensors.Where(s => s.SensorType == SensorType.Temperature).ToList();
+                var loadSensors = hw.Sensors.Where(s => s.SensorType == SensorType.Load).ToList();
+                var powerSensors = hw.Sensors.Where(s => s.SensorType == SensorType.Power).ToList();
+                
+                var gpuType = hw.HardwareType switch
+                {
+                    HardwareType.GpuNvidia => "NVIDIA",
+                    HardwareType.GpuAmd => "AMD",
+                    HardwareType.GpuIntel => hw.Name.Contains("Arc", StringComparison.OrdinalIgnoreCase) ? "Intel Arc" : "Intel iGPU",
+                    _ => "Unknown"
+                };
+                
+                Console.WriteLine($"[GPU Detected] {gpuType}: {hw.Name}");
+                Console.WriteLine($"  Temp sensors: [{string.Join(", ", tempSensors.Select(s => $"{s.Name}={s.Value:F0}°C"))}]");
+                Console.WriteLine($"  Load sensors: [{string.Join(", ", loadSensors.Select(s => $"{s.Name}={s.Value:F0}%"))}]");
+                Console.WriteLine($"  Power sensors: [{string.Join(", ", powerSensors.Select(s => $"{s.Name}={s.Value:F1}W"))}]");
+                
+                // Also log to file
+                LogToFile($"[{DateTime.Now:O}] [GPU Detected] {gpuType}: {hw.Name}\n");
+                LogToFile($"  Temp sensors: [{string.Join(", ", tempSensors.Select(s => $"{s.Name}={s.Value:F0}°C"))}]\n");
+                LogToFile($"  Load sensors: [{string.Join(", ", loadSensors.Select(s => $"{s.Name}={s.Value:F0}%"))}]\n");
+                LogToFile($"  Power sensors: [{string.Join(", ", powerSensors.Select(s => $"{s.Name}={s.Value:F1}W"))}]\n");
+            }
+        }
+        
+        // Log Memory sensors
+        foreach (var hw in _computer.Hardware)
+        {
+            if (hw.HardwareType == HardwareType.Memory)
+            {
+                hw.Update();
+                var dataSensors = hw.Sensors.Where(s => s.SensorType == SensorType.Data).ToList();
+                
+                Console.WriteLine($"[Memory Detected] {hw.Name}");
+                Console.WriteLine($"  Data sensors ({dataSensors.Count}): [{string.Join(", ", dataSensors.Select(s => $"{s.Name}={s.Value:F0}GB"))}]");
+                
+                // Also log to file
+                LogToFile($"[{DateTime.Now:O}] [Memory Detected] {hw.Name}\n");
+                LogToFile($"  Data sensors ({dataSensors.Count}): [{string.Join(", ", dataSensors.Select(s => $"{s.Name}={s.Value:F0}GB"))}]\n");
+            }
+        }
+    }
+
+    private static void CleanupHardware()
+    {
+        _running = false;
+        try
+        {
+            _computer?.Close();
+        }
+        catch { }
+    }
+
+    private static async Task UpdateLoop()
+    {
+        while (_running)
+        {
+            try
+            {
+                UpdateHardwareReadings();
+            }
+            catch (AccessViolationException ex)
+            {
+                _amdGpuTelemetryAccessViolationCount++;
+                LogToFile($"[{DateTime.Now:O}] ACCESS VIOLATION in worker loop (count={_amdGpuTelemetryAccessViolationCount}): {ex}\n");
+                ActivateAmdGpuTelemetryQuarantine($"Access violation in hardware update loop: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"[{DateTime.Now:O}] Update error: {ex.Message}\n");
+            }
+
+            await Task.Delay(GetAdaptiveUpdateDelayMs());
+        }
+    }
+
+    private static int GetAdaptiveUpdateDelayMs()
+    {
+        var idleSeconds = (DateTime.Now - _lastClientActivity).TotalSeconds;
+
+        // A worker nobody has spoken to in half a minute can poll slower, whatever the parent's
+        // state. This used to require _parentAlive to be false as well, which meant a worker whose
+        // parent-liveness guess was stuck kept polling at the full rate with no client to serve -
+        // and the polling is what wakes a parked dGPU. See OrphanWatchdog for how that ended.
+        if (idleSeconds >= 30)
+        {
+            return OrphanIdleUpdateIntervalMs;
+        }
+
+        // No recent client requests; keep telemetry warm but reduce overhead.
+        if (idleSeconds >= 15)
+        {
+            return IdleUpdateIntervalMs;
+        }
+
+        return UpdateIntervalMs;
+    }
+
+    /// <summary>
+    /// True when the discrete NVIDIA GPU must be left alone this pass — either because it is parked
+    /// in D3 and reading it is what would wake it, or because something is restarting it and the
+    /// NVML handle we hold no longer points at a device.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately free of side effects. It is called from LogDetectedHardware, which runs inside
+    /// InitializeHardware - which is what the reopen calls. A version that set the stale flag would
+    /// re-arm the reopen from inside the reopen.
+    /// </remarks>
+    private static bool ShouldSkipNvidiaGpu(IHardware hardware)
+    {
+        if (hardware.HardwareType != HardwareType.GpuNvidia) return false;
+
+        if (OmenCore.Hardware.GpuRestartGate.IsRestarting) return true;
+
+        _gpuSleepProbe ??= new OmenCore.Hardware.GpuPowerStateProbe(
+            msg => LogToFile($"[{DateTime.Now:O}] {msg}\n"));
+        return _gpuSleepProbe.IsAsleep();
+    }
+
+    /// <summary>
+    /// Set while a GPU restart is in flight, cleared by reopening the <c>Computer</c> once it is over.
+    /// Skipping the device during the restart keeps this process alive; it does not make the cached
+    /// NVML handle valid again, and the next call through it would fault exactly as it would have
+    /// during the restart.
+    /// </summary>
+    private static bool _gpuHandlesStale;
+
+    // Logged once per process. Slot starvation should not happen with two pollers and sixteen slots,
+    // so it is worth saying; saying it on every poll would bury the fact it reports.
+    private static bool _nvmlSlotStarvationLogged;
+
+    private static void ReopenAfterGpuRestartIfNeeded()
+    {
+        if (!_gpuHandlesStale || OmenCore.Hardware.GpuRestartGate.IsRestarting) return;
+        _gpuHandlesStale = false;
+
+        LogToFile($"[{DateTime.Now:O}] dGPU was restarted — reopening LibreHardwareMonitor so NVML re-enumerates it\n");
+
+        try
+        {
+            _computer?.Close();
+        }
+        catch (Exception ex)
+        {
+            LogToFile($"[{DateTime.Now:O}] Close before NVML re-enumeration failed: {ex.Message}\n");
+        }
+
+        try
+        {
+            InitializeHardware();
+        }
+        catch (Exception ex)
+        {
+            LogToFile($"[{DateTime.Now:O}] Reopen after GPU restart failed: {ex.Message}\n");
+        }
+    }
+
+    /// <summary>
+    /// A sleeping dGPU draws no meaningful power and has no die temperature to report. The
+    /// sample is seeded from the previous cycle, so without this the last values measured
+    /// before it slept would be served indefinitely as though they were current.
+    /// </summary>
+    private static void ZeroGpuTelemetry(HardwareSample sample)
+    {
+        sample.GpuTemperature = 0;
+        sample.GpuHotspot = 0;
+        sample.GpuLoad = 0;
+        sample.GpuPower = 0;
+        sample.GpuClock = 0;
+        sample.GpuMemoryClock = 0;
+        sample.GpuVoltage = 0;
+        sample.GpuCurrent = 0;
+        sample.VramUsage = 0;
+    }
+
+    private static void UpdateHardwareReadings()
+    {
+        // Before anything is read, not after: this is what makes the handle valid again.
+        ReopenAfterGpuRestartIfNeeded();
+
+        if (_computer == null) return;
+
+        PruneErrorLogCacheIfNeeded();
+        
+        lock (_lock)
+        {
+            // Track if CPU hardware update succeeded this cycle
+            var previousCpuTemp = _lastSample.CpuTemperature;
+            
+            // Start with last known values to preserve data if some hardware fails
+            var sample = new HardwareSample
+            {
+                CpuTemperature = _lastSample.CpuTemperature,
+                CpuLoad = _lastSample.CpuLoad,
+                CpuPower = _lastSample.CpuPower,
+                GpuName = _lastSample.GpuName,
+                IsAmdGpuTelemetryQuarantined = _amdGpuTelemetryQuarantined,
+                AmdGpuTelemetryQuarantineReason = _amdGpuTelemetryQuarantineReason,
+                GpuTemperature = _lastSample.GpuTemperature,
+                GpuHotspot = _lastSample.GpuHotspot,
+                GpuLoad = _lastSample.GpuLoad,
+                GpuPower = _lastSample.GpuPower,
+                GpuClock = _lastSample.GpuClock,
+                GpuMemoryClock = _lastSample.GpuMemoryClock,
+                GpuVoltage = _lastSample.GpuVoltage,
+                GpuCurrent = _lastSample.GpuCurrent,
+                VramUsage = _lastSample.VramUsage,
+                VramTotal = _lastSample.VramTotal,
+                RamUsage = _lastSample.RamUsage,
+                RamTotal = _lastSample.RamTotal,
+                SsdTemperature = _lastSample.SsdTemperature,
+                BatteryCharge = _lastSample.BatteryCharge,
+                BatteryDischargeRate = _lastSample.BatteryDischargeRate,
+                IsOnAc = _lastSample.IsOnAc,
+                FanSpeeds = new Dictionary<string, double>(_lastSample.FanSpeeds),
+                IsFresh = true,  // Assume fresh until proven otherwise
+                StaleCount = 0
+            };
+            
+            int hardwareUpdated = 0;
+            bool cpuHardwareUpdateSucceeded = false;
+            
+            foreach (var hardware in _computer.Hardware)
+            {
+                try
+                {
+                    if (_amdGpuTelemetryQuarantined && hardware.HardwareType == HardwareType.GpuAmd)
+                    {
+                        // Skip unstable AMD ADL-backed updates after quarantine is activated.
+                        continue;
+                    }
+
+                    if (ShouldSkipNvidiaGpu(hardware))
+                    {
+                        // Leave a parked dGPU parked. LHM reaches it through NVML, which wakes
+                        // the device to answer, so this poll loop would hold it in D0 forever.
+                        // The same skip covers a dGPU being restarted, where the NVML handle is
+                        // stale and calling through it takes the process down.
+                        if (hardware.HardwareType == HardwareType.GpuNvidia &&
+                            OmenCore.Hardware.GpuRestartGate.IsRestarting)
+                        {
+                            // The only place the flag is raised. Recording it here rather than in the
+                            // predicate keeps the predicate callable from inside the reopen it causes.
+                            _gpuHandlesStale = true;
+                        }
+
+                        ZeroGpuTelemetry(sample);
+                        continue;
+                    }
+
+                    // For the NVIDIA GPU, hold a slot in the in-flight semaphore across Update().
+                    // The skip above stops a call being started once a restart is announced; this is
+                    // what makes the restarter wait for a call already running. Only the pair of them
+                    // is a guarantee - see GpuRestartGate.
+                    IDisposable? nvmlLease = null;
+                    if (hardware.HardwareType == HardwareType.GpuNvidia)
+                    {
+                        var access = OmenCore.Hardware.GpuRestartGate.TryEnterNvml(out nvmlLease);
+
+                        if (access == OmenCore.Hardware.NvmlAccess.DeviceRestarting)
+                        {
+                            _gpuHandlesStale = true;
+                            ZeroGpuTelemetry(sample);
+                            continue;
+                        }
+
+                        if (access != OmenCore.Hardware.NvmlAccess.Granted)
+                        {
+                            // Every slot taken. Skip this pass only: the handle is still valid, and
+                            // re-enumerating on the strength of a contended semaphore would wake a
+                            // dGPU that is asleep - permanently, if a slot has been leaked.
+                            if (!_nvmlSlotStarvationLogged)
+                            {
+                                _nvmlSlotStarvationLogged = true;
+                                LogToFile($"[{DateTime.Now:O}] No NVML slot available — skipping GPU updates. " +
+                                          "If this persists, a process died holding one.\n");
+                            }
+
+                            ZeroGpuTelemetry(sample);
+                            continue;
+                        }
+                    }
+
+                    // CRITICAL: Isolate each hardware device update in its own try-catch
+                    // If storage drives go to sleep, their SafeFileHandle gets disposed,
+                    // but we must not let that crash CPU/GPU monitoring
+
+                    // First, try to update the hardware device itself
+                    try
+                    {
+                        hardware.Update();
+                    }
+                    catch (ObjectDisposedException) when (hardware.HardwareType == HardwareType.Storage)
+                    {
+                        // Storage drive went to sleep - this is NORMAL, skip this device
+                        continue;
+                    }
+                    catch (Exception ex) when ((hardware.HardwareType == HardwareType.Storage) &&
+                                               (ex.Message.Contains("disposed", StringComparison.OrdinalIgnoreCase) ||
+                                                ex.Message.Contains("SafeFileHandle", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        // Storage SafeFileHandle disposed - skip this device
+                        continue;
+                    }
+                    finally
+                    {
+                        // Released the moment Update() returns rather than at the end of the device's
+                        // processing: everything after this reads sensor values off the last update
+                        // and does not re-enter NVML, so holding the slot longer would only make the
+                        // restarter wait for work that cannot fault.
+                        nvmlLease?.Dispose();
+                    }
+
+                    // Process the hardware data (CPU, GPU, RAM, etc.)
+                    ProcessHardware(hardware, sample);
+                    ProcessFanSensors(hardware.Sensors, sample);
+                    
+                    // Update sub-hardware (fans, sensors)
+                    foreach (var subHardware in hardware.SubHardware)
+                    {
+                        try
+                        {
+                            subHardware.Update();
+                            ProcessSubHardware(subHardware, sample);
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            // Sub-device went to sleep - skip it
+                            continue;
+                        }
+                        catch (Exception ex) when (ex.Message.Contains("disposed", StringComparison.OrdinalIgnoreCase) ||
+                                                   ex.Message.Contains("SafeFileHandle", StringComparison.OrdinalIgnoreCase))
+                        {
+                            // Sub-device SafeFileHandle disposed - skip it
+                            continue;
+                        }
+                    }
+                    
+                    hardwareUpdated++;
+                    
+                    // Track if CPU hardware update succeeded (not just temp changed)
+                    if (hardware.HardwareType == HardwareType.Cpu)
+                    {
+                        cpuHardwareUpdateSucceeded = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Filter out known benign errors
+                    var isDisposedError = ex is ObjectDisposedException || 
+                                          ex.Message.Contains("disposed", StringComparison.OrdinalIgnoreCase) ||
+                                          ex.Message.Contains("SafeFileHandle", StringComparison.OrdinalIgnoreCase);
+                    
+                    // Only log non-disposed errors, or disposed errors once per hardware per hour
+                    var errorKey = $"{hardware.Name}:{ex.GetType().Name}";
+                    var shouldLog = !isDisposedError;
+                    
+                    if (isDisposedError)
+                    {
+                        // Rate-limit disposed errors (drives going to sleep is normal)
+                        if (!_lastErrorLog.TryGetValue(errorKey, out var lastLog) || 
+                            DateTime.Now - lastLog > TimeSpan.FromHours(1))
+                        {
+                            _lastErrorLog[errorKey] = DateTime.Now;
+                            shouldLog = true;
+                        }
+                    }
+                    
+                    if (shouldLog)
+                    {
+                        LogToFile($"[{DateTime.Now:O}] Error updating {hardware.Name}: {ex.Message}\n");
+                    }
+                    
+                    // CRITICAL: Even if this hardware device failed, continue to next device
+                    // This prevents storage failures from stopping CPU/GPU monitoring
+                }
+            }
+            
+            // Detect stale data - if CPU hardware update failed (not just temp unchanged), mark as stale
+            // Note: Stable temps during idle are NORMAL, don't flag as stale just because temp didn't change
+            if (!cpuHardwareUpdateSucceeded && sample.CpuTemperature > 0)
+            {
+                sample.StaleCount = _lastSample.StaleCount + 1;
+                
+                // If CPU update failed for 20+ cycles (about 30+ seconds), mark as not fresh
+                if (sample.StaleCount >= 20)
+                {
+                    sample.IsFresh = false;
+                    
+                    // Log once when we first detect staleness
+                    if (_lastSample.IsFresh)
+                    {
+                        LogToFile(
+                            $"[{DateTime.Now:O}] ⚠️ CPU hardware update failed for {sample.StaleCount} cycles (temp={sample.CpuTemperature:F1}°C). Reinitializing sensors...\n");
+                        
+                        // Try to reinitialize CPU sensors
+                        try
+                        {
+                            var cpuHw = _computer.Hardware.FirstOrDefault(h => h.HardwareType == HardwareType.Cpu);
+                            if (cpuHw != null)
+                            {
+                                cpuHw.Update();
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            else
+            {
+                // CPU hardware updated successfully - reset stale count even if temp unchanged
+                sample.StaleCount = 0;
+                sample.IsFresh = true;
+            }
+
+            DetectAndRecoverFrozenCpuTemperature(sample, previousCpuTemp, cpuHardwareUpdateSucceeded);
+            
+            sample.Timestamp = DateTime.Now;
+            _lastSample = sample;
+            _lastUpdate = DateTime.Now;
+            
+            // Mark as initialized after first update cycle completes
+            if (!_hasInitialized && sample.CpuTemperature > 0)
+            {
+                _hasInitialized = true;
+                Console.WriteLine("[Worker] Hardware monitoring initialized - first sample complete");
+            }
+        }
+    }
+
+    private static void PruneErrorLogCacheIfNeeded()
+    {
+        var nowUtc = DateTime.UtcNow;
+        if ((nowUtc - _lastErrorLogPruneUtc).TotalMinutes < ErrorLogPruneIntervalMinutes)
+        {
+            return;
+        }
+
+        _lastErrorLogPruneUtc = nowUtc;
+        if (_lastErrorLog.Count == 0)
+        {
+            return;
+        }
+
+        var cutoffUtc = nowUtc.AddHours(-ErrorLogRetentionHours);
+        var staleKeys = _lastErrorLog
+            .Where(kvp => kvp.Value < cutoffUtc)
+            .Select(kvp => kvp.Key)
+            .ToList();
+
+        foreach (var key in staleKeys)
+        {
+            _lastErrorLog.Remove(key);
+        }
+    }
+
+    private static void DetectAndRecoverFrozenCpuTemperature(HardwareSample sample, double previousCpuTemp, bool cpuHardwareUpdateSucceeded)
+    {
+        if (!cpuHardwareUpdateSucceeded || sample.CpuTemperature <= 0)
+        {
+            _consecutiveCpuTempFrozenReads = 0;
+            return;
+        }
+
+        if (Math.Abs(sample.CpuTemperature - previousCpuTemp) < 0.05)
+        {
+            _consecutiveCpuTempFrozenReads++;
+        }
+        else
+        {
+            _consecutiveCpuTempFrozenReads = 0;
+            return;
+        }
+
+        var suspiciouslyHotAndIdle = sample.CpuTemperature >= FrozenCpuTempThresholdC && sample.CpuLoad <= FrozenCpuLoadMaxPercent;
+        if (!suspiciouslyHotAndIdle || _consecutiveCpuTempFrozenReads < FrozenCpuTempTriggerCycles)
+        {
+            return;
+        }
+
+        var nowUtc = DateTime.UtcNow;
+        if ((nowUtc - _lastCpuTempRecoveryAttemptUtc).TotalSeconds < FrozenCpuRecoveryCooldownSeconds)
+        {
+            return;
+        }
+
+        _lastCpuTempRecoveryAttemptUtc = nowUtc;
+        _consecutiveCpuTempFrozenReads = 0;
+
+        LogToFile(
+            $"[{DateTime.Now:O}] ⚠️ Detected frozen CPU temp ({sample.CpuTemperature:F1}°C for prolonged period at {sample.CpuLoad:F1}% load). Forcing sensor recovery.\n");
+
+        // Force next cycles to use null-temp recovery path instead of presenting stale hot readings.
+        sample.IsFresh = false;
+        sample.StaleCount = Math.Max(sample.StaleCount, _lastSample.StaleCount + 1);
+        sample.CpuTemperature = 0;
+        _consecutiveNullCpuTemp = Math.Max(_consecutiveNullCpuTemp, NullTempThresholdForFallback);
+
+        try
+        {
+            var cpuHw = _computer?.Hardware.FirstOrDefault(h => h.HardwareType == HardwareType.Cpu);
+            cpuHw?.Update();
+        }
+        catch
+        {
+            // Ignore recovery update errors; normal loop will continue retrying.
+        }
+    }
+
+    private static void ProcessHardware(IHardware hardware, HardwareSample sample)
+    {
+        switch (hardware.HardwareType)
+        {
+            case HardwareType.Cpu:
+                var cpuLoad = GetSensorValueMulti(hardware, SensorType.Load,
+                    "CPU Total", "Total CPU Usage", "CPU Package", "CPU Package Total", "Total");
+
+                // CPU Temperature - apply model/vendor-aware sensor ranking.
+                // This avoids selecting low individual-core sensors on some Ryzen systems.
+                var cpuTemp = GetBestCpuTemperature(hardware, cpuLoad);
+                
+                // v2.8.6: Safety net for Intel Core Ultra / Arrow Lake CPUs where the
+                // primary sensor returns 0 after initial readings.  When we had a valid
+                // previous temperature but the named search returns 0, sweep ALL temp
+                // sensors and pick the first one with a plausible value (> 5°C).
+                if (cpuTemp <= 0 && _lastSample.CpuTemperature > 5)
+                {
+                    var allTempSensors = hardware.Sensors
+                        .Where(s => s.SensorType == SensorType.Temperature && (s.Value ?? 0) > 5 && (s.Value ?? 0) < 120)
+                        .OrderByDescending(s => s.Value ?? 0)
+                        .ToList();
+                    if (allTempSensors.Count > 0)
+                    {
+                        cpuTemp = allTempSensors[0].Value ?? 0;
+                        // Log only once when fallback first activates
+                        if (!_cpuTempFallbackLogged)
+                        {
+                            _cpuTempFallbackLogged = true;
+                            LogToFile(
+                                $"[{DateTime.Now:O}] ⚠️ CPU temp named-sensor returned 0 (prev={_lastSample.CpuTemperature:F1}°C). " +
+                                $"Using fallback sensor '{allTempSensors[0].Name}'={cpuTemp:F1}°C " +
+                                $"(available: {string.Join(", ", allTempSensors.Select(s => $"{s.Name}={s.Value:F0}°C"))})\n");
+                        }
+                    }
+                }
+                
+                // PawnIO fallback: if the primary CPU sensor path returns 0 repeatedly,
+                // try reading CPU temp via PawnIO MSR instead
+                if (cpuTemp <= 0 && _pawnIOCpuTemp != null && _pawnIOCpuTemp.IsAvailable)
+                {
+                    _consecutiveNullCpuTemp++;
+                    
+                    if (_consecutiveNullCpuTemp >= NullTempThresholdForFallback)
+                    {
+                        if (!_pawnIOFallbackActive)
+                        {
+                            _pawnIOFallbackActive = true;
+                            LogToFile(
+                                $"[{DateTime.Now:O}] ⚠️ LibreHardwareMonitor CPU temp null for {_consecutiveNullCpuTemp} readings. " +
+                                $"Switching to PawnIO fallback for resilient CPU temperature reads.\n");
+                            Console.WriteLine("Switching to PawnIO CPU temp fallback");
+                        }
+                        
+                        try
+                        {
+                            cpuTemp = _pawnIOCpuTemp.ReadCpuTemperature();
+                            if (cpuTemp > 0)
+                            {
+                                Console.WriteLine($"CPU Temp (PawnIO): {cpuTemp}°C");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            // Rate-limit PawnIO error logging
+                            var errorKey = "PawnIO_CpuTemp";
+                            if (!_lastErrorLog.TryGetValue(errorKey, out var lastLog) || 
+                                DateTime.Now - lastLog > TimeSpan.FromMinutes(5))
+                            {
+                                _lastErrorLog[errorKey] = DateTime.Now;
+                                LogToFile($"[{DateTime.Now:O}] PawnIO CPU temp read failed: {ex.Message}\n");
+                            }
+                        }
+                    }
+                }
+                else if (cpuTemp > 0)
+                {
+                    // LibreHardwareMonitor working again - reset fallback state
+                    if (_pawnIOFallbackActive)
+                    {
+                        _pawnIOFallbackActive = false;
+                        LogToFile(
+                            $"[{DateTime.Now:O}] ✓ LibreHardwareMonitor CPU temp restored. Disabling PawnIO fallback.\n");
+                    }
+                    _consecutiveNullCpuTemp = 0;
+                }
+                
+                // Always update temperature, even if 0 (indicates sensor failure/unavailable)
+                // This prevents stuck readings when sensors become temporarily unavailable
+                sample.CpuTemperature = cpuTemp;
+
+                // Always assign load - 0 is a valid idle reading
+                sample.CpuLoad = cpuLoad;
+                
+                var cpuPower = GetSensorValueMulti(hardware, SensorType.Power, 
+                    "CPU Package", "Package Power");
+                if (cpuPower > 0) sample.CpuPower = cpuPower;
+                
+                // Collect CPU core clocks
+                var coreClocks = hardware.Sensors
+                    .Where(s => s.SensorType == SensorType.Clock && 
+                           (s.Name.StartsWith("CPU Core #") || s.Name.StartsWith("Core #")))
+                    .Select(s => (double)(s.Value ?? 0))
+                    .Where(v => v > 0)
+                    .ToList();
+                if (coreClocks.Count > 0)
+                {
+                    sample.CpuCoreClocks = coreClocks;
+                }
+                break;
+                
+            case HardwareType.GpuNvidia:
+            case HardwareType.GpuAmd:
+                if (_amdGpuTelemetryQuarantined && hardware.HardwareType == HardwareType.GpuAmd)
+                {
+                    if (string.IsNullOrWhiteSpace(sample.GpuName))
+                    {
+                        sample.GpuName = "AMD GPU telemetry disabled (ADL quarantine)";
+                    }
+                    break;
+                }
+
+                // GPU Temperature - prefer Core over Hotspot (more stable)
+                var gpuTemp = GetSensorValueMulti(hardware, SensorType.Temperature, 
+                    "GPU Core", "Core");
+                // Always update temperature, even if 0 (indicates sensor failure/unavailable)
+                sample.GpuTemperature = gpuTemp;
+                
+                var gpuHotspot = GetSensorValueMulti(hardware, SensorType.Temperature, 
+                    "GPU Hot Spot", "Hot Spot");
+                // Always update hotspot, even if 0
+                sample.GpuHotspot = gpuHotspot;
+                
+                var gpuLoad = GetSensorValueMulti(hardware, SensorType.Load,
+                    "GPU Core", "D3D 3D", "3D", "GPU", "Graphics", "Compute");
+                // Always assign load - 0 is a valid idle reading
+                sample.GpuLoad = gpuLoad;
+                
+                var gpuPower = GetSensorValueMulti(hardware, SensorType.Power, "GPU Power");
+                if (gpuPower > 0) sample.GpuPower = gpuPower;
+                
+                var gpuVoltage = GetSensorValueMulti(hardware, SensorType.Voltage, "GPU Core");
+                if (gpuVoltage > 0) sample.GpuVoltage = gpuVoltage;
+                
+                var gpuCurrent = GetSensorValueMulti(hardware, SensorType.Current, "GPU Core");
+                if (gpuCurrent > 0) sample.GpuCurrent = gpuCurrent;
+                
+                var gpuClock = GetSensorValue(hardware, SensorType.Clock, "GPU Core");
+                if (gpuClock > 0) sample.GpuClock = gpuClock;
+                
+                var gpuMemClock = GetSensorValue(hardware, SensorType.Clock, "GPU Memory");
+                if (gpuMemClock > 0) sample.GpuMemoryClock = gpuMemClock;
+                
+                var vramUsed = GetSensorValueMulti(hardware, SensorType.SmallData, 
+                    "GPU Memory Used", "D3D Dedicated Memory Used");
+                if (vramUsed > 0) sample.VramUsage = vramUsed;
+                
+                var vramTotal = GetSensorValue(hardware, SensorType.SmallData, "GPU Memory Total");
+                if (vramTotal > 0) sample.VramTotal = vramTotal;
+                
+                sample.GpuName = hardware.Name;
+                break;
+                
+            case HardwareType.GpuIntel:
+                // Intel Arc (dedicated) or integrated
+                bool isArc = hardware.Name.Contains("Arc", StringComparison.OrdinalIgnoreCase);
+                
+                // Only override if Arc or no dedicated GPU found
+                if (isArc || sample.GpuTemperature == 0)
+                {
+                    var intelTemp = GetSensorValueMulti(hardware, SensorType.Temperature, 
+                        "GPU Core", "GPU Package", "GPU");
+                    // Always update temperature, even if 0
+                    sample.GpuTemperature = intelTemp;
+                    
+                    if (isArc || string.IsNullOrEmpty(sample.GpuName))
+                        sample.GpuName = hardware.Name;
+                }
+                
+                if (isArc || sample.GpuLoad == 0)
+                {
+                    var intelLoad = GetSensorValueMulti(hardware, SensorType.Load, "GPU Core", "D3D 3D");
+                    if (intelLoad > 0) sample.GpuLoad = intelLoad;
+                }
+                
+                // Intel Arc power and clock metrics
+                if (isArc)
+                {
+                    var arcPower = GetSensorValueMulti(hardware, SensorType.Power, 
+                        "GPU Power", "GPU Package");
+                    if (arcPower > 0) sample.GpuPower = arcPower;
+                    
+                    var arcClock = GetSensorValue(hardware, SensorType.Clock, "GPU Core");
+                    if (arcClock > 0) sample.GpuClock = arcClock;
+                    
+                    var arcMemClock = GetSensorValue(hardware, SensorType.Clock, "GPU Memory");
+                    if (arcMemClock > 0) sample.GpuMemoryClock = arcMemClock;
+                }
+                break;
+                
+            case HardwareType.Memory:
+                var ramUsed = GetSensorValue(hardware, SensorType.Data, "Memory Used");
+                var ramAvail = GetSensorValue(hardware, SensorType.Data, "Memory Available");
+                
+                // LibreHardwareMonitor sometimes returns garbage values (e.g. 16MB instead of 16GB)
+                // Use WMI fallback if values are unreasonable (< 1GB total is clearly wrong)
+                var sensorTotal = ramUsed + ramAvail;
+                if (sensorTotal >= 1.0) // At least 1 GB - seems valid
+                {
+                    sample.RamUsage = ramUsed;
+                    sample.RamTotal = sensorTotal;
+                }
+                
+                // Always use WMI if sensor data is missing or unreasonable
+                if (sample.RamTotal < 1.0)
+                {
+                    var (wmiTotal, wmiUsed) = GetRamFromWmi();
+                    if (wmiTotal > 0)
+                    {
+                        sample.RamTotal = wmiTotal;
+                        sample.RamUsage = wmiUsed > 0 ? wmiUsed : wmiTotal * 0.5; // Estimate 50% if usage unknown
+                    }
+                }
+                break;
+                
+            case HardwareType.Storage:
+                if (hardware.Name.Contains("NVMe") || hardware.Name.Contains("SSD"))
+                {
+                    var ssdTemp = GetSensorValue(hardware, SensorType.Temperature);
+                    if (ssdTemp > 0 && sample.SsdTemperature == 0) sample.SsdTemperature = ssdTemp;
+                }
+                break;
+                
+            case HardwareType.Battery:
+                if (_batteryMonitoringDisabled)
+                {
+                    sample.BatteryCharge = 100;
+                    sample.BatteryDischargeRate = 0;
+                    sample.IsOnAc = true;
+                    break;
+                }
+                
+                var charge = GetSensorValueMulti(hardware, SensorType.Level, "Charge Level");
+                if (charge > 0) sample.BatteryCharge = charge;
+                
+                var discharge = GetSensorValueMulti(hardware, SensorType.Power, "Discharge Rate");
+                sample.BatteryDischargeRate = discharge;
+                sample.IsOnAc = discharge <= 0;
+                
+                // Dead battery auto-detection: if charge is 0% while on AC for 3+ consecutive reads, disable
+                if (charge <= 0 && discharge <= 0)
+                {
+                    _consecutiveZeroBatteryReads++;
+                    if (_consecutiveZeroBatteryReads >= MaxZeroBatteryReadsBeforeDisable)
+                    {
+                        _batteryMonitoringDisabled = true;
+                        sample.BatteryCharge = 100;
+                        sample.IsOnAc = true;
+                        Console.WriteLine("Dead battery detected (0% on AC for 3+ reads) — disabling battery polling to prevent EC timeouts");
+                        LogToFile($"[{DateTime.Now:O}] Dead battery auto-detected — battery monitoring disabled\n");
+                    }
+                }
+                else
+                {
+                    _consecutiveZeroBatteryReads = 0;
+                }
+                break;
+        }
+    }
+
+    private static void ActivateAmdGpuTelemetryQuarantine(string reason)
+    {
+        if (_amdGpuTelemetryQuarantined)
+        {
+            return;
+        }
+
+        bool hasAmdGpu = false;
+        try
+        {
+            hasAmdGpu = _computer?.Hardware?.Any(h => h.HardwareType == HardwareType.GpuAmd) == true;
+        }
+        catch
+        {
+            hasAmdGpu = false;
+        }
+
+        if (!hasAmdGpu)
+        {
+            return;
+        }
+
+        _amdGpuTelemetryQuarantined = true;
+        _amdGpuTelemetryQuarantineReason = reason;
+        var message = $"[{DateTime.Now:O}] AMD GPU telemetry quarantined after instability: {reason}. " +
+                      "CPU/fan/memory telemetry continues; AMD GPU metrics are skipped until worker restart.";
+        Console.WriteLine(message);
+        LogToFile(message + "\n");
+    }
+
+    private static void ProcessSubHardware(IHardware subHardware, HardwareSample sample)
+    {
+        // Fan RPM from EC/motherboard
+        ProcessFanSensors(subHardware.Sensors, sample);
+    }
+
+    private static void ProcessFanSensors(IEnumerable<ISensor> sensors, HardwareSample sample)
+    {
+        foreach (var sensor in sensors.Where(s => s.SensorType == SensorType.Fan))
+        {
+            if (sensor.Value.HasValue && sensor.Value.Value > 0)
+            {
+                sample.FanSpeeds[sensor.Name] = sensor.Value.Value;
+            }
+        }
+    }
+
+    private static double GetSensorValue(IHardware hardware, SensorType type, string? name = null)
+    {
+        ISensor? sensor;
+        if (name != null)
+        {
+            sensor = hardware.Sensors.FirstOrDefault(s => s.SensorType == type && s.Name.Contains(name, StringComparison.OrdinalIgnoreCase));
+        }
+        else
+        {
+            sensor = hardware.Sensors.FirstOrDefault(s => s.SensorType == type);
+        }
+        
+        return sensor?.Value ?? 0;
+    }
+    
+    /// <summary>
+    /// Get sensor value, trying multiple name patterns
+    /// </summary>
+    private static double GetSensorValueMulti(IHardware hardware, SensorType type, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            var sensor = hardware.Sensors.FirstOrDefault(s => s.SensorType == type && s.Name.Contains(name, StringComparison.OrdinalIgnoreCase));
+            if (sensor != null)
+            {
+                return sensor.Value ?? 0;  // Return actual value even if 0
+            }
+        }
+        // Fallback to any sensor of this type
+        var fallback = hardware.Sensors.FirstOrDefault(s => s.SensorType == type);
+        return fallback?.Value ?? 0;
+    }
+
+    private static double GetBestCpuTemperature(IHardware hardware, double cpuLoad)
+    {
+        var tempSensors = hardware.Sensors
+            .Where(s => s.SensorType == SensorType.Temperature && s.Value.HasValue)
+            .Select(s => new { Sensor = s, Value = (double)s.Value!.Value })
+            .Where(s => s.Value > 0 && s.Value < 120)
+            .ToList();
+
+        if (tempSensors.Count == 0)
+        {
+            return 0;
+        }
+
+        var isAmdCpu = hardware.Name.Contains("AMD", StringComparison.OrdinalIgnoreCase) ||
+                       hardware.Name.Contains("Ryzen", StringComparison.OrdinalIgnoreCase);
+
+        // Preferred stable sources first (Intel and AMD package-level sensors).
+        // "IA Cores" covers Intel Core Ultra (Meteor/Arrow Lake) P-core cluster temperature in LHM.
+        var preferredByName = GetSensorValueMulti(hardware, SensorType.Temperature,
+            "CPU Package", "Package", "CPU DTS", "IA Cores",
+            "Core (Tctl/Tdie)", "CPU (Tctl/Tdie)", "Tctl/Tdie",
+            "Tctl", "Tdie", "CCDs Max", "CCDs Average", "Core Max", "Core Average");
+
+        if (!isAmdCpu)
+        {
+            if (preferredByName > 0)
+            {
+                return preferredByName;
+            }
+
+            // Fallback: prefer any sensor whose name hints at a package or cluster aggregate
+            // rather than taking Max() over individual cores, which can surface transient
+            // single-core spikes (e.g. 105 °C for one poll interval at game launch).
+            var packageHintFallback = tempSensors
+                .Where(s => s.Sensor.Name.Contains("Package", StringComparison.OrdinalIgnoreCase) ||
+                            s.Sensor.Name.Contains("Core Max", StringComparison.OrdinalIgnoreCase) ||
+                            s.Sensor.Name.Contains("IA Cores", StringComparison.OrdinalIgnoreCase))
+                .Select(s => s.Value)
+                .DefaultIfEmpty(0)
+                .Max();
+
+            return packageHintFallback > 0 ? packageHintFallback : tempSensors.Max(s => s.Value);
+        }
+
+        var amdAggregateCandidates = tempSensors
+            .Where(s =>
+                s.Sensor.Name.Contains("Tctl", StringComparison.OrdinalIgnoreCase) ||
+                s.Sensor.Name.Contains("Tdie", StringComparison.OrdinalIgnoreCase) ||
+                s.Sensor.Name.Contains("Package", StringComparison.OrdinalIgnoreCase) ||
+                s.Sensor.Name.Contains("CCD", StringComparison.OrdinalIgnoreCase) ||
+                s.Sensor.Name.Contains("Core Max", StringComparison.OrdinalIgnoreCase) ||
+                s.Sensor.Name.Contains("Average", StringComparison.OrdinalIgnoreCase))
+            .Select(s => s.Value)
+            .ToList();
+
+        var amdCandidate = amdAggregateCandidates.Count > 0
+            ? amdAggregateCandidates.Max()
+            : (preferredByName > 0 ? preferredByName : tempSensors.Max(s => s.Value));
+
+        // Guardrail: if selected temp is implausibly low while load is meaningful,
+        // prefer the hottest aggregate/CCD-like candidate.
+        if (cpuLoad >= 20.0 && amdCandidate < 45.0)
+        {
+            var hottest = tempSensors.Max(s => s.Value);
+            if (hottest - amdCandidate >= 10.0)
+            {
+                return hottest;
+            }
+        }
+
+        return amdCandidate;
+    }
+
+    /// <summary>
+    /// Get RAM information directly from WMI when LibreHardwareMonitor sensors unavailable.
+    /// This fixes the "0/0 GB" RAM display issue on some systems.
+    /// </summary>
+    private static (double TotalGb, double UsedGb) GetRamFromWmi()
+    {
+        try
+        {
+            double totalGb = 0;
+            double freeGb = 0;
+            
+            // Get total RAM from Win32_ComputerSystem
+            using (var searcher = new System.Management.ManagementObjectSearcher(
+                "SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"))
+            {
+                foreach (System.Management.ManagementObject obj in searcher.Get())
+                {
+                    var bytes = Convert.ToUInt64(obj["TotalPhysicalMemory"]);
+                    totalGb = bytes / 1024.0 / 1024.0 / 1024.0;
+                    break;
+                }
+            }
+            
+            // Get free RAM from Win32_OperatingSystem
+            using (var searcher = new System.Management.ManagementObjectSearcher(
+                "SELECT FreePhysicalMemory FROM Win32_OperatingSystem"))
+            {
+                foreach (System.Management.ManagementObject obj in searcher.Get())
+                {
+                    var freeKb = Convert.ToUInt64(obj["FreePhysicalMemory"]);
+                    freeGb = freeKb / 1024.0 / 1024.0;
+                    break;
+                }
+            }
+            
+            double usedGb = totalGb > 0 ? totalGb - freeGb : 0;
+            return (totalGb, usedGb);
+        }
+        catch
+        {
+            return (16, 8); // Default assumption: 16 GB total, 8 GB used
+        }
+    }
+
+    private static async Task RunPipeServer()
+    {
+        Console.WriteLine($"Starting named pipe server: {PipeName}");
+        
+        while (_running)
+        {
+            try
+            {
+                // CurrentUserOnly restricts the pipe to the current user session for security (audit_1 critical #2)
+                using var server = new NamedPipeServerStream(
+                    PipeName,
+                    PipeDirection.InOut,
+                    1,
+                    PipeTransmissionMode.Message,
+                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+                
+                Console.WriteLine("Waiting for client connection...");
+                await server.WaitForConnectionAsync();
+                Console.WriteLine("Client connected.");
+
+                // To the file, not just the console, because the console goes nowhere. Whether a
+                // client ever connected is the question that separates "the app is using this
+                // worker" from "this worker is running for nobody", and on 2026-08-08 it was the
+                // question the logs could not answer.
+                var connectedAt = DateTime.Now;
+                LogToFile($"[{connectedAt:O}] Client connected (parent PID {_parentProcessId}).\n");
+                _lastClientActivity = connectedAt;
+
+                await HandleClient(server);
+
+                // Client disconnected — update activity timestamp
+                // so orphan watchdog starts counting from NOW, not from last request
+                _lastClientActivity = DateTime.Now;
+                LogToFile($"[{DateTime.Now:O}] Client session ended after " +
+                          $"{(DateTime.Now - connectedAt).TotalSeconds:F0}s. Waiting for next connection.\n");
+                Console.WriteLine("Client session ended. Waiting for next connection...");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Pipe error: {ex.Message}");
+                await Task.Delay(1000);
+            }
+        }
+    }
+
+    private static async Task HandleClient(NamedPipeServerStream server)
+    {
+        var buffer = new byte[4096];
+        
+        try
+        {
+            while (server.IsConnected && _running)
+            {
+                // Read request
+                var bytesRead = await server.ReadAsync(buffer, 0, buffer.Length);
+                if (bytesRead == 0) break;
+                
+                var request = Encoding.UTF8.GetString(buffer, 0, bytesRead).Trim();
+                _lastClientActivity = DateTime.Now;
+                
+                string response;
+                if (request == "PING")
+                {
+                    response = "PONG";
+                }
+                else if (request == "GET")
+                {
+                    lock (_lock)
+                    {
+                        // Mark sample as stale if we haven't initialized yet (first update not complete)
+                        if (!_hasInitialized)
+                        {
+                            _lastSample.IsFresh = false;
+                            _lastSample.StaleCount = 999;  // High stale count to signal "not initialized"
+                        }
+                        response = JsonSerializer.Serialize(_lastSample);
+                    }
+                }
+                else if (request.StartsWith("SET_PARENT ", StringComparison.Ordinal))
+                {
+                    // New OmenCore instance registering as parent
+                    var pidStr = request.Substring("SET_PARENT ".Length).Trim();
+                    if (int.TryParse(pidStr, out var newPid) && newPid > 0)
+                    {
+                        var oldPid = _parentProcessId;
+                        if (oldPid == newPid && _parentAlive)
+                        {
+                            response = "OK";
+                        }
+                        else
+                        {
+                        _parentProcessId = newPid;
+                        _parentAlive = true;
+                        
+                        Console.WriteLine($"New parent registered: PID {newPid} (was {oldPid})");
+                        LogToFile($"[{DateTime.Now:O}] New parent registered: PID {newPid} (was {oldPid}). Worker reattached.\n");
+                        
+                        // Start monitoring new parent in background
+                        _ = Task.Run(MonitorParentProcess);
+                        
+                        response = "OK";
+                        }
+                    }
+                    else
+                    {
+                        response = "ERROR:INVALID_PID";
+                    }
+                }
+                else if (request == "SHUTDOWN")
+                {
+                    response = "OK";
+                    _running = false;
+                    // Logged because the log is the only way to tell a requested exit from a
+                    // parent that simply died — and those two get very different treatment
+                    // (see MonitorParentProcess).
+                    Console.WriteLine("SHUTDOWN received. Worker exiting.");
+                    LogToFile($"[{DateTime.Now:O}] SHUTDOWN received from client. Worker exiting.\n");
+                }
+                else if (request == "DISABLE_BATTERY")
+                {
+                    _batteryMonitoringDisabled = true;
+                    Console.WriteLine("Battery monitoring disabled by client (dead/removed battery).");
+                    LogToFile($"[{DateTime.Now:O}] Battery monitoring disabled by client command\n");
+                    response = "OK";
+                }
+                else
+                {
+                    response = "UNKNOWN";
+                }
+                
+                // Send response
+                var responseBytes = Encoding.UTF8.GetBytes(response);
+                await server.WriteAsync(responseBytes, 0, responseBytes.Length);
+                await server.FlushAsync();
+            }
+        }
+        catch (IOException)
+        {
+            // Client disconnected
+            Console.WriteLine("Client disconnected.");
+        }
+    }
+}
+
+/// <summary>
+/// Visitor pattern for LibreHardwareMonitor updates
+/// </summary>
+internal class UpdateVisitor : IVisitor
+{
+    public void VisitComputer(IComputer computer) => computer.Traverse(this);
+    public void VisitHardware(IHardware hardware)
+    {
+        try
+        {
+            hardware.Update();
+            foreach (var sub in hardware.SubHardware)
+                sub.Accept(this);
+        }
+        catch (ObjectDisposedException)
+        {
+            // Hardware went to sleep (storage drives) - skip this hardware
+        }
+        catch (Exception ex) when (ex.Message.Contains("disposed", StringComparison.OrdinalIgnoreCase) ||
+                                    ex.Message.Contains("SafeFileHandle", StringComparison.OrdinalIgnoreCase))
+        {
+            // Also catch nested disposed errors from storage drives
+        }
+    }
+    public void VisitSensor(ISensor sensor) { }
+    public void VisitParameter(IParameter parameter) { }
+}
+
+/// <summary>
+/// Hardware sample data transferred via IPC
+/// </summary>
+public class HardwareSample
+{
+    public DateTime Timestamp { get; set; }
+    
+    /// <summary>
+    /// Indicates if the sample contains fresh data from hardware sensors.
+    /// False if sensors could not be read (stale data from last successful read).
+    /// </summary>
+    public bool IsFresh { get; set; } = true;
+    
+    /// <summary>
+    /// Number of consecutive stale readings (for client-side staleness detection)
+    /// </summary>
+    public int StaleCount { get; set; } = 0;
+    
+    // CPU
+    public double CpuTemperature { get; set; }
+    public double CpuLoad { get; set; }
+    public double CpuPower { get; set; }
+    public List<double> CpuCoreClocks { get; set; } = new();
+    
+    // GPU
+    public string GpuName { get; set; } = "";
+    public bool IsAmdGpuTelemetryQuarantined { get; set; }
+    public string AmdGpuTelemetryQuarantineReason { get; set; } = "";
+    public double GpuTemperature { get; set; }
+    public double GpuHotspot { get; set; }
+    public double GpuLoad { get; set; }
+    public double GpuPower { get; set; }
+    public double GpuClock { get; set; }
+    public double GpuMemoryClock { get; set; }
+    public double GpuVoltage { get; set; }
+    public double GpuCurrent { get; set; }
+    public double VramUsage { get; set; }
+    public double VramTotal { get; set; }
+    
+    // Memory
+    public double RamUsage { get; set; }
+    public double RamTotal { get; set; }
+    
+    // Storage
+    public double SsdTemperature { get; set; }
+    
+    // Battery
+    public double BatteryCharge { get; set; }
+    public double BatteryDischargeRate { get; set; }
+    public bool IsOnAc { get; set; } = true;
+    
+    // Fans (name -> RPM)
+    public Dictionary<string, double> FanSpeeds { get; set; } = new();
+}
+
+/// <summary>
+/// PawnIO-based CPU temperature reader as fallback when the primary sensor path fails.
+/// PawnIO is a signed driver that works with Secure Boot and Defender.
+/// </summary>
+[SupportedOSPlatform("windows")]
+public sealed class PawnIOCpuTemp : IDisposable
+{
+    private IntPtr _handle = IntPtr.Zero;
+    private IntPtr _pawnIOLib = IntPtr.Zero;
+    private bool _moduleLoaded;
+    private bool _disposed;
+    private int _tjMax = 100; // Default TjMax, will try to detect actual value
+    
+    // MSR addresses
+    private const uint MSR_IA32_THERM_STATUS = 0x19C;      // Per-core temperature
+    private const uint MSR_IA32_TEMPERATURE_TARGET = 0x1A2; // TjMax
+    private const uint MSR_IA32_PACKAGE_THERM_STATUS = 0x1B1; // Package temperature (Intel only)
+    
+    // Embedded IntelMSR module binary
+    private static byte[]? _intelMsrModule;
+    
+    // Function delegates
+    private delegate int PawnioOpen(out IntPtr handle);
+    private delegate int PawnioLoad(IntPtr handle, byte[] blob, IntPtr size);
+    private delegate int PawnioExecute(IntPtr handle, string name, ulong[] input, IntPtr inSize, ulong[] output, IntPtr outSize, out IntPtr returnSize);
+    private delegate int PawnioClose(IntPtr handle);
+    
+    private PawnioOpen? _pawnioOpen;
+    private PawnioLoad? _pawnioLoad;
+    private PawnioExecute? _pawnioExecute;
+    private PawnioClose? _pawnioClose;
+    
+    public bool IsAvailable => _handle != IntPtr.Zero && _moduleLoaded;
+    
+    public PawnIOCpuTemp()
+    {
+        Initialize();
+    }
+    
+    private bool Initialize()
+    {
+        try
+        {
+            // Try bundled PawnIOLib.dll first (in drivers folder next to exe)
+            string appDir = AppDomain.CurrentDomain.BaseDirectory;
+            string bundledLibPath = Path.Combine(appDir, "drivers", "PawnIOLib.dll");
+            string? libPath = null;
+            
+            if (File.Exists(bundledLibPath))
+            {
+                libPath = bundledLibPath;
+            }
+            else
+            {
+                // Fall back to PawnIO installation
+                string? pawnIOPath = FindPawnIOInstallation();
+                if (pawnIOPath != null)
+                {
+                    string installedLibPath = Path.Combine(pawnIOPath, "PawnIOLib.dll");
+                    if (File.Exists(installedLibPath))
+                    {
+                        libPath = installedLibPath;
+                    }
+                }
+            }
+            
+            if (libPath == null) return false;
+            
+            _pawnIOLib = NativeMethods.LoadLibrary(libPath);
+            if (_pawnIOLib == IntPtr.Zero) return false;
+            
+            // Resolve functions
+            if (!ResolveFunctions()) return false;
+            
+            // Open PawnIO handle
+            int hr = _pawnioOpen!(out _handle);
+            if (hr < 0 || _handle == IntPtr.Zero) return false;
+            
+            // Load IntelMSR module
+            if (!LoadMsrModule())
+            {
+                _pawnioClose!(_handle);
+                _handle = IntPtr.Zero;
+                return false;
+            }
+            
+            _moduleLoaded = true;
+            
+            // Try to detect TjMax
+            try
+            {
+                _tjMax = ReadTjMax();
+            }
+            catch
+            {
+                _tjMax = 100; // Default for most Intel CPUs
+            }
+            
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+    
+    private string? FindPawnIOInstallation()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO");
+            if (key != null)
+            {
+                string? installLocation = key.GetValue("InstallLocation") as string;
+                if (!string.IsNullOrEmpty(installLocation) && Directory.Exists(installLocation))
+                {
+                    return installLocation;
+                }
+            }
+        }
+        catch { }
+        
+        string defaultPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "PawnIO");
+        if (Directory.Exists(defaultPath)) return defaultPath;
+        
+        return null;
+    }
+    
+    private bool ResolveFunctions()
+    {
+        IntPtr openPtr = NativeMethods.GetProcAddress(_pawnIOLib, "pawnio_open");
+        IntPtr loadPtr = NativeMethods.GetProcAddress(_pawnIOLib, "pawnio_load");
+        IntPtr executePtr = NativeMethods.GetProcAddress(_pawnIOLib, "pawnio_execute");
+        IntPtr closePtr = NativeMethods.GetProcAddress(_pawnIOLib, "pawnio_close");
+        
+        if (openPtr == IntPtr.Zero || loadPtr == IntPtr.Zero || 
+            executePtr == IntPtr.Zero || closePtr == IntPtr.Zero)
+        {
+            return false;
+        }
+        
+        _pawnioOpen = Marshal.GetDelegateForFunctionPointer<PawnioOpen>(openPtr);
+        _pawnioLoad = Marshal.GetDelegateForFunctionPointer<PawnioLoad>(loadPtr);
+        _pawnioExecute = Marshal.GetDelegateForFunctionPointer<PawnioExecute>(executePtr);
+        _pawnioClose = Marshal.GetDelegateForFunctionPointer<PawnioClose>(closePtr);
+        
+        return true;
+    }
+    
+    private bool LoadMsrModule()
+    {
+        try
+        {
+            string appDir = AppDomain.CurrentDomain.BaseDirectory;
+            string[] moduleNames = { "IntelMSR.bin", "IntelMSR.amx" };
+            
+            foreach (var moduleName in moduleNames)
+            {
+                string modulePath = Path.Combine(appDir, "drivers", moduleName);
+                if (File.Exists(modulePath))
+                {
+                    _intelMsrModule = File.ReadAllBytes(modulePath);
+                    break;
+                }
+            }
+            
+            if (_intelMsrModule == null || _intelMsrModule.Length == 0)
+            {
+                string? pawnIOPath = FindPawnIOInstallation();
+                if (pawnIOPath != null)
+                {
+                    foreach (var moduleName in moduleNames)
+                    {
+                        string installedModule = Path.Combine(pawnIOPath, "modules", moduleName);
+                        if (File.Exists(installedModule))
+                        {
+                            _intelMsrModule = File.ReadAllBytes(installedModule);
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if (_intelMsrModule == null || _intelMsrModule.Length == 0) return false;
+            
+            int hr = _pawnioLoad!(_handle, _intelMsrModule, (IntPtr)_intelMsrModule.Length);
+            return hr >= 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+    
+    /// <summary>
+    /// Read CPU temperature using MSR 0x19C (IA32_THERM_STATUS) or 0x1B1 (Package).
+    /// Returns temperature in Celsius.
+    /// </summary>
+    public double ReadCpuTemperature()
+    {
+        if (!IsAvailable) return 0;
+        
+        try
+        {
+            // Try package temperature first (MSR 0x1B1) - more stable than per-core
+            ulong pkgTherm = ReadMsr(MSR_IA32_PACKAGE_THERM_STATUS);
+            
+            // Check if reading is valid (bit 31 = Reading Valid)
+            if ((pkgTherm & 0x80000000) != 0)
+            {
+                // Digital Readout is bits 22:16 (7 bits)
+                int digitalReadout = (int)((pkgTherm >> 16) & 0x7F);
+                double temp = _tjMax - digitalReadout;
+                if (temp > 0 && temp < 150) return temp;
+            }
+            
+            // Fallback to core 0 temperature (MSR 0x19C)
+            ulong thermStatus = ReadMsr(MSR_IA32_THERM_STATUS);
+            
+            // Check if reading is valid (bit 31 = Reading Valid)
+            if ((thermStatus & 0x80000000) != 0)
+            {
+                // Digital Readout is bits 22:16 (7 bits)
+                int digitalReadout = (int)((thermStatus >> 16) & 0x7F);
+                double temp = _tjMax - digitalReadout;
+                if (temp > 0 && temp < 150) return temp;
+            }
+            
+            return 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+    
+    /// <summary>
+    /// Read TjMax from MSR 0x1A2 (IA32_TEMPERATURE_TARGET).
+    /// TjMax is the maximum junction temperature - actual temp = TjMax - digital readout.
+    /// </summary>
+    private int ReadTjMax()
+    {
+        try
+        {
+            ulong value = ReadMsr(MSR_IA32_TEMPERATURE_TARGET);
+            // TjMax is in bits 23:16
+            int tjMax = (int)((value >> 16) & 0xFF);
+            if (tjMax > 50 && tjMax < 150) return tjMax;
+        }
+        catch { }
+        
+        return 100; // Default for most Intel CPUs
+    }
+    
+    private ulong ReadMsr(uint index)
+    {
+        ulong[] input = { index };
+        ulong[] output = new ulong[2]; // low, high
+        
+        int hr = _pawnioExecute!(_handle, "ioctl_msr_read", input, (IntPtr)1, output, (IntPtr)2, out IntPtr returnSize);
+        if (hr < 0)
+        {
+            throw new InvalidOperationException($"PawnIO MSR read failed: HRESULT 0x{hr:X8}");
+        }
+        
+        return output[0] | (output[1] << 32);
+    }
+    
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        
+        if (_handle != IntPtr.Zero && _pawnioClose != null)
+        {
+            try { _pawnioClose(_handle); } catch { }
+            _handle = IntPtr.Zero;
+        }
+        
+        if (_pawnIOLib != IntPtr.Zero)
+        {
+            try { NativeMethods.FreeLibrary(_pawnIOLib); } catch { }
+            _pawnIOLib = IntPtr.Zero;
+        }
+    }
+}
+
+/// <summary>
+/// Native methods for PawnIO library loading
+/// </summary>
+internal static class NativeMethods
+{
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr LoadLibrary(string lpFileName);
+    
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool FreeLibrary(IntPtr hModule);
+    
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
+    public static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+}

@@ -1,0 +1,160 @@
+﻿param(
+    [string]$Configuration = "Release",
+    [string]$Runtime = "win-x64",
+    [switch]$SingleFile
+)
+
+$ErrorActionPreference = "Stop"
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $root
+$publishRoot = Join-Path $root "publish"
+$publishDir = Join-Path $publishRoot "$Runtime-build"
+$artifactsDir = Join-Path $root "artifacts"
+$versionFile = Join-Path $root "VERSION.txt"
+
+if (-not (Test-Path $versionFile)) {
+    throw "VERSION.txt not found."
+}
+
+$version = (Get-Content $versionFile | Select-Object -First 1).Trim()
+if ([string]::IsNullOrWhiteSpace($version)) {
+    throw "VERSION.txt must contain a semantic version string."
+}
+
+# Build assembly version (major.minor.patch.0) for embedding in Windows PE headers
+$versionParts = (($version -split '-')[0]) -split '\.'
+$assemblyVersion = "$($versionParts[0]).$($versionParts[1]).$($versionParts[2]).0"
+
+Write-Host "Building OmenCore $version ($Configuration/$Runtime)" -ForegroundColor Cyan
+
+# Linux packaging is handled by build-linux-package.ps1 so this script remains Windows-only.
+if ($Runtime -like "linux*") {
+    throw "Linux packaging is handled by build-linux-package.ps1. Use that script for linux runtimes."
+}
+
+# Use a dedicated staging folder so locked leftovers in publish\win-x64 do not block packaging.
+if (Test-Path $publishDir) { Remove-Item $publishDir -Recurse -Force }
+if (-not (Test-Path $publishRoot)) { New-Item $publishRoot -ItemType Directory | Out-Null }
+if (-not (Test-Path $artifactsDir)) { New-Item $artifactsDir -ItemType Directory | Out-Null }
+
+$appProject = "src/OmenCoreApp/OmenCoreApp.csproj"
+
+$publishArgs = @(
+    $appProject,
+    "--configuration", $Configuration,
+    "-r", $Runtime,
+    "--self-contained", "true",
+    "-p:PublishTrimmed=false",
+    "-p:IncludeNativeLibrariesForSelfExtract=true",
+    "-p:EnableCompressionInSingleFile=true",
+    "-p:PublishSingleFile=true",
+    "-p:IncludeAllContentForSelfExtract=true",
+    "-p:Version=$version",
+    "-p:AssemblyVersion=$assemblyVersion",
+    "-p:FileVersion=$assemblyVersion",
+    "-o", $publishDir
+)
+
+# SingleFile is now always enabled for proper .NET embedding
+Write-Host "Building self-contained single-file executable with embedded .NET runtime..." -ForegroundColor Yellow
+
+& dotnet publish @publishArgs
+if ($LASTEXITCODE -ne 0) {
+    throw "App publish failed with exit code $LASTEXITCODE"
+}
+
+# Build and publish the hardware worker (out-of-process monitoring for crash isolation)
+Write-Host "Building hardware worker process..." -ForegroundColor Yellow
+$workerPublishArgs = @(
+    "src/OmenCore.HardwareWorker/OmenCore.HardwareWorker.csproj",
+    "--configuration", $Configuration,
+    "-r", $Runtime,
+    "--self-contained", "true",
+    "-p:PublishTrimmed=false",
+    "-p:PublishSingleFile=true",
+    "-p:Version=$version",
+    "-p:AssemblyVersion=$assemblyVersion",
+    "-p:FileVersion=$assemblyVersion",
+    "-o", $publishDir
+)
+& dotnet publish @workerPublishArgs
+if ($LASTEXITCODE -ne 0) {
+    throw "Hardware worker publish failed with exit code $LASTEXITCODE"
+}
+Write-Host "Hardware worker built successfully" -ForegroundColor Green
+
+$zipPath = Join-Path $artifactsDir "OmenCore-$version-$Runtime.zip"
+if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+Compress-Archive -Path (Join-Path $publishDir '*') -DestinationPath $zipPath
+Write-Host "Created $zipPath" -ForegroundColor Green
+
+# Written next to the artifact so CI can upload it as a release asset and the release job can
+# read it back into the published release notes. This is the fix for #194: release notes had
+# been hand-copied from a separate LOCAL build-script run, which produces different bytes (and
+# therefore a different hash) than the artifact CI actually publishes. Hashing the exact file
+# this script just produced - the same file CI uploads - keeps the two in sync by construction.
+function Write-Sha256Sidecar {
+    param([string]$FilePath)
+    $hash = (Get-FileHash $FilePath -Algorithm SHA256).Hash
+    Set-Content -Path "$FilePath.sha256" -Value "$hash  $([IO.Path]::GetFileName($FilePath))" -NoNewline
+    Write-Host "SHA256 ($([IO.Path]::GetFileName($FilePath))): $hash" -ForegroundColor Green
+    return $hash
+}
+
+Write-Sha256Sidecar -FilePath $zipPath | Out-Null
+
+# Resolve Inno Setup CLI to a plain path string. Get-Command returns an
+# ApplicationInfo (has .Source, no .FullName) when iscc is found on PATH
+# (e.g. via `choco install innosetup` on CI runners), but Get-Item returns
+# a FileInfo (has .FullName, no .Source) for the hardcoded-path fallback
+# below — using .FullName unconditionally silently resolved to $null on
+# CI and broke `& $null ...` with a cryptic "not a valid command" error.
+$isccCommand = Get-Command iscc -ErrorAction SilentlyContinue
+$isccPath = $null
+if ($isccCommand) {
+    $isccPath = $isccCommand.Source
+} else {
+    $defaultPaths = @(
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
+        "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe",
+        "${env:ProgramFiles}\Inno Setup 7\ISCC.exe",
+        "${env:LOCALAPPDATA}\Programs\Inno Setup 6\ISCC.exe",
+        "${env:LOCALAPPDATA}\Programs\Inno Setup 7\ISCC.exe",
+        "C:\InnoSetup\ISCC.exe"
+    )
+    foreach ($candidate in $defaultPaths) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        if (Test-Path $candidate) {
+            $isccPath = $candidate
+            break
+        }
+    }
+}
+
+if (-not $isccPath) {
+    throw "Inno Setup (iscc) not found. Install Inno Setup 6 to build the installer."
+}
+
+$pawnIoInstaller = Join-Path $root "installer\PawnIO_setup.exe"
+if (-not (Test-Path $pawnIoInstaller)) {
+    throw "PawnIO_setup.exe not found in installer\. Release installers must bundle PawnIO so users do not need an external runtime download."
+}
+
+$installer = Join-Path $artifactsDir "OmenCoreSetup-$version.exe"
+if (Test-Path $installer) { Remove-Item $installer -Force }
+& $isccPath "installer/OmenCoreInstaller.iss" "/DMyAppVersion=$version" "/DMyPublishDir=$publishDir"
+if ($LASTEXITCODE -ne 0) {
+    throw "Inno Setup compile failed with exit code $LASTEXITCODE"
+}
+$generated = Join-Path $artifactsDir "OmenCoreSetup-$version.exe"
+if (-not (Test-Path $generated)) {
+    throw "Inno Setup compiler did not produce the expected output at $generated"
+}
+
+if (-not (Test-Path $installer)) {
+    throw "Failed to create installer at $installer"
+}
+
+Write-Host "Created installer $installer" -ForegroundColor Green
+Write-Sha256Sidecar -FilePath $installer | Out-Null

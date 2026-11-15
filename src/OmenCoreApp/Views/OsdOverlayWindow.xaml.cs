@@ -1,0 +1,1137 @@
+using System;
+using System.ComponentModel;
+using System.Net.NetworkInformation;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Threading;
+using OmenCore.Hardware;
+using OmenCore.Models;
+using OmenCore.Services;
+using OmenCore.Services.Diagnostics;
+using OmenCore.Utils;
+
+namespace OmenCore.Views
+{
+    /// <summary>
+    /// In-game OSD overlay window. Shows system stats in a transparent overlay.
+    /// 
+    /// Key features:
+    /// - Master disable toggle (no process when disabled)
+    /// - Click-through (doesn't interfere with games)
+    /// - Configurable position and metrics
+    /// - Auto-hides when fullscreen apps detected (optional)
+    /// </summary>
+    public partial class OsdOverlayWindow : Window, INotifyPropertyChanged
+    {
+        // Win32 for click-through window
+        private const int GWL_EXSTYLE = -20;
+        private const int WS_EX_TRANSPARENT = 0x00000020;
+        private const int WS_EX_TOOLWINDOW = 0x00000080;
+        private const uint MONITOR_DEFAULTTOPRIMARY = 0x00000001;
+        private const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
+        private static readonly IntPtr HWND_TOPMOST = new(-1);
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOACTIVATE = 0x0010;
+        private const string OsdStatsTimerRegistryName = "OsdOverlayStatsRefresh";
+        private const string OsdNetworkTimerRegistryName = "OsdOverlayNetworkRefresh";
+        private const int OsdStatsTimerIntervalMs = 1000;
+        private const int OsdNetworkTimerIntervalMs = 5000;
+        private static readonly Brush FpsGoodBrush = CreateFrozenBrush(0, 255, 136);
+        private static readonly Brush FpsWarningBrush = CreateFrozenBrush(255, 213, 0);
+        private static readonly Brush FpsCriticalBrush = CreateFrozenBrush(255, 68, 68);
+        private static readonly Brush FpsUnavailableBrush = CreateFrozenBrush(170, 170, 170);
+        // Shared status-color brushes for temp/battery/latency readouts (same 4-color scale as FPS above).
+        // Frozen and reused instead of allocated per tick — this window redraws every second while an OSD
+        // is on screen over a running game, which is exactly when extra GC pressure hurts frame time most.
+        private static readonly Brush StatusGoodBrush = FpsGoodBrush;
+        private static readonly Brush StatusWarningBrush = FpsWarningBrush;
+        private static readonly Brush StatusOrangeBrush = CreateFrozenBrush(255, 149, 0);
+        private static readonly Brush StatusCriticalBrush = FpsCriticalBrush;
+        
+        [DllImport("user32.dll")]
+        private static extern int GetWindowLong(IntPtr hwnd, int index);
+        
+        [DllImport("user32.dll")]
+        private static extern int SetWindowLong(IntPtr hwnd, int index, int newStyle);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetCursorPos(out POINT lpPoint);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private struct MONITORINFO
+        {
+            public int cbSize;
+            public RECT rcMonitor;
+            public RECT rcWork;
+            public int dwFlags;
+        }
+        
+        private IDisposable? _updateTimerSubscription;
+        private IDisposable? _pingTimerSubscription;
+        private readonly ThermalSensorProvider? _thermalProvider;
+        private readonly FanService? _fanService;
+        private readonly RtssIntegrationService? _rtssService;
+        private OsdSettings _settings;
+        private Func<OmenCore.Models.MonitoringSample?>? _getMonitoringSample;
+        private int _lastPingMs = -1;
+        private bool _rtssInitialized;
+        
+        // Bindable properties
+        private double _cpuTemp;
+        private double _gpuTemp;
+        private double _cpuLoad;
+        private double _gpuLoad;
+        private string _fanSpeed = "-- / --";
+        private string _ramUsage = "-- GB";
+        private string _cpuPower = "";
+        private string _gpuPower = "";
+        private bool _isThrottling;
+        private string _currentMode = "Auto";
+        private double _fps;
+        private string _fpsLabel = "FPS";
+        private string _fpsDisplay = "--";
+        private string _fpsDetailDisplay = "";
+        private Brush _fpsAccentBrush = FpsGoodBrush;
+        private string _frametimeDisplay = "0.0ms";
+        private string _fanMode = "Auto";
+        private string _performanceMode = "";
+        private double _frametime;
+        private string _clockTime = "";
+        private string _networkLatency = "--";
+        private Brush _networkLatencyColor = Brushes.Gray;
+        private string _vramUsage = "-- GB";
+        private string _packagePower = "";
+        private double _gpuHotspotTemp;
+        private Brush _cpuTempColor = Brushes.White;
+        private bool _isCpuTempSourceFallback;
+        private Brush _gpuTempColor = Brushes.White;
+        private Brush _gpuHotspotTempColor = Brushes.White;
+        private string _networkUpload = "0.0";
+        private string _networkDownload = "0.0";
+        private string _batteryPercent = "--%";
+        private Brush _batteryColor = Brushes.White;
+        private string _cpuClockSpeed = "-- MHz";
+        private string _gpuClockSpeed = "-- MHz";
+        private string _osdDensityMode = "Balanced";
+        private double _overlayScale = 1.0;
+        private Thickness _metricRowMargin = new Thickness(0, 3, 0, 3);
+        private Thickness _separatorMargin = new Thickness(0, 6, 0, 6);
+        private Thickness _overlayPadding = new Thickness(16, 12, 16, 12);
+        
+        // Network traffic monitoring
+        private NetworkInterface? _activeNetworkInterface;
+        private long _lastBytesSent;
+        private long _lastBytesReceived;
+        private DateTime _lastNetworkCheck = DateTime.MinValue;
+        
+        public double CpuTemp { get => _cpuTemp; set { _cpuTemp = value; OnPropertyChanged(); } }
+        public double GpuTemp { get => _gpuTemp; set { _gpuTemp = value; OnPropertyChanged(); } }
+        public double CpuLoad { get => _cpuLoad; set { _cpuLoad = value; OnPropertyChanged(); } }
+        public double GpuLoad { get => _gpuLoad; set { _gpuLoad = value; OnPropertyChanged(); } }
+        public string FanSpeed { get => _fanSpeed; set { _fanSpeed = value; OnPropertyChanged(); } }
+        public string RamUsage { get => _ramUsage; set { _ramUsage = value; OnPropertyChanged(); } }
+        public string CpuPower { get => _cpuPower; set { _cpuPower = value; OnPropertyChanged(); } }
+        public string GpuPower { get => _gpuPower; set { _gpuPower = value; OnPropertyChanged(); } }
+        public bool IsThrottling { get => _isThrottling; set { _isThrottling = value; OnPropertyChanged(); } }
+        public string CurrentMode { get => _currentMode; set { _currentMode = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowCurrentModeRow)); } }
+        public double Fps { get => _fps; set { _fps = value; OnPropertyChanged(); } }
+        public string FpsLabel { get => _fpsLabel; set { _fpsLabel = value; OnPropertyChanged(); } }
+        public string FpsDisplay { get => _fpsDisplay; set { _fpsDisplay = value; OnPropertyChanged(); } }
+        public string FpsDetailDisplay { get => _fpsDetailDisplay; set { _fpsDetailDisplay = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowFpsDetail)); } }
+        public Brush FpsAccentBrush { get => _fpsAccentBrush; set { _fpsAccentBrush = value; OnPropertyChanged(); } }
+        public string FrametimeDisplay { get => _frametimeDisplay; set { _frametimeDisplay = value; OnPropertyChanged(); } }
+        public string FanMode { get => _fanMode; set { _fanMode = value; OnPropertyChanged(); } }
+        public string PerformanceMode { get => _performanceMode; set { _performanceMode = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowCurrentModeRow)); OnPropertyChanged(nameof(ShowPerformanceModeRow)); } }
+        public double Frametime { get => _frametime; set { _frametime = value; OnPropertyChanged(); } }
+        public string ClockTime { get => _clockTime; set { _clockTime = value; OnPropertyChanged(); } }
+        public string NetworkLatency { get => _networkLatency; set { _networkLatency = value; OnPropertyChanged(); } }
+        public Brush NetworkLatencyColor { get => _networkLatencyColor; set { _networkLatencyColor = value; OnPropertyChanged(); } }
+        public string VramUsage { get => _vramUsage; set { _vramUsage = value; OnPropertyChanged(); } }
+        public string PackagePower { get => _packagePower; set { _packagePower = value; OnPropertyChanged(); } }
+        public double GpuHotspotTemp { get => _gpuHotspotTemp; set { _gpuHotspotTemp = value; OnPropertyChanged(); UpdateGpuHotspotTempColor(); } }
+        public Brush CpuTempColor { get => _cpuTempColor; set { _cpuTempColor = value; OnPropertyChanged(); } }
+
+        /// <summary>
+        /// True when the trusted CPU temperature source is the LibreHardwareMonitor fallback
+        /// path — the primary WMI/ACPI reading was recently rejected as implausible. Drives a
+        /// small always-visible marker rather than a tooltip: this window is click-through
+        /// (WS_EX_TRANSPARENT), so hover-triggered UI would never be reachable during actual
+        /// gameplay, unlike the equivalent Dashboard tooltip.
+        /// </summary>
+        public bool IsCpuTempSourceFallback { get => _isCpuTempSourceFallback; set { _isCpuTempSourceFallback = value; OnPropertyChanged(); } }
+        public Brush GpuTempColor { get => _gpuTempColor; set { _gpuTempColor = value; OnPropertyChanged(); } }
+        public Brush GpuHotspotTempColor { get => _gpuHotspotTempColor; set { _gpuHotspotTempColor = value; OnPropertyChanged(); } }
+        public string NetworkUpload { get => _networkUpload; set { _networkUpload = value; OnPropertyChanged(); } }
+        public string NetworkDownload { get => _networkDownload; set { _networkDownload = value; OnPropertyChanged(); } }
+        public string BatteryPercent { get => _batteryPercent; set { _batteryPercent = value; OnPropertyChanged(); } }
+        public Brush BatteryColor { get => _batteryColor; set { _batteryColor = value; OnPropertyChanged(); } }
+        public string CpuClockSpeed { get => _cpuClockSpeed; set { _cpuClockSpeed = value; OnPropertyChanged(); } }
+        public string GpuClockSpeed { get => _gpuClockSpeed; set { _gpuClockSpeed = value; OnPropertyChanged(); } }
+        
+        // Settings-bound visibility - now using backing fields for live updates
+        private bool _showCpuTemp;
+        private bool _showGpuTemp;
+        private bool _showCpuLoad;
+        private bool _showGpuLoad;
+        private bool _showFanSpeed;
+        private bool _showRamUsage;
+        private bool _showCurrentMode = true;
+        private bool _showFps;
+        private bool _showFanMode = true;
+        private bool _showPerformanceMode;
+        private bool _showFrametime;
+        private bool _showTime;
+        private bool _showGpuPower;
+        private bool _showCpuPower;
+        private bool _showNetworkLatency;
+        private bool _showVramUsage;
+        private bool _showPackagePower;
+        private bool _showGpuHotspot;
+        private bool _showNetworkUpload;
+        private bool _showNetworkDownload;
+        private bool _showBattery;
+        private bool _showCpuClock;
+        private bool _showGpuClock;
+        private bool _showThermalsGroup = true;
+        private bool _showPerformanceGroup = true;
+        private bool _showNetworkGroup = true;
+        private bool _showSystemGroup = true;
+        
+        public bool ShowCpuTemp { get => _showCpuTemp; set { _showCpuTemp = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowSeparator1)); } }
+        public bool ShowGpuTemp { get => _showGpuTemp; set { _showGpuTemp = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowSeparator1)); } }
+        public bool ShowCpuLoad { get => _showCpuLoad; set { _showCpuLoad = value; OnPropertyChanged(); } }
+        public bool ShowGpuLoad { get => _showGpuLoad; set { _showGpuLoad = value; OnPropertyChanged(); } }
+        public bool ShowFanSpeed { get => _showFanSpeed; set { _showFanSpeed = value; OnPropertyChanged(); } }
+        public bool ShowRamUsage { get => _showRamUsage; set { _showRamUsage = value; OnPropertyChanged(); } }
+        public bool ShowCurrentMode { get => _showCurrentMode; set { _showCurrentMode = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowCurrentModeRow)); } }
+        public bool ShowFps { get => _showFps; set { _showFps = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowSeparator2)); OnPropertyChanged(nameof(ShowFpsDetail)); } }
+        public bool ShowFanMode { get => _showFanMode; set { _showFanMode = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowSeparator1)); } }
+        public bool ShowPerformanceMode { get => _showPerformanceMode; set { _showPerformanceMode = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowCurrentModeRow)); OnPropertyChanged(nameof(ShowSeparator1)); } }
+        public bool ShowFrametime { get => _showFrametime; set { _showFrametime = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowSeparator2)); } }
+        public bool ShowTime { get => _showTime; set { _showTime = value; OnPropertyChanged(); } }
+        public bool ShowGpuPower { get => _showGpuPower; set { _showGpuPower = value; OnPropertyChanged(); } }
+        public bool ShowCpuPower { get => _showCpuPower; set { _showCpuPower = value; OnPropertyChanged(); } }
+        public bool ShowNetworkLatency { get => _showNetworkLatency; set { _showNetworkLatency = value; OnPropertyChanged(); } }
+        public bool ShowVramUsage { get => _showVramUsage; set { _showVramUsage = value; OnPropertyChanged(); } }
+        public bool ShowPackagePower { get => _showPackagePower; set { _showPackagePower = value; OnPropertyChanged(); } }
+        public bool ShowGpuHotspot { get => _showGpuHotspot; set { _showGpuHotspot = value; OnPropertyChanged(); } }
+        public bool ShowNetworkUpload { get => _showNetworkUpload; set { _showNetworkUpload = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowSeparator2)); } }
+        public bool ShowNetworkDownload { get => _showNetworkDownload; set { _showNetworkDownload = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowSeparator2)); } }
+        public bool ShowBattery { get => _showBattery; set { _showBattery = value; OnPropertyChanged(); } }
+        public bool ShowCpuClock { get => _showCpuClock; set { _showCpuClock = value; OnPropertyChanged(); } }
+        public bool ShowGpuClock { get => _showGpuClock; set { _showGpuClock = value; OnPropertyChanged(); } }
+
+        public bool ShowThermalsGroup { get => _showThermalsGroup; set { _showThermalsGroup = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowSeparator1)); OnPropertyChanged(nameof(ShowSeparator2)); OnPropertyChanged(string.Empty); } }
+        public bool ShowPerformanceGroup { get => _showPerformanceGroup; set { _showPerformanceGroup = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowCurrentModeRow)); OnPropertyChanged(nameof(ShowSeparator1)); OnPropertyChanged(nameof(ShowSeparator2)); OnPropertyChanged(string.Empty); } }
+        public bool ShowNetworkGroup { get => _showNetworkGroup; set { _showNetworkGroup = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowSeparator2)); OnPropertyChanged(string.Empty); } }
+        public bool ShowSystemGroup { get => _showSystemGroup; set { _showSystemGroup = value; OnPropertyChanged(); OnPropertyChanged(nameof(ShowSeparator1)); OnPropertyChanged(nameof(ShowSeparator2)); OnPropertyChanged(string.Empty); } }
+
+        public bool ShowClockTimeRow => _showSystemGroup && _showTime;
+        public bool ShowCurrentModeRow =>
+            _showPerformanceGroup &&
+            _showCurrentMode &&
+            !string.IsNullOrWhiteSpace(CurrentMode) &&
+            (!_showPerformanceMode || !string.Equals(CurrentMode, PerformanceMode, StringComparison.OrdinalIgnoreCase));
+        public bool ShowPerformanceModeRow => _showPerformanceGroup && _showPerformanceMode && !string.IsNullOrWhiteSpace(_performanceMode);
+        public bool ShowFanModeRow => _showPerformanceGroup && _showFanMode;
+        public bool ShowCpuTempRow => _showThermalsGroup && _showCpuTemp;
+        public bool ShowCpuClockRow => _showPerformanceGroup && _showCpuClock;
+        public bool ShowGpuTempRow => _showThermalsGroup && _showGpuTemp;
+        public bool ShowGpuClockRow => _showPerformanceGroup && _showGpuClock;
+        public bool ShowGpuHotspotRow => _showThermalsGroup && _showGpuHotspot;
+        public bool ShowVramUsageRow => _showSystemGroup && _showVramUsage;
+        public bool ShowPackagePowerRow => _showThermalsGroup && _showPackagePower;
+        public bool ShowFanSpeedRow => _showThermalsGroup && _showFanSpeed;
+        public bool ShowRamUsageRow => _showSystemGroup && _showRamUsage;
+        public bool ShowBatteryRow => _showSystemGroup && _showBattery;
+        public bool ShowFpsRow => _showPerformanceGroup && _showFps;
+        public bool ShowFpsDetail => ShowFpsRow && !string.IsNullOrWhiteSpace(_fpsDetailDisplay);
+        public bool ShowFrametimeRow => _showPerformanceGroup && _showFrametime;
+        public bool ShowNetworkLatencyRow => _showNetworkGroup && _showNetworkLatency;
+        public bool ShowNetworkUploadRow => _showNetworkGroup && _showNetworkUpload;
+        public bool ShowNetworkDownloadRow => _showNetworkGroup && _showNetworkDownload;
+
+        public double OverlayScale { get => _overlayScale; private set { _overlayScale = value; OnPropertyChanged(); } }
+        public Thickness MetricRowMargin { get => _metricRowMargin; private set { _metricRowMargin = value; OnPropertyChanged(); } }
+        public Thickness SeparatorMargin { get => _separatorMargin; private set { _separatorMargin = value; OnPropertyChanged(); } }
+        public Thickness OverlayPadding { get => _overlayPadding; private set { _overlayPadding = value; OnPropertyChanged(); } }
+        
+        // Computed visibility for separators
+        public bool ShowSeparator1 => (ShowPerformanceModeRow || ShowFanModeRow) &&
+                         (ShowCpuTempRow || ShowGpuTempRow || ShowCpuClockRow || ShowGpuClockRow || ShowGpuHotspotRow || ShowPackagePowerRow || ShowFanSpeedRow || ShowRamUsageRow || ShowBatteryRow || ShowVramUsageRow);
+        public bool ShowSeparator2 => (ShowFpsRow || ShowFrametimeRow || ShowNetworkLatencyRow || ShowNetworkUploadRow || ShowNetworkDownloadRow) &&
+                         (ShowCpuTempRow || ShowGpuTempRow || ShowCpuClockRow || ShowGpuClockRow || ShowGpuHotspotRow || ShowPackagePowerRow || ShowFanSpeedRow || ShowRamUsageRow || ShowBatteryRow || ShowVramUsageRow);
+        
+        public event PropertyChangedEventHandler? PropertyChanged;
+        
+        public OsdOverlayWindow(OsdSettings settings, ThermalSensorProvider? thermalProvider = null, FanService? fanService = null, RtssIntegrationService? rtssService = null)
+        {
+            _settings = settings ?? new OsdSettings();
+            _thermalProvider = thermalProvider;
+            _fanService = fanService;
+            _rtssService = rtssService;
+            
+            // Initialize visibility from settings
+            ApplySettings(_settings);
+            
+            InitializeComponent();
+            DataContext = this;
+
+            Loaded += (_, _) =>
+            {
+                ApplyDpiAwareScale();
+                PositionWindow();
+            };
+            SizeChanged += (_, _) =>
+            {
+                if (IsLoaded)
+                {
+                    PositionWindow();
+                }
+            };
+            
+            // Set opacity from settings
+            Opacity = _settings.Opacity;
+            
+            // Position window
+            PositionWindow();
+            
+            // Stats/ping timers are started/stopped with overlay visibility and settings
+            // (see Start/StopStatsTimer, Start/StopNetworkTimer) rather than running
+            // continuously from construction.
+        }
+        
+        /// <summary>
+        /// Update settings at runtime (for live preview)
+        /// </summary>
+        public void UpdateSettings(OsdSettings settings)
+        {
+            _settings = settings;
+            ApplySettings(settings);
+            Opacity = settings.Opacity;
+
+            var shouldPollNetwork = _showNetworkGroup && (_showNetworkLatency || _showNetworkUpload || _showNetworkDownload);
+            if (shouldPollNetwork)
+            {
+                StartNetworkTimer();
+            }
+            else
+            {
+                StopNetworkTimer();
+            }
+
+            PositionWindow();
+        }
+        
+        private void ApplySettings(OsdSettings settings)
+        {
+            ShowCpuTemp = settings.ShowCpuTemp;
+            ShowGpuTemp = settings.ShowGpuTemp;
+            ShowCpuLoad = settings.ShowCpuLoad;
+            ShowGpuLoad = settings.ShowGpuLoad;
+            ShowFanSpeed = settings.ShowFanSpeed;
+            ShowRamUsage = settings.ShowRamUsage;
+            ShowCurrentMode = settings.ShowCurrentMode;
+            ShowFps = settings.ShowFps;
+            ShowFanMode = settings.ShowFanMode;
+            ShowPerformanceMode = settings.ShowPerformanceMode;
+            ShowFrametime = settings.ShowFrametime;
+            ShowTime = settings.ShowTime;
+            ShowGpuPower = settings.ShowGpuPower;
+            ShowCpuPower = settings.ShowCpuPower;
+            ShowNetworkLatency = settings.ShowNetworkLatency;
+            ShowVramUsage = settings.ShowVramUsage;
+            ShowPackagePower = settings.ShowPackagePower;
+            ShowGpuHotspot = settings.ShowGpuHotspot;
+            ShowNetworkUpload = settings.ShowNetworkUpload;
+            ShowNetworkDownload = settings.ShowNetworkDownload;
+            ShowBattery = settings.ShowBattery;
+            ShowCpuClock = settings.ShowCpuClock;
+            ShowGpuClock = settings.ShowGpuClock;
+            ShowThermalsGroup = settings.ShowThermalsGroup;
+            ShowPerformanceGroup = settings.ShowPerformanceGroup;
+            ShowNetworkGroup = settings.ShowNetworkGroup;
+            ShowSystemGroup = settings.ShowSystemGroup;
+            _osdDensityMode = string.IsNullOrWhiteSpace(settings.DensityMode) ? "Balanced" : settings.DensityMode;
+            ApplyDensityLayout();
+            
+            // Apply layout orientation
+            if (MainPanel != null)
+            {
+                MainPanel.Orientation = settings.Layout?.Equals("Horizontal", StringComparison.OrdinalIgnoreCase) == true
+                    ? System.Windows.Controls.Orientation.Horizontal
+                    : System.Windows.Controls.Orientation.Vertical;
+            }
+
+            if (IsLoaded)
+            {
+                ApplyDpiAwareScale();
+                PositionWindow();
+            }
+
+            OnPropertyChanged(string.Empty);
+        }
+
+        private void ApplyDensityLayout()
+        {
+            switch (_osdDensityMode.Trim().ToLowerInvariant())
+            {
+                case "compact":
+                    OverlayScale = 0.93;
+                    MetricRowMargin = new Thickness(0, 2, 0, 2);
+                    SeparatorMargin = new Thickness(0, 5, 0, 5);
+                    OverlayPadding = new Thickness(14, 10, 14, 10);
+                    break;
+                case "comfortable":
+                    OverlayScale = 1.07;
+                    MetricRowMargin = new Thickness(0, 6, 0, 6);
+                    SeparatorMargin = new Thickness(0, 9, 0, 9);
+                    OverlayPadding = new Thickness(18, 14, 18, 14);
+                    break;
+                default:
+                    OverlayScale = 1.0;
+                    MetricRowMargin = new Thickness(0, 3, 0, 3);
+                    SeparatorMargin = new Thickness(0, 6, 0, 6);
+                    OverlayPadding = new Thickness(16, 12, 16, 12);
+                    break;
+            }
+        }
+        
+        /// <summary>
+        /// Set a callback to get the latest monitoring sample (for CPU/GPU load, power, etc.)
+        /// </summary>
+        public void SetMonitoringSampleSource(Func<OmenCore.Models.MonitoringSample?> getMonitoringSample)
+        {
+            _getMonitoringSample = getMonitoringSample;
+        }
+        
+        /// <summary>
+        /// Set the current mode string to display
+        /// </summary>
+        public void SetCurrentMode(string mode)
+        {
+            CurrentMode = mode;
+        }
+        
+        /// <summary>
+        /// Set the current performance mode to display
+        /// </summary>
+        public void SetPerformanceMode(string mode)
+        {
+            PerformanceMode = mode;
+        }
+        
+        /// <summary>
+        /// Set the current fan mode to display
+        /// </summary>
+        public void SetFanMode(string mode)
+        {
+            FanMode = mode;
+        }
+        
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+
+            // Make window click-through
+            var hwnd = new WindowInteropHelper(this).Handle;
+            var extendedStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+            SetWindowLong(hwnd, GWL_EXSTYLE, extendedStyle | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW);
+        }
+
+        /// <summary>
+        /// Re-applies HWND_TOPMOST. Borderless/windowed-fullscreen games render through the
+        /// desktop compositor and frequently reclaim topmost for their own window on focus or
+        /// present, silently dropping this overlay behind them; WPF's Topmost="True" is only
+        /// applied once and does not fight that. Cannot help true DXGI exclusive-fullscreen,
+        /// which bypasses the compositor entirely and no HWND can render over.
+        /// </summary>
+        private void ReassertTopmost()
+        {
+            var hwnd = new WindowInteropHelper(this).Handle;
+            if (hwnd == IntPtr.Zero)
+                return;
+
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        
+        public void StartUpdates()
+        {
+            ReassertTopmost();
+            StartStatsTimer();
+            if (_showNetworkGroup && (_showNetworkLatency || _showNetworkUpload || _showNetworkDownload))
+                StartNetworkTimer();
+            
+            // Initialize RTSS for real FPS data
+            if (_rtssService != null && !_rtssInitialized)
+            {
+                if (_rtssService.Initialize())
+                {
+                    _rtssService.StartPolling(500);
+                    _rtssInitialized = true;
+                }
+            }
+            
+            UpdateStats(); // Initial update
+        }
+        
+        public void StopUpdates()
+        {
+            StopStatsTimer();
+            StopNetworkTimer();
+            _rtssService?.StopPolling();
+        }
+
+        private void StartStatsTimer()
+        {
+            if (_updateTimerSubscription == null)
+            {
+                _updateTimerSubscription = UiPollingCoordinator.Subscribe(
+                    OsdStatsTimerRegistryName,
+                    TimeSpan.FromMilliseconds(OsdStatsTimerIntervalMs),
+                    () => UpdateTimer_Tick(null, EventArgs.Empty));
+                BackgroundTimerRegistry.Register(
+                    OsdStatsTimerRegistryName,
+                    nameof(OsdOverlayWindow),
+                    "Visible OSD overlay stats refresh",
+                    OsdStatsTimerIntervalMs,
+                    BackgroundTimerTier.VisibleOnly);
+            }
+        }
+
+        private void StopStatsTimer()
+        {
+            _updateTimerSubscription?.Dispose();
+            _updateTimerSubscription = null;
+
+            BackgroundTimerRegistry.Unregister(OsdStatsTimerRegistryName);
+        }
+
+        private void StartNetworkTimer()
+        {
+            if (_pingTimerSubscription == null)
+            {
+                _pingTimerSubscription = UiPollingCoordinator.Subscribe(
+                    OsdNetworkTimerRegistryName,
+                    TimeSpan.FromMilliseconds(OsdNetworkTimerIntervalMs),
+                    () => PingTimer_Tick(null, EventArgs.Empty));
+                BackgroundTimerRegistry.Register(
+                    OsdNetworkTimerRegistryName,
+                    nameof(OsdOverlayWindow),
+                    "Visible OSD network latency/throughput refresh",
+                    OsdNetworkTimerIntervalMs,
+                    BackgroundTimerTier.VisibleOnly);
+            }
+        }
+
+        private void StopNetworkTimer()
+        {
+            _pingTimerSubscription?.Dispose();
+            _pingTimerSubscription = null;
+
+            BackgroundTimerRegistry.Unregister(OsdNetworkTimerRegistryName);
+        }
+        
+        private void UpdateTimer_Tick(object? sender, EventArgs e)
+        {
+            ReassertTopmost();
+            UpdateStats();
+        }
+        
+        private void PingTimer_Tick(object? sender, EventArgs e)
+        {
+            if (_showNetworkGroup && _showNetworkLatency)
+                UpdateNetworkLatency();
+            
+            if (_showNetworkGroup && (_showNetworkUpload || _showNetworkDownload))
+                UpdateNetworkTraffic();
+        }
+        
+        private void UpdateNetworkTraffic()
+        {
+            try
+            {
+                // Find active network interface (Ethernet or WiFi with actual traffic)
+                if (_activeNetworkInterface == null || !_activeNetworkInterface.OperationalStatus.Equals(OperationalStatus.Up))
+                {
+                    _activeNetworkInterface = null;
+                    foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+                    {
+                        if (nic.OperationalStatus == OperationalStatus.Up &&
+                            (nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet ||
+                             nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211) &&
+                            !nic.Name.Contains("Virtual", StringComparison.OrdinalIgnoreCase) &&
+                            !nic.Name.Contains("VPN", StringComparison.OrdinalIgnoreCase))
+                        {
+                            _activeNetworkInterface = nic;
+                            break;
+                        }
+                    }
+                }
+                
+                if (_activeNetworkInterface == null)
+                {
+                    NetworkUpload = "0.0";
+                    NetworkDownload = "0.0";
+                    return;
+                }
+                
+                // Get current stats
+                var stats = _activeNetworkInterface.GetIPv4Statistics();
+                var currentBytesSent = stats.BytesSent;
+                var currentBytesReceived = stats.BytesReceived;
+                var now = DateTime.Now;
+                
+                // Calculate speeds if we have previous data
+                if (_lastNetworkCheck != DateTime.MinValue)
+                {
+                    var timeDelta = (now - _lastNetworkCheck).TotalSeconds;
+                    if (timeDelta > 0)
+                    {
+                        var bytesSentDelta = currentBytesSent - _lastBytesSent;
+                        var bytesReceivedDelta = currentBytesReceived - _lastBytesReceived;
+                        
+                        // Convert to Mbps (megabits per second)
+                        var uploadMbps = (bytesSentDelta * 8) / (timeDelta * 1_000_000);
+                        var downloadMbps = (bytesReceivedDelta * 8) / (timeDelta * 1_000_000);
+                        
+                        // Cap negative values (interface reset)
+                        if (uploadMbps < 0) uploadMbps = 0;
+                        if (downloadMbps < 0) downloadMbps = 0;
+                        
+                        NetworkUpload = uploadMbps >= 1 ? $"{uploadMbps:F1}" : $"{(uploadMbps * 1000):F0}k";
+                        NetworkDownload = downloadMbps >= 1 ? $"{downloadMbps:F1}" : $"{(downloadMbps * 1000):F0}k";
+                    }
+                }
+                
+                // Update last values
+                _lastBytesSent = currentBytesSent;
+                _lastBytesReceived = currentBytesReceived;
+                _lastNetworkCheck = now;
+            }
+            catch (Exception ex)
+            {
+                NetworkUpload = "0.0";
+                NetworkDownload = "0.0";
+                App.Logging.Debug($"OSD network throughput update failed: {ex.Message}");
+            }
+        }
+        
+        private void UpdateNetworkLatency()
+        {
+            try
+            {
+                // Ping Cloudflare DNS (very reliable, low latency target)
+                using var ping = new Ping();
+                var reply = ping.Send("1.1.1.1", 1000);
+                if (reply.Status == IPStatus.Success)
+                {
+                    _lastPingMs = (int)reply.RoundtripTime;
+                    NetworkLatency = $"{_lastPingMs}ms";
+                    
+                    // Color based on latency
+                    if (_lastPingMs < 30)
+                        NetworkLatencyColor = StatusGoodBrush;
+                    else if (_lastPingMs < 60)
+                        NetworkLatencyColor = StatusWarningBrush;
+                    else if (_lastPingMs < 100)
+                        NetworkLatencyColor = StatusOrangeBrush;
+                    else
+                        NetworkLatencyColor = StatusCriticalBrush;
+                }
+                else
+                {
+                    NetworkLatency = "N/A";
+                    NetworkLatencyColor = Brushes.Gray;
+                }
+            }
+            catch (Exception ex)
+            {
+                NetworkLatency = "N/A";
+                NetworkLatencyColor = Brushes.Gray;
+                App.Logging.Debug($"OSD network latency update failed: {ex.Message}");
+            }
+        }
+        
+        private void UpdateStats()
+        {
+            try
+            {
+                // Update clock time
+                if (_showSystemGroup && _showTime)
+                    ClockTime = DateTime.Now.ToString("HH:mm:ss");
+                
+                // Try to get data from monitoring sample first (more accurate)
+                var sample = _getMonitoringSample?.Invoke();
+                
+                // Check if sample is stale (older than 5 seconds)
+                bool isStale = sample == null || (DateTime.Now - sample.Timestamp).TotalSeconds > 5;
+                
+                if (sample != null && !isStale)
+                {
+                    CpuTemp = sample.CpuTemperatureC;
+                    IsCpuTempSourceFallback = string.Equals(sample.CpuTemperatureSource, "LHM Fallback", StringComparison.OrdinalIgnoreCase);
+                    GpuTemp = sample.GpuTemperatureC;
+                    CpuLoad = sample.CpuLoadPercent;
+                    GpuLoad = sample.GpuLoadPercent;
+                    
+                    // Update temperature colors
+                    UpdateCpuTempColor();
+                    UpdateGpuTempColor();
+                    
+                    // Power draw
+                    if (sample.CpuPowerWatts > 0)
+                        CpuPower = $"{sample.CpuPowerWatts:F0}W";
+                    else
+                        CpuPower = "";
+                        
+                    if (sample.GpuPowerWatts > 0)
+                        GpuPower = $"{sample.GpuPowerWatts:F0}W";
+                    else
+                        GpuPower = "";
+                    
+                    // Package power (CPU + GPU total)
+                    if (sample.CpuPowerWatts > 0 || sample.GpuPowerWatts > 0)
+                        PackagePower = $"{(sample.CpuPowerWatts + sample.GpuPowerWatts):F0}W";
+                    else
+                        PackagePower = "";
+                    
+                    // GPU hotspot temperature: prefer real junction temp sensor when available.
+                    if (_showGpuHotspot)
+                    {
+                        if (sample.GpuHotspotTemperatureC > 0)
+                        {
+                            GpuHotspotTemp = sample.GpuHotspotTemperatureC;
+                        }
+                        else if (sample.GpuTemperatureC > 0)
+                        {
+                            // Fallback estimate when hotspot sensor is unavailable.
+                            GpuHotspotTemp = sample.GpuTemperatureC + 12;
+                        }
+                        else
+                        {
+                            GpuHotspotTemp = 0;
+                        }
+                    }
+                    else
+                    {
+                        GpuHotspotTemp = 0;
+                    }
+                    
+                    // FPS / GPU Activity display
+                    if (_showFps || _showFrametime)
+                    {
+                        OsdFpsDisplaySnapshot fpsSnapshot;
+                        if (_rtssService != null && _rtssService.IsAvailable)
+                        {
+                            fpsSnapshot = OsdFpsDisplayFormatter.FromRtss(
+                                _rtssService.CurrentFps,
+                                _rtssService.AverageFps,
+                                _rtssService.MinFps,
+                                _rtssService.OnePercentLow,
+                                _rtssService.FrametimeMs,
+                                _rtssService.CurrentProcess);
+                        }
+                        else
+                        {
+                            // Retry RTSS connection periodically
+                            if (_rtssService != null && !_rtssService.IsAvailable && !_rtssInitialized)
+                            {
+                                if (_rtssService.Initialize())
+                                {
+                                    _rtssService.StartPolling(500);
+                                    _rtssInitialized = true;
+                                }
+                            }
+
+                            fpsSnapshot = OsdFpsDisplayFormatter.Unavailable(
+                                _rtssService == null
+                                    ? "RTSS disabled"
+                                    : "FPS needs RTSS running (RivaTuner Statistics Server)");
+                        }
+
+                        ApplyFpsSnapshot(fpsSnapshot);
+                    }
+                    
+                    // Throttling detection
+                    IsThrottling = CpuTemp > 95 || GpuTemp > 95;
+                    
+                    // Battery status
+                    if (_showBattery)
+                    {
+                        var pct = sample.BatteryChargePercent;
+                        if (pct > 0 || sample.IsOnAcPower)
+                        {
+                            var icon = sample.IsOnAcPower ? "⚡" : "🔋";
+                            BatteryPercent = $"{icon} {pct:F0}%";
+                            
+                            if (pct > 60)
+                                BatteryColor = StatusGoodBrush;
+                            else if (pct > 30)
+                                BatteryColor = StatusWarningBrush;
+                            else if (pct > 15)
+                                BatteryColor = StatusOrangeBrush;
+                            else
+                                BatteryColor = StatusCriticalBrush;
+                        }
+                        else
+                        {
+                            BatteryPercent = "AC";
+                            BatteryColor = StatusGoodBrush;
+                        }
+                    }
+                    
+                    // CPU clock speed (average of all core clocks)
+                    if (_showCpuClock && sample.CpuCoreClocksMhz.Count > 0)
+                    {
+                        double avgClock = 0;
+                        foreach (var c in sample.CpuCoreClocksMhz)
+                            avgClock += c;
+                        avgClock /= sample.CpuCoreClocksMhz.Count;
+                        CpuClockSpeed = avgClock >= 1000 ? $"{(avgClock / 1000):F2} GHz" : $"{avgClock:F0} MHz";
+                    }
+                    else if (_showCpuClock)
+                    {
+                        CpuClockSpeed = "-- MHz";
+                    }
+                    
+                    // GPU clock speed
+                    if (_showGpuClock && sample.GpuClockMhz > 0)
+                    {
+                        GpuClockSpeed = sample.GpuClockMhz >= 1000 ? $"{(sample.GpuClockMhz / 1000):F2} GHz" : $"{sample.GpuClockMhz:F0} MHz";
+                    }
+                    else if (_showGpuClock)
+                    {
+                        GpuClockSpeed = "-- MHz";
+                    }
+                }
+                else if (isStale && _thermalProvider != null)
+                {
+                    // Sample is stale - fallback to thermal provider for live data
+                    var temps = _thermalProvider.ReadTemperatures();
+                    foreach (var reading in temps)
+                    {
+                        if (reading.Sensor.Contains("CPU", StringComparison.OrdinalIgnoreCase))
+                        {
+                            CpuTemp = reading.Celsius;
+                        }
+                        else if (reading.Sensor.Contains("GPU", StringComparison.OrdinalIgnoreCase))
+                        {
+                            GpuTemp = reading.Celsius;
+                        }
+                    }
+                    
+                    // Update colors for fresh temps
+                    UpdateCpuTempColor();
+                    UpdateGpuTempColor();
+                    
+                    IsThrottling = CpuTemp > 95 || GpuTemp > 95;
+                }
+                
+                // Read fan speeds
+                if (_fanService != null && _fanService.FanTelemetry.Count >= 2)
+                {
+                    var cpu = _fanService.FanTelemetry[0];
+                    var gpu = _fanService.FanTelemetry[1];
+                    FanSpeed = $"{cpu.Rpm:N0} / {gpu.Rpm:N0}";
+                }
+                
+                // Get fan mode from fan service
+                if (_showFanMode && _fanService != null)
+                {
+                    FanMode = _fanService.ActivePresetName ?? "Auto";
+                }
+                
+                // Get RAM usage from monitoring sample
+                if (_showRamUsage && sample != null)
+                {
+                    if (sample.RamUsageGb > 0 && sample.RamTotalGb > 0)
+                        RamUsage = $"{sample.RamUsageGb:F1} / {sample.RamTotalGb:F0} GB";
+                    else if (sample.RamUsageGb > 0)
+                        RamUsage = $"{sample.RamUsageGb:F1} GB";
+                    else
+                        RamUsage = "--";
+                }
+                
+                // Get VRAM usage from monitoring sample
+                if (_showVramUsage && sample != null)
+                {
+                    if (sample.GpuVramUsageMb > 0 && sample.GpuVramTotalMb > 0)
+                        VramUsage = $"{sample.GpuVramUsageMb / 1024.0:F1} / {sample.GpuVramTotalMb / 1024.0:F0} GB";
+                    else if (sample.GpuVramUsageMb > 0)
+                        VramUsage = $"{sample.GpuVramUsageMb / 1024.0:F1} GB";
+                    else
+                        VramUsage = "--";
+                }
+                
+                // FPS would require hooking into present calls - placeholder
+                // Fps = ...
+            }
+            catch (Exception ex)
+            {
+                App.Logging.Debug($"OSD stats update failed: {ex.Message}");
+            }
+        }
+        
+        private void PositionWindow()
+        {
+            UpdateLayout();
+            var workArea = GetCurrentMonitorWorkArea();
+
+            var width = ActualWidth > 0 ? ActualWidth : Math.Max(220, DesiredSize.Width);
+            var height = ActualHeight > 0 ? ActualHeight : Math.Max(140, DesiredSize.Height);
+            const double padding = 10;
+            
+            switch (_settings.Position.ToLowerInvariant())
+            {
+                case "topleft":
+                    Left = workArea.Left + padding;
+                    Top = workArea.Top + padding;
+                    break;
+                case "topcenter":
+                    Left = workArea.Left + (workArea.Width - width) / 2;
+                    Top = workArea.Top + padding;
+                    break;
+                case "topright":
+                    Left = workArea.Right - width - padding;
+                    Top = workArea.Top + padding;
+                    break;
+                case "bottomleft":
+                    Left = workArea.Left + padding;
+                    Top = workArea.Bottom - height - padding;
+                    break;
+                case "bottomcenter":
+                    Left = workArea.Left + (workArea.Width - width) / 2;
+                    Top = workArea.Bottom - height - padding;
+                    break;
+                case "bottomright":
+                    Left = workArea.Right - width - padding;
+                    Top = workArea.Bottom - height - padding;
+                    break;
+                default:
+                    Left = workArea.Left + padding;
+                    Top = workArea.Top + padding;
+                    break;
+            }
+
+            // Clamp final placement to visible work area to prevent clipping on any DPI/resolution.
+            Left = Math.Max(workArea.Left + padding, Math.Min(Left, workArea.Right - width - padding));
+            Top = Math.Max(workArea.Top + padding, Math.Min(Top, workArea.Bottom - height - padding));
+        }
+
+        private Rect GetCurrentMonitorWorkArea()
+        {
+            try
+            {
+                var monitor = ResolveTargetMonitor();
+                if (monitor == IntPtr.Zero)
+                {
+                    return SystemParameters.WorkArea;
+                }
+
+                var monitorInfo = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+                if (!GetMonitorInfo(monitor, ref monitorInfo))
+                {
+                    return SystemParameters.WorkArea;
+                }
+
+                // GetMonitorInfo returns physical pixels; WPF Left/Top are logical units.
+                // Divide by the per-monitor DPI scale so the window lands in the right place
+                // on displays with non-100% scaling (e.g. 1.5× = 150% DPI).
+                double dpiScaleX = 1.0;
+                double dpiScaleY = 1.0;
+                var source = PresentationSource.FromVisual(this);
+                if (source?.CompositionTarget != null)
+                {
+                    dpiScaleX = source.CompositionTarget.TransformToDevice.M11;
+                    dpiScaleY = source.CompositionTarget.TransformToDevice.M22;
+                }
+
+                return new Rect(
+                    monitorInfo.rcWork.Left / dpiScaleX,
+                    monitorInfo.rcWork.Top / dpiScaleY,
+                    Math.Max(1, (monitorInfo.rcWork.Right - monitorInfo.rcWork.Left) / dpiScaleX),
+                    Math.Max(1, (monitorInfo.rcWork.Bottom - monitorInfo.rcWork.Top) / dpiScaleY));
+            }
+            catch (Exception ex)
+            {
+                App.Logging.Debug($"OSD monitor work-area resolution failed: {ex.Message}");
+                return SystemParameters.WorkArea;
+            }
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            StopUpdates();
+            base.OnClosed(e);
+        }
+
+        private IntPtr ResolveTargetMonitor()
+        {
+            var target = _settings.MonitorTarget?.Trim();
+
+            if (string.Equals(target, "Primary", StringComparison.OrdinalIgnoreCase))
+            {
+                return MonitorFromPoint(new POINT { X = 0, Y = 0 }, MONITOR_DEFAULTTOPRIMARY);
+            }
+
+            if (string.Equals(target, "MouseCursor", StringComparison.OrdinalIgnoreCase))
+            {
+                if (GetCursorPos(out var point))
+                {
+                    return MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+                }
+            }
+
+            if (string.Equals(target, "ActiveWindow", StringComparison.OrdinalIgnoreCase))
+            {
+                var foreground = GetForegroundWindow();
+                if (foreground != IntPtr.Zero)
+                {
+                    return MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+                }
+            }
+
+            var hwnd = new WindowInteropHelper(this).Handle;
+            if (hwnd != IntPtr.Zero)
+            {
+                return MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            }
+
+            return MonitorFromPoint(new POINT { X = 0, Y = 0 }, MONITOR_DEFAULTTOPRIMARY);
+        }
+
+        private void ApplyDpiAwareScale()
+        {
+            if (RootBorder == null)
+            {
+                return;
+            }
+
+            var workArea = GetCurrentMonitorWorkArea();
+            double scale = workArea.Height switch
+            {
+                >= 2000 => 1.28,
+                >= 1400 => 1.14,
+                <= 800 => 0.92,
+                _ => 1.0
+            };
+
+            RootBorder.LayoutTransform = new ScaleTransform(scale, scale);
+        }
+        
+        protected virtual void OnPropertyChanged([CallerMemberName] string? propertyName = null)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        }
+        
+        /// <summary>
+        /// Update CPU temperature text color based on value
+        /// </summary>
+        private void UpdateCpuTempColor()
+        {
+            if (_cpuTemp < 60)
+                CpuTempColor = StatusGoodBrush; // <60°C
+            else if (_cpuTemp < 75)
+                CpuTempColor = StatusWarningBrush; // 60-75°C
+            else if (_cpuTemp < 85)
+                CpuTempColor = StatusOrangeBrush; // 75-85°C
+            else
+                CpuTempColor = StatusCriticalBrush; // >85°C
+        }
+
+        private void ApplyFpsSnapshot(OsdFpsDisplaySnapshot snapshot)
+        {
+            Fps = snapshot.Fps;
+            FpsLabel = snapshot.Label;
+            FpsDisplay = snapshot.Display;
+            FpsDetailDisplay = snapshot.Detail;
+            FpsAccentBrush = GetFpsBrush(snapshot.State);
+            Frametime = snapshot.FrametimeMs;
+            FrametimeDisplay = snapshot.FrametimeDisplay;
+        }
+
+        private static Brush GetFpsBrush(OsdFpsDisplayState state)
+        {
+            return state switch
+            {
+                OsdFpsDisplayState.Good => FpsGoodBrush,
+                OsdFpsDisplayState.Warning => FpsWarningBrush,
+                OsdFpsDisplayState.Critical => FpsCriticalBrush,
+                _ => FpsUnavailableBrush
+            };
+        }
+
+        private static Brush CreateFrozenBrush(byte r, byte g, byte b)
+        {
+            var brush = new SolidColorBrush(Color.FromRgb(r, g, b));
+            brush.Freeze();
+            return brush;
+        }
+        
+        /// <summary>
+        /// Update GPU temperature text color based on value
+        /// </summary>
+        private void UpdateGpuTempColor()
+        {
+            if (_gpuTemp < 65)
+                GpuTempColor = StatusGoodBrush; // <65°C
+            else if (_gpuTemp < 75)
+                GpuTempColor = StatusWarningBrush; // 65-75°C
+            else if (_gpuTemp < 85)
+                GpuTempColor = StatusOrangeBrush; // 75-85°C
+            else
+                GpuTempColor = StatusCriticalBrush; // >85°C
+        }
+
+        /// <summary>
+        /// Update GPU hotspot temperature text color based on value
+        /// </summary>
+        private void UpdateGpuHotspotTempColor()
+        {
+            if (_gpuHotspotTemp < 75)
+                GpuHotspotTempColor = StatusGoodBrush; // <75°C
+            else if (_gpuHotspotTemp < 85)
+                GpuHotspotTempColor = StatusWarningBrush; // 75-85°C
+            else if (_gpuHotspotTemp < 95)
+                GpuHotspotTempColor = StatusOrangeBrush; // 85-95°C
+            else
+                GpuHotspotTempColor = StatusCriticalBrush; // >95°C
+        }
+    }
+}

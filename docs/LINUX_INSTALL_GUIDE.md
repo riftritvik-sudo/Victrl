@@ -1,0 +1,1004 @@
+# OmenCore Linux Installation Guide
+
+Complete guide for installing and running OmenCore on Linux distributions. OmenCore provides **CLI** and **GUI (Avalonia)** interfaces for controlling HP OMEN & Victus laptops.
+
+---
+
+## Table of Contents
+
+- [System Requirements](#system-requirements)
+- [Quick Install](#quick-install)
+- [Distribution-Specific Setup](#distribution-specific-setup)
+  - [Ubuntu / Pop!_OS / Debian](#ubuntu--popos--debian)
+  - [Fedora](#fedora)
+  - [Arch Linux / CachyOS / Manjaro](#arch-linux--cachyos--manjaro)
+  - [openSUSE](#opensuse)
+- [Kernel Module Setup](#kernel-module-setup)
+- [GUI Installation](#gui-installation)
+- [CLI Usage](#cli-usage)
+- [Daemon / Background Service](#daemon--background-service)
+- [Configuration](#configuration)
+- [Fan Control Methods](#fan-control-methods)
+- [Supported Models & Features](#supported-models--features)
+- [Four-zone keyboard RGB (DKMS hp-wmi)](#four-zone-keyboard-rgb-dkms-hp-wmi)
+- [Troubleshooting](#troubleshooting)
+- [Uninstallation](#uninstallation)
+
+---
+
+## System Requirements
+
+| Requirement | Details |
+|-------------|---------|
+| **OS** | Any x86_64 Linux distribution (glibc-based) |
+| **Kernel** | 5.15+ (pre-2023 models), 6.5+ (2023+ models), 6.18+ recommended |
+| **Runtime** | Self-contained — no .NET runtime needed |
+| **Privileges** | Root/sudo required for hardware access |
+| **GPU** | NVIDIA: `nvidia-smi` for GPU monitoring (optional) |
+| **Display** | X11 or Wayland for GUI (CLI works headless) |
+
+---
+
+## Quick Install
+
+### CLI Only (Recommended for servers/headless)
+
+```bash
+# Download latest release
+wget https://github.com/theantipopau/omencore/releases/download/v3.3.0/OmenCore-3.3.0-linux-x64.zip
+
+# Extract
+mkdir -p OmenCore-linux-x64
+unzip OmenCore-3.3.0-linux-x64.zip -d OmenCore-linux-x64
+cd OmenCore-linux-x64
+
+# Make executable
+chmod +x omencore-cli
+
+# Verify it works
+sudo ./omencore-cli status
+
+# (Optional) Install system-wide
+sudo cp omencore-cli /usr/local/bin/
+```
+
+### GUI + CLI
+
+```bash
+# Download latest release
+wget https://github.com/theantipopau/omencore/releases/download/v3.3.0/OmenCore-3.3.0-linux-x64.zip
+
+# Extract
+mkdir -p OmenCore-linux-x64
+unzip OmenCore-3.3.0-linux-x64.zip -d OmenCore-linux-x64
+cd OmenCore-linux-x64
+
+# Make both executables
+chmod +x omencore-cli omencore-gui
+
+# Run GUI (prefer user session)
+./omencore-gui
+
+# Or run CLI
+sudo ./omencore-cli status
+```
+
+---
+
+## Distribution-Specific Setup
+
+### Ubuntu / Pop!_OS / Debian
+
+```bash
+# Install dependencies
+sudo apt update
+sudo apt install -y unzip wget libice6 libsm6 libx11-6 libxext6 libxrandr2 libxi6
+
+# Download and extract OmenCore
+wget https://github.com/theantipopau/omencore/releases/download/v3.3.0/OmenCore-3.3.0-linux-x64.zip
+mkdir -p OmenCore-linux-x64
+unzip OmenCore-3.3.0-linux-x64.zip -d OmenCore-linux-x64
+cd OmenCore-linux-x64
+chmod +x omencore-cli omencore-gui
+
+# Load kernel modules
+sudo modprobe hp-wmi
+sudo modprobe ec_sys write_support=1  # May fail on newer kernels — that's OK
+
+# Test
+sudo ./omencore-cli status
+```
+
+**Ubuntu-specific notes:**
+- **AppArmor** may block EC access. Check `dmesg | grep apparmor` for denials.
+- **Secure Boot** may prevent loading unsigned kernel modules. Either disable Secure Boot or sign the module.
+
+### Fedora
+
+```bash
+# Install dependencies
+sudo dnf install -y unzip wget libICE libSM libX11 libXext libXrandr libXi
+
+# Download and extract
+wget https://github.com/theantipopau/omencore/releases/download/v3.3.0/OmenCore-3.3.0-linux-x64.zip
+mkdir -p OmenCore-linux-x64
+unzip OmenCore-3.3.0-linux-x64.zip -d OmenCore-linux-x64
+cd OmenCore-linux-x64
+chmod +x omencore-cli omencore-gui
+
+# Load HP-WMI module
+sudo modprobe hp-wmi
+
+# Test
+sudo ./omencore-cli status
+```
+
+**Fedora-specific notes:**
+- **Fedora 43+** removed `ec_sys` from the default kernel. Use `hp-wmi` for 2023+ models.
+- **SELinux** may require policy adjustments. Run `sudo setsebool -P domain_can_mmap_files 1` if you encounter permission issues.
+
+### Arch Linux / CachyOS / Manjaro
+
+```bash
+# Install dependencies (most already present)
+sudo pacman -S --needed unzip wget libice libsm libx11 libxext libxrandr libxi
+
+# Download and extract
+wget https://github.com/theantipopau/omencore/releases/download/v3.3.0/OmenCore-3.3.0-linux-x64.zip
+mkdir -p OmenCore-linux-x64
+unzip OmenCore-3.3.0-linux-x64.zip -d OmenCore-linux-x64
+cd OmenCore-linux-x64
+chmod +x omencore-cli omencore-gui
+
+# Load kernel modules
+sudo modprobe hp-wmi
+sudo modprobe ec_sys write_support=1
+
+# Test
+sudo ./omencore-cli status
+```
+
+**Arch-specific notes:**
+- After kernel updates, modules may need to be reloaded: `sudo modprobe -r hp-wmi && sudo modprobe hp-wmi`
+- CachyOS users with custom kernels may have additional hp-wmi patches pre-applied.
+
+### openSUSE
+
+```bash
+# Install dependencies
+sudo zypper install unzip wget libICE6 libSM6 libX11-6 libXext6 libXrandr2 libXi6
+
+# Download and extract
+wget https://github.com/theantipopau/omencore/releases/download/v3.3.0/OmenCore-3.3.0-linux-x64.zip
+mkdir -p OmenCore-linux-x64
+unzip OmenCore-3.3.0-linux-x64.zip -d OmenCore-linux-x64
+cd OmenCore-linux-x64
+chmod +x omencore-cli omencore-gui
+
+# Load kernel modules
+sudo modprobe hp-wmi
+
+# Test
+sudo ./omencore-cli status
+```
+
+---
+
+## Kernel Module Setup
+
+OmenCore uses different kernel modules depending on your OMEN model generation.
+
+### Determine Your Model
+
+```bash
+# Check model name
+cat /sys/class/dmi/id/product_name
+
+# Check BIOS version
+cat /sys/class/dmi/id/bios_version
+
+# Check kernel version
+uname -r
+```
+
+### Module Requirements by Model
+
+| OMEN Generation | Module | Setup |
+|-----------------|--------|-------|
+| **2025+ OMEN Max** | `hp-wmi` (hwmon PWM) | `sudo modprobe hp-wmi` |
+| **2023+ (13th Gen+)** | `hp-wmi` | `sudo modprobe hp-wmi` |
+| **2020–2022** | `ec_sys` | `sudo modprobe ec_sys write_support=1` |
+| **Pre-2020** | `ec_sys` | `sudo modprobe ec_sys write_support=1` |
+
+### Make Modules Persistent (Survive Reboot)
+
+```bash
+# Create module load file
+echo -e "hp-wmi\nec_sys" | sudo tee /etc/modules-load.d/omencore.conf
+
+# Create module options file
+echo "options ec_sys write_support=1" | sudo tee /etc/modprobe.d/omencore.conf
+
+# Reload module configuration
+sudo systemctl restart systemd-modules-load.service
+```
+
+### Verify Module Status
+
+```bash
+# Check loaded modules
+lsmod | grep -E "hp_wmi|ec_sys"
+
+# Check HP-WMI sysfs (2023+ models)
+ls /sys/devices/platform/hp-wmi/ 2>/dev/null
+
+# Check EC access (pre-2023 models)
+ls /sys/kernel/debug/ec/ec0/io 2>/dev/null
+
+# Check ACPI platform profile (2025+ models)
+cat /sys/firmware/acpi/platform_profile 2>/dev/null
+cat /sys/firmware/acpi/platform_profile_choices 2>/dev/null
+```
+
+### When hp-wmi is present but profiles are missing
+
+Some boards expose non-standard or incomplete hp-wmi interfaces. Check what the kernel actually exported:
+
+```bash
+ls /sys/devices/platform/hp-wmi/*profile* 2>/dev/null
+```
+
+On selected OMEN firmware variants, forcing multiplexed hp-wmi routing can help:
+
+```bash
+# kernel cmdline parameter (set in bootloader, then reboot)
+hp_wmi.force_multiplex=1
+```
+
+Arch-family users may also try `hp-omen-gaming-wmi-dkms` from AUR. On many OMEN systems it effectively automates the hp-wmi profile setup that otherwise requires manual multiplex/path tuning. It is still not guaranteed to resolve profile control on every board.
+
+OmenCore 3.7.0 has an experimental compatibility layer for this path. It does not install or manage DKMS packages, but when a DKMS or patched upstream `hp_wmi` module exposes standard `hp-wmi`/`hwmon` files (`pwm*_enable`, `pwm*`, `fan*_input`, profile files), OmenCore detects the backend in `status` and `diagnose --report` and uses the same safe sysfs controls it uses for upstream hp-wmi.
+
+If profile control still fails after these steps, collect a report:
+
+```bash
+sudo ./omencore-cli diagnose --report > omencore-report.txt
+```
+
+---
+
+## GUI Installation
+
+The Avalonia-based GUI provides a graphical dashboard similar to the Windows version.
+
+### Requirements
+
+- X11 or Wayland display server
+- GUI libraries: `libice`, `libsm`, `libx11`, `libxext`, `libxrandr`, `libxi`
+
+### Running the GUI
+
+```bash
+# Standard launch
+./omencore-gui
+
+# Prefer EGL first, then GLX, then software fallback (default in v3.3.0)
+./omencore-gui
+
+# Force software rendering on Fedora/X11 systems where GLX fails or llvmpipe is blacklisted
+OMENCORE_GUI_RENDER_MODE=software ./omencore-gui
+
+# Prefer EGL explicitly if you want to avoid GLX first
+OMENCORE_GUI_RENDER_MODE=egl ./omencore-gui
+
+# If elevated launch is unavoidable, preserve desktop-session variables
+sudo --preserve-env=DISPLAY,XAUTHORITY,XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS,OMENCORE_GUI_RENDER_MODE ./omencore-gui
+
+# If using Wayland
+DISPLAY=:0 ./omencore-gui
+
+# Or with explicit Wayland
+WAYLAND_DISPLAY=wayland-0 ./omencore-gui
+
+# Check for missing libraries
+ldd ./omencore-gui | grep "not found"
+```
+
+### Desktop Entry (Optional)
+
+Create a `.desktop` file for application menu integration:
+
+```bash
+sudo tee /usr/share/applications/omencore.desktop << 'EOF'
+[Desktop Entry]
+Name=OmenCore
+Comment=HP OMEN & Victus Laptop Control Center
+Exec=pkexec /usr/local/bin/omencore-gui
+Icon=utilities-system-monitor
+Terminal=false
+Type=Application
+Categories=System;HardwareSettings;
+Keywords=fan;temperature;omen;hp;gaming;
+EOF
+```
+
+### System Tray (Optional)
+
+A shell-based tray helper is available in the source repository (not bundled in the release zip). It integrates with `yad`, `libappindicator`, or `pystray`:
+
+```bash
+# If using the pystray backend, install the Python dependency
+pip install pystray pillow
+
+# Download the script from the repository
+wget https://raw.githubusercontent.com/theantipopau/omencore/main/src/OmenCore.Linux/scripts/omencore-tray.sh
+chmod +x omencore-tray.sh
+
+# Run tray icon (requires omencore-cli in PATH)
+./omencore-tray.sh start &
+```
+
+---
+
+## CLI Usage
+
+### System Status
+
+```bash
+# Full system overview
+sudo omencore-cli status
+
+# JSON output (for scripting)
+sudo omencore-cli status --json
+
+# Pipe to jq for specific fields
+sudo omencore-cli status --json | jq '.cpu_temp'
+```
+
+### Fan Control
+
+```bash
+# View current fan status
+sudo omencore-cli fan --status
+
+# Apply fan profiles
+sudo omencore-cli fan --profile auto       # BIOS-managed (default)
+sudo omencore-cli fan --profile silent     # Low noise
+sudo omencore-cli fan --profile balanced   # Balanced
+sudo omencore-cli fan --profile gaming     # Gaming workloads
+sudo omencore-cli fan --profile max        # Maximum cooling
+
+# Set specific fan speed (percentage)
+sudo omencore-cli fan --speed 70
+
+# Set individual fan RPMs
+sudo omencore-cli fan --fan1 3000 --fan2 2800
+
+# Custom fan curve
+sudo omencore-cli fan --curve "40:20,50:30,60:50,70:70,80:90,90:100"
+# Format: temp1:speed1,temp2:speed2,...
+
+# Enable/disable fan boost
+sudo omencore-cli fan --boost
+
+# Battery-aware auto mode
+sudo omencore-cli fan --battery-aware
+```
+
+### Performance Modes
+
+```bash
+# Switch performance mode
+sudo omencore-cli perf --mode default      # Balanced
+sudo omencore-cli perf --mode balanced     # Moderate boost
+sudo omencore-cli perf --mode performance  # Maximum boost
+sudo omencore-cli perf --mode cool         # Throttled for quiet
+
+# Set TCC offset (Intel thermal throttle)
+sudo omencore-cli perf --tcc 5             # Throttle 5°C below TjMax
+
+# Set thermal power limit level (0-5)
+sudo omencore-cli perf --power-limit 3
+```
+
+### GPU TGP and Power Limit Notes (Linux)
+
+- OmenCore Linux CLI does not currently expose a direct dGPU TGP command (for example, no `gpu --tgp` flag yet).
+- `perf --power-limit` controls platform thermal/power policy and CPU-side behavior, not NVIDIA/AMD board-level VBIOS TGP directly.
+- If you flashed a custom VBIOS, validate effective GPU power limits with vendor tooling:
+
+```bash
+# NVIDIA: check real-time draw and active limit
+nvidia-smi --query-gpu=name,power.draw,power.limit --format=csv
+
+# Optional live watch
+watch -n 1 nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.limit --format=csv,noheader
+```
+
+Planned direction for future Linux releases: add explicit GPU power-limit control where firmware, driver stack, and hardware safety checks allow it.
+
+### Keyboard RGB
+
+```bash
+# Set all zones to one color
+sudo omencore-cli keyboard --color FF0000  # Red
+
+# Set specific zone (0-3)
+sudo omencore-cli keyboard --zone 0 --color 00FF00  # Zone 1 green
+
+# Set brightness (0-100)
+sudo omencore-cli keyboard --brightness 80
+
+# Turn off keyboard backlight
+sudo omencore-cli keyboard --off
+```
+
+### Battery Management
+
+```bash
+# Check battery status
+sudo omencore-cli battery status
+
+# Set charge threshold (limits max charge)
+sudo omencore-cli battery threshold 80     # Don't charge above 80%
+sudo omencore-cli battery threshold 0      # Disable threshold (charge to 100%)
+
+# Set battery profile
+sudo omencore-cli battery profile quiet         # Low power
+sudo omencore-cli battery profile balanced      # Normal
+sudo omencore-cli battery profile performance   # Max power on battery
+```
+
+### Real-Time Monitoring
+
+```bash
+# Live dashboard with color-coded progress bars
+sudo omencore-cli monitor
+
+# Custom poll interval (milliseconds)
+sudo omencore-cli monitor --interval 2000
+```
+
+### Diagnostics
+
+```bash
+# Full environment diagnostics
+sudo omencore-cli diagnose
+
+# JSON diagnostics output
+sudo omencore-cli diagnose --json
+
+# Generate a debug report for GitHub issues
+sudo omencore-cli diagnose --report > omencore-report.txt
+
+# Export diagnostics to file
+sudo omencore-cli diagnose --export /tmp/omencore-diag.json
+```
+
+### Configuration
+
+```bash
+# Show current configuration
+omencore-cli config --show
+
+# Set configuration values
+omencore-cli config --set fan.profile=gaming
+omencore-cli config --set keyboard.color=00FF00
+omencore-cli config --set general.poll_interval_ms=3000
+```
+
+---
+
+## Daemon / Background Service
+
+Run OmenCore as a background service to automatically manage fans, apply profiles on boot, and maintain custom fan curves.
+
+### Install as systemd Service
+
+```bash
+# Install the service
+sudo ./omencore-cli daemon --install
+
+# Enable on boot
+sudo systemctl enable omencore
+
+# Start now
+sudo systemctl start omencore
+
+# Check status
+sudo systemctl status omencore
+```
+
+### Manage the Service
+
+```bash
+# Stop the service
+sudo systemctl stop omencore
+
+# Restart (reloads config)
+sudo systemctl restart omencore
+
+# View live logs
+journalctl -u omencore -f
+
+# View last 50 log lines
+journalctl -u omencore -n 50
+```
+
+### Run in Foreground (Debugging)
+
+```bash
+# Run daemon in foreground (useful for debugging)
+sudo ./omencore-cli daemon --run
+
+# With custom config
+sudo ./omencore-cli daemon --run --config /path/to/config.toml
+```
+
+### Generate Service Files
+
+```bash
+# Print systemd unit file (for manual installation)
+./omencore-cli daemon --generate-service
+
+# Generate default config file
+./omencore-cli daemon --generate-config > ~/.config/omencore/config.toml
+```
+
+### Uninstall Service
+
+```bash
+sudo ./omencore-cli daemon --uninstall
+```
+
+### Daemon Features
+
+- **Auto fan curve** — Continuously adjusts fan speed based on temperature with configurable curve
+- **Hysteresis** — Prevents fan speed oscillation (default 3°C deadzone)
+- **Battery-aware** — Reduces fan speed by 20% on battery power (below 85°C)
+- **Config reload** — Watches config file for changes (restart service apply)
+- **Low-overhead mode** — On battery: longer poll intervals (5s vs 2s), reduced logging, cached sensor paths
+- **Graceful shutdown** — Restores BIOS fan control on exit
+- **Auto-restart** — systemd restarts service on failure (5s delay)
+
+---
+
+## Configuration
+
+### Config File Locations
+
+| Location | Priority | Use Case |
+|----------|----------|----------|
+| `/etc/omencore/config.toml` | System-wide | Daemon/service settings |
+| `~/.config/omencore/config.toml` | Per-user | User preferences |
+| `~/.config/omencore/config.json` | Per-user | Quick key-value settings |
+
+### Configuration Reference
+
+```toml
+[general]
+poll_interval_ms = 2000          # Sensor polling interval
+log_level = "info"               # debug, info, warn, error
+
+[general.low_overhead]           # Battery-aware throttling
+enable_on_battery = true
+poll_interval_ms = 5000          # Slower polling on battery
+disable_sensor_scanning = true
+reduce_logging = true
+
+[fan]
+profile = "auto"                 # auto, silent, balanced, gaming, max, custom
+boost = false                    # Fan boost toggle
+smooth_transition = true         # Gradual fan speed changes
+
+[fan.curve]                      # Used when profile = "custom"
+enabled = false
+hysteresis = 3                   # °C deadzone to prevent oscillation
+points = [
+    { temp = 40, speed = 20 },
+    { temp = 50, speed = 30 },
+    { temp = 60, speed = 50 },
+    { temp = 70, speed = 70 },
+    { temp = 80, speed = 90 },
+    { temp = 90, speed = 100 }
+]
+
+[performance]
+mode = "balanced"                # default, balanced, performance, cool
+
+[keyboard]
+enabled = true
+color = "FF0000"
+brightness = 100
+
+[startup]
+apply_on_boot = true             # Apply saved settings when daemon starts
+restore_on_exit = true           # Restore BIOS defaults when daemon exits
+```
+
+---
+
+## Fan Control Methods
+
+OmenCore automatically selects the best fan control method available for your hardware.
+
+### Method Priority (Highest to Lowest)
+
+1. **hp-wmi sysfs** (2023+ models)
+   - Path: `/sys/devices/platform/hp-wmi/`
+   - Uses `thermal_profile`, `fan1_output`/`fan2_output`, `fan_always_on`
+   - Most reliable for modern models
+
+2. **hp-wmi hwmon PWM** (2025+ OMEN Max)
+   - Path: `/sys/devices/platform/hp-wmi/hwmon/hwmonN/`
+   - Direct PWM control: `pwm1_enable` (0=full, 1=manual, 2=auto)
+   - RPM readback from `fan1_input`/`fan2_input`
+
+3. **ACPI Platform Profile** (kernel 5.18+)
+   - Path: `/sys/firmware/acpi/platform_profile`
+   - Values: `low-power`, `balanced`, `performance`
+   - Profile-based rather than direct fan control
+
+4. **ec_sys Direct EC** (pre-2023 models)
+   - Path: `/sys/kernel/debug/ec/ec0/io`
+   - Direct reads/writes to EC registers
+   - Based on [omen-fan](https://github.com/alou-S/omen-fan) register documentation
+   - **OMEN 15-dc0xxx (board `84DB`)**, tested by [murilopontes](https://github.com/murilopontes/hp-omen-fan-linux): fan boost lives at EC offset `0xEC` (write `1` for max, `0` for auto). On the stock `hp-wmi`, `pwm1_enable=0` fails with `EINVAL`, while RPM readback through `fan1_input`/`fan2_input` works.
+   - **OMEN 15-dc0xxx (board 84DB):** fan boost at offset `0xEC` — write `1` for max, `0` for auto. Stock `hp-wmi` `pwm1_enable=0` fails with EINVAL; RPM readback via `fan1_input`/`fan2_input` works. See [hp-omen-fan-linux](https://github.com/murilopontes/hp-omen-fan-linux).
+
+### Safety Protections
+
+- **2025+ OMEN Max models** (`16t-ah0xxx`, `17t-ah0xxx`) — EC writes are **blocked** to prevent EC panic
+- Fan speed 0% is blocked in manual mode to prevent overheating
+- BIOS auto control is always restorable via `omencore-cli fan --profile auto`
+- Daemon restores BIOS control on service stop/crash
+
+---
+
+## Supported Models & Features
+
+| Feature | hp-wmi (2023+) | hwmon PWM (2025+) | ec_sys (pre-2023) |
+|---------|:--------------:|:-----------------:|:-----------------:|
+| Fan profile switching | Yes | Yes | Yes |
+| Manual fan speed % | Varies | Yes | Yes |
+| Custom fan curves | Varies | Yes | Yes |
+| RPM readback | If exposed | Yes | Yes |
+| Keyboard RGB (4-zone) | Yes | Yes | Yes |
+| Battery threshold | Yes | Yes | N/A |
+| Performance modes | Yes | Yes | EC-based |
+| Temperature monitoring | Yes | Yes | Yes |
+
+### Known Working Models
+
+| Model | Kernel | Method | Notes |
+|-------|--------|--------|-------|
+| OMEN 15 2018-19 (dc0xxx, 84DB) | 5.15+ | ec_sys + hp-wmi RPM | Fan max via EC `0xEC=1`; `pwm1_enable=0` returns EINVAL on stock kernel |
+| OMEN 15 2018-19 (dc0xxx, `84DB`) | 5.15+ | ec_sys + hp-wmi RPM | Fan max via EC `0xEC=1`; `pwm1_enable=0` returns `EINVAL` on the stock kernel (murilopontes' test) |
+| OMEN 15 2020 | 5.15+ | ec_sys | Full EC access |
+| OMEN 16 2022 | 5.19+ | ec_sys | Full EC access |
+| OMEN 16 2023 (wf0xxx) | 6.5+ | hp-wmi | Partial fan control |
+| OMEN 17 2021 | 5.15+ | ec_sys | Full EC access |
+| OMEN 16 2024 (xd0xxx) | 6.5+ | hp-wmi | WMI fan control |
+| OMEN Max 2025 | 6.18+ | hwmon PWM | EC writes blocked |
+| OMEN Transcend 14-fb1xxx (8E41) | 6.17+ | hp-wmi (capability-gated) | Usually telemetry/profile-only until kernel hp-wmi exposes fan target/thermal controls |
+
+### Run Diagnostics to Check Your Model
+
+```bash
+sudo ./omencore-cli diagnose
+```
+
+This will show:
+- Detected model name and product ID
+- Available kernel modules
+- Accessible sysfs paths
+- Recommended fan control method
+- Feature compatibility matrix
+
+---
+
+## Four-zone keyboard RGB (DKMS hp-wmi)
+
+> Contributed knowledge: this section is based on the Linux write-up in the OMEN Slim 16 (board `8D40`)
+> fork by [saikiranworks](https://github.com/saikiranworks/omencore), where it was worked out on real
+> hardware. The sysfs interface below is the community DKMS `hp-wmi` driver's, not the in-tree one.
+
+Many kernels' stock `hp_wmi` module does **not** expose a four-zone colour interface. If you installed
+the community DKMS build (for example `hp-omen-dkms`), OmenCore detects and uses these nodes
+automatically (it only ever writes to them if they exist):
+
+| Node (`/sys/devices/platform/hp-wmi/`) | Purpose |
+|---|---|
+| `fourzone_color` | All four zones in **one** file: 24 hex characters, `RRGGBB` x 4 |
+| `fourzone_brightness` | A separate hardware brightness gate, 0-255 |
+| `fourzone_animation` | Driver animations (not used by OmenCore yet) |
+
+### 1. Check the driver is the one you think it is
+
+```bash
+modinfo -n hp_wmi            # a DKMS build lives under /lib/modules/.../updates/dkms, not .../kernel/
+ls /sys/devices/platform/hp-wmi/fourzone_*
+```
+
+If the `fourzone_*` files are missing, the stock module is loaded: install the DKMS package for your
+distro (it needs `dkms`, a compiler and the kernel headers for the running kernel), then reload it with
+`sudo modprobe -r hp_wmi && sudo modprobe hp_wmi`. After kernel upgrades DKMS should rebuild it
+automatically; if it doesn't, run `sudo dkms autoinstall -k $(uname -r)`.
+
+### 2. "Colours apply but the keyboard stays dark" is almost always the brightness gate
+
+`fourzone_color` and `fourzone_brightness` are **independent**. A colour write can succeed while
+`fourzone_brightness` reads `0`, and the keyboard looks dead. This is not a permissions problem.
+
+OmenCore raises the gate to full when you set a visible (non-black) colour and the gate is at `0`. To
+keep an intentional "off" instead, set `OMENCORE_SKIP_BRIGHTNESS_INIT=1` in the environment of the
+daemon/CLI. To check or set it by hand:
+
+```bash
+cat /sys/devices/platform/hp-wmi/fourzone_brightness
+omencore-cli keyboard --brightness 100
+omencore-cli keyboard --color 00BFFF
+```
+
+### 3. Letting the GUI write without root (optional)
+
+These nodes are created `root:root` with mode `644`, so the GUI (running as your user) can't write to
+them, while `sudo omencore-cli keyboard` can. Prefer a **group** over making them world-writable:
+
+```bash
+# /etc/udev/rules.d/99-omencore-fourzone.rules
+ACTION=="add|change", SUBSYSTEM=="platform", KERNEL=="hp-wmi", \
+  RUN+="/bin/sh -c 'for f in fourzone_color fourzone_brightness fourzone_animation; do p=/sys/devices/platform/hp-wmi/$$f; [ -e $$p ] && chgrp plugdev $$p && chmod 0664 $$p; done; true'"
+```
+
+then `sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=platform --action=change`
+and make sure your user is in the `plugdev` group (or use whichever group your distro uses for
+hardware access).
+
+> **Do not** extend a rule like this to the fan PWM nodes (`pwm1`, `pwm1_enable`). Anything that can
+> write fan duty can stop the fans, so those stay root-only.
+
+### 4. Verify
+
+```bash
+omencore-cli keyboard                       # should report the keyboard as available
+echo 255 > /sys/devices/platform/hp-wmi/fourzone_brightness   # as root
+echo 00bfff00bfff00bfff00bfff > /sys/devices/platform/hp-wmi/fourzone_color
+```
+
+If the nodes exist, the writes succeed, the gate is non-zero and the keyboard is still dark, collect a
+report with `sudo omencore-cli diagnose --report` and open an issue.
+
+---
+
+## Troubleshooting
+
+### "Permission denied" Errors
+
+OmenCore requires root access for hardware control:
+```bash
+sudo ./omencore-cli status
+./omencore-gui
+# If elevated launch is unavoidable:
+sudo --preserve-env=DISPLAY,XAUTHORITY,XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS,OMENCORE_GUI_RENDER_MODE ./omencore-gui
+```
+
+### "ec_sys module not found"
+
+Some distributions (Fedora 43+, some Arch builds) don't include `ec_sys`:
+
+1. **Use hp-wmi instead** (2023+ models):
+   ```bash
+   sudo modprobe hp-wmi
+   ```
+
+2. **Check if debugfs is mounted** (required for ec_sys):
+   ```bash
+   mount | grep debugfs
+   # If not mounted:
+   sudo mount -t debugfs debugfs /sys/kernel/debug
+   ```
+
+### Fan Control Has No Effect
+
+1. **Check which method was detected**:
+   ```bash
+   sudo ./omencore-cli diagnose
+   ```
+
+2. **For very new models** (2025+), the hp-wmi driver may not yet support your laptop:
+   ```bash
+   dmesg | grep -i wmi
+   dmesg | grep -i omen
+   ```
+
+3. **Generate a debug report** for the developer:
+   ```bash
+   sudo ./omencore-cli diagnose --report > omencore-report.txt
+   ```
+
+4. **Transcend 14 note (boards 8C58/8E41)**:
+   - Legacy EC writes are intentionally blocked for safety on these boards.
+   - If `hp-wmi` exposes telemetry but no `thermal_profile` / `fan*_target`, control is limited by current kernel/firmware exposure.
+   - Collect and share:
+     ```bash
+     uname -a
+     sudo ./omencore-cli status
+     sudo ./omencore-cli diagnose
+     ls -la /sys/devices/platform/hp-wmi/
+     ls -la /sys/devices/platform/hp-wmi/hwmon/*/ 2>/dev/null
+     cat /sys/class/dmi/id/board_name
+     cat /sys/class/dmi/id/product_name
+     ```
+
+### GUI Won't Start
+
+```bash
+# Check for missing X11 libraries
+ldd ./omencore-gui | grep "not found"
+
+# Try with explicit display
+DISPLAY=:0 ./omencore-gui
+
+# For Wayland, try XWayland
+XDG_SESSION_TYPE=x11 ./omencore-gui
+
+# Force CPU/software rendering if GLX fails or llvmpipe is blacklisted
+OMENCORE_GUI_RENDER_MODE=software ./omencore-gui
+
+# Prefer EGL before GLX on X11
+OMENCORE_GUI_RENDER_MODE=egl ./omencore-gui
+
+# If you must run elevated, preserve DBus/session env vars
+sudo --preserve-env=DISPLAY,XAUTHORITY,XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS,OMENCORE_GUI_RENDER_MODE ./omencore-gui
+```
+
+Notes:
+- `SESSION_MANAGER environment variable not defined` is usually informational on X11 and is not the root cause by itself.
+- Running the GUI via raw `sudo ./omencore-gui` can drop session DBus context and trigger a blank/black startup on some systems.
+- OmenCore now retries once in software mode automatically if Linux renderer initialization fails.
+- After repeated renderer startup failures, OmenCore can persist `software` as a last-known-good render mode for next launch.
+- If terminal or `journalctl` output mentions `Unable to initialize GLX-based rendering` or `llvmpipe ... is blacklisted`, use `OMENCORE_GUI_RENDER_MODE=software` and retry.
+- v3.3.0 writes a GUI startup log on failure and prints its path to stderr so launch issues are not silent.
+
+### "Could not load file or assembly 'System.Runtime, Version=8.0.0.0'"
+
+This usually means you are running an older or incomplete Linux package.
+
+```bash
+# Verify you're on the fixed package
+./omencore-cli --version
+
+# Re-download v3.3.0 and extract into a clean folder
+rm -rf OmenCore-linux-x64
+mkdir -p OmenCore-linux-x64
+wget https://github.com/theantipopau/omencore/releases/download/v3.3.0/OmenCore-3.3.0-linux-x64.zip
+unzip OmenCore-3.3.0-linux-x64.zip -d OmenCore-linux-x64
+cd OmenCore-linux-x64
+chmod +x omencore-cli omencore-gui
+
+# Sanity check binary type
+file ./omencore-cli
+
+# Retry
+sudo ./omencore-cli status
+```
+
+### "Method not found: Boolean System.OperatingSystem.IsWindows()" (GUI)
+
+This is a known issue in older Linux GUI builds and is fixed in v3.3.0.
+
+```bash
+# Use the current package
+./omencore-gui --version || true
+./omencore-gui
+```
+
+### Temperatures Show 0°C
+
+1. **Ensure kernel modules are loaded**:
+   ```bash
+   lsmod | grep -E "hp_wmi|coretemp|k10temp"
+   ```
+
+2. **Load temperature modules**:
+   ```bash
+   sudo modprobe coretemp   # Intel CPUs
+   sudo modprobe k10temp    # AMD CPUs
+   ```
+
+### High CPU Usage From Daemon
+
+Increase the poll interval:
+```bash
+sudo omencore-cli config --set general.poll_interval_ms=5000
+sudo systemctl restart omencore
+```
+
+### Kernel Module Not Loading After Update
+
+On rolling-release distros (Arch, CachyOS), kernel updates may require module reload:
+```bash
+sudo modprobe -r hp-wmi
+sudo modprobe hp-wmi
+```
+
+---
+
+## Uninstallation
+
+### Remove OmenCore Files
+
+```bash
+# Stop daemon if running
+sudo systemctl stop omencore 2>/dev/null
+sudo systemctl disable omencore 2>/dev/null
+
+# Uninstall daemon
+sudo ./omencore-cli daemon --uninstall 2>/dev/null
+
+# Remove installed binary
+sudo rm -f /usr/local/bin/omencore-cli
+sudo rm -f /usr/local/bin/omencore-gui
+
+# Remove config and logs
+sudo rm -rf /etc/omencore
+rm -rf ~/.config/omencore
+
+# Remove desktop entry
+sudo rm -f /usr/share/applications/omencore.desktop
+
+# Remove extracted files
+rm -rf ~/OmenCore-linux-x64
+```
+
+### Remove Kernel Module Config (Optional)
+
+Only remove if you no longer need hp-wmi or ec_sys for other purposes:
+```bash
+sudo rm -f /etc/modules-load.d/omencore.conf
+sudo rm -f /etc/modprobe.d/omencore.conf
+```
+
+---
+
+## Keyboard backlight across suspend (optional)
+
+Some keyboards stay lit or come back at the wrong colour after sleep. This hook switches the four-zone
+colour and single-zone backlight off before suspend and restores them on resume:
+
+```bash
+sudo install -m 0755 scripts/linux/omencore-kbd-suspend.sh /lib/systemd/system-sleep/omencore-kbd-suspend.sh
+```
+
+The script is inside the release zip under `scripts/linux/` (from 4.5.0), and in the repository at the same path. Run the command
+from the folder you unpacked, or from a clone.
+
+It only touches the keyboard sysfs files and does nothing on boards that don't have them. Adapted from
+saikiranworks' fork. That fork also ships a udev rule making the hp-wmi fan PWM files world-writable; it is
+deliberately not included here, because it would let any local user set the fans to zero.
+
+## Additional Resources
+
+- [Main Documentation](../README.md) — Full feature overview
+- [LINUX_TESTING.md](LINUX_TESTING.md) — Detailed testing guide for distro-specific validation
+- [LINUX_QA_TESTING.md](LINUX_QA_TESTING.md) — QA testing checklist
+- [Discord Server](https://discord.gg/9WhJdabGk8) — Community support
+- [GitHub Issues](https://github.com/theantipopau/omencore/issues) — Bug reports and feature requests
+
+---
+
+## Contributing Linux Support
+
+If your OMEN model isn't supported:
+
+1. **Run diagnostics**: `sudo ./omencore-cli diagnose --report > report.txt`
+2. **Share the report** on Discord or GitHub Issues
+3. **Include**: Model name, product ID (`cat /sys/class/dmi/id/product_name`), kernel version, distro
+
+This helps us add your model to the database and verify which control methods work.
+
+## My board has no `platform_profile` / performance modes cannot be set
+
+That is a kernel-side limit, not something OmenCore can route around. See [LINUX_KERNEL_BOARD_SUPPORT.md](LINUX_KERNEL_BOARD_SUPPORT.md)
+for what to collect, how to send a board-ID patch upstream, and a safety checklist for out-of-tree drivers.

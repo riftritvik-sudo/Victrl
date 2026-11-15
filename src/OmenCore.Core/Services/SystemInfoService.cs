@@ -1,0 +1,640 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Management;
+using System.ServiceProcess;
+using OmenCore.Models;
+
+namespace OmenCore.Services
+{
+    public class SystemInfoService
+    {
+        private readonly LoggingService _logging;
+        private volatile SystemInfo? _cachedInfo;
+        private DependencyAudit? _cachedAudit;
+        private readonly object _systemInfoLock = new();
+        // ThreadStatic flag prevents STA COM-pump reentrancy: if the WMI queries are
+        // already running on this thread (COM yielded to another message), a reentrant
+        // caller will receive an empty placeholder rather than seeing partial / null data.
+        [System.ThreadStatic]
+        private static bool _buildingInfoOnThisThread;
+        
+        public SystemInfoService(LoggingService logging)
+        {
+            _logging = logging;
+        }
+        
+        /// <summary>
+        /// Perform a dependency audit to check for standalone operation.
+        /// </summary>
+        public DependencyAudit PerformDependencyAudit()
+        {
+            if (_cachedAudit != null && (DateTime.Now - _cachedAudit.AuditTime).TotalMinutes < 5)
+                return _cachedAudit;
+                
+            _logging.Info("═══════════════════════════════════════════════════");
+            _logging.Info("Starting Standalone Dependency Audit...");
+            
+            var audit = new DependencyAudit();
+            
+            // Check 1: HP WMI BIOS Provider (required for fan control)
+            audit.Checks.Add(CheckHpWmiBios());
+            
+            // Check 2: OMEN Gaming Hub service
+            audit.Checks.Add(CheckOmenGamingHub());
+            
+            // Check 3: HP System Event Utility
+            audit.Checks.Add(CheckHpSystemEventUtility());
+            
+            // Check 4: LibreHardwareMonitor availability
+            audit.Checks.Add(CheckLibreHardwareMonitor());
+            
+            // Check 5: PawnIO driver
+            audit.Checks.Add(CheckPawnIODriver());
+            
+            // If HP WMI BIOS is missing but another backend exists, this is a limited-feature
+            // fallback mode rather than a hard required dependency failure.
+            var hpWmiCheck = audit.Checks.FirstOrDefault(c => c.Name == "HP WMI BIOS");
+            var pawnIoCheck = audit.Checks.FirstOrDefault(c => c.Name == "PawnIO Driver");
+            var oghCheck = audit.Checks.FirstOrDefault(c => c.Name == "OMEN Gaming Hub");
+            var hasFallbackBackend = (pawnIoCheck?.IsDetected == true) || (oghCheck?.IsDetected == true);
+
+            if (hpWmiCheck != null && !hpWmiCheck.IsDetected && hasFallbackBackend)
+            {
+                hpWmiCheck.IsRequired = false;
+                hpWmiCheck.IsOptional = true;
+                hpWmiCheck.Status = "Fallback";
+                hpWmiCheck.Details = (pawnIoCheck?.IsDetected == true)
+                    ? "HP WMI BIOS not detected; using PawnIO fallback (some HP-service features may be unavailable)"
+                    : "HP WMI BIOS not detected; using OMEN service fallback (some direct BIOS features may be unavailable)";
+            }
+            
+            // Determine overall status
+            var requiredMissing = audit.Checks.Where(c => c.IsRequired && !c.IsDetected).ToList();
+            var optionalMissing = audit.Checks.Where(c => c.IsOptional && !c.IsDetected).ToList();
+            
+            if (requiredMissing.Any())
+            {
+                audit.Status = StandaloneStatus.Limited;
+                audit.StatusText = "Limited";
+                audit.StatusColor = "#FF6B6B"; // Red
+                audit.DegradationClassification = "Critical";
+                audit.Summary = $"Critical degradation: missing {requiredMissing.Count} required component(s): {string.Join(", ", requiredMissing.Select(c => c.Name))}";
+            }
+            // P1-2 fix: threshold raised from >= 2 to >= 3, and LHM is no longer counted
+            // as optional (it's explicitly not needed). This prevents clean standalone installs
+            // (no OGH + no HP-SEU, but PawnIO present) from showing "Degraded".
+            // Degraded now requires 3+ optional components absent, meaning at minimum:
+            // OGH + HP-SEU + PawnIO are all absent (i.e. no EC driver AND no HP support apps).
+            else if (optionalMissing.Count >= 3)
+            {
+                audit.Status = StandaloneStatus.Degraded;
+                audit.StatusText = "Degraded";
+                audit.StatusColor = "#FFD93D"; // Yellow
+                audit.DegradationClassification = "Optional";
+                audit.Summary = $"Optional degradation: fully standalone, but {optionalMissing.Count} optional component(s) unavailable (OGH and HP-SEU are not required for core operation)";
+            }
+            else
+            {
+                if (hpWmiCheck != null && !hpWmiCheck.IsDetected && hasFallbackBackend)
+                {
+                    audit.Status = StandaloneStatus.Limited;
+                    audit.StatusText = "Limited";
+                    audit.StatusColor = "#FFD93D"; // Yellow
+                    audit.DegradationClassification = "Critical";
+                    audit.Summary = "Critical degradation: direct HP WMI BIOS interface is unavailable; fallback backend is active (core fan control works, some HP-dependent features may be limited)";
+                }
+                else
+                {
+                    audit.Status = StandaloneStatus.OK;
+                    audit.StatusText = "Standalone";
+                    audit.StatusColor = "#00FF88"; // Green
+                    audit.DegradationClassification = "None";
+                    audit.Summary = "OmenCore is running fully standalone without HP dependencies";
+                }
+            }
+            
+            _logging.Info($"Dependency Audit Complete: {audit.StatusText}");
+            _logging.Info($"  Summary: {audit.Summary}");
+            _logging.Info("═══════════════════════════════════════════════════");
+            
+            _cachedAudit = audit;
+            return audit;
+        }
+        
+        private DependencyCheck CheckHpWmiBios()
+        {
+            var check = new DependencyCheck
+            {
+                Name = "HP WMI BIOS",
+                Description = "HP WMI interface for fan/thermal control",
+                IsRequired = true,
+                IsOptional = false
+            };
+            
+            try
+            {
+                using var searcher = new ManagementObjectSearcher(@"root\wmi", "SELECT * FROM hpqBIntM");
+                var results = searcher.Get();
+                check.IsDetected = results.Count > 0;
+                check.Status = check.IsDetected ? "OK" : "Missing";
+                check.Details = check.IsDetected 
+                    ? "HP WMI BIOS interface available" 
+                    : "HP WMI BIOS not found - fan control will be limited";
+            }
+            catch
+            {
+                check.IsDetected = false;
+                check.Status = "Missing";
+                check.Details = "HP WMI BIOS query failed";
+            }
+            
+            _logging.Info($"  [{(check.IsDetected ? "✓" : "✗")}] {check.Name}: {check.Status}");
+            return check;
+        }
+        
+        private DependencyCheck CheckOmenGamingHub()
+        {
+            var check = new DependencyCheck
+            {
+                Name = "OMEN Gaming Hub",
+                Description = "HP OMEN Gaming Hub (OGH) - NOT required for standalone operation",
+                IsRequired = false,
+                IsOptional = true
+            };
+            
+            try
+            {
+                // Check for OGH service
+                var services = ServiceController.GetServices();
+                var oghService = services.FirstOrDefault(s => 
+                    s.ServiceName.Contains("OMEN", StringComparison.OrdinalIgnoreCase) ||
+                    s.ServiceName.Contains("HPOmen", StringComparison.OrdinalIgnoreCase) ||
+                    s.ServiceName.Contains("OmenAgent", StringComparison.OrdinalIgnoreCase));
+                    
+                if (oghService != null)
+                {
+                    check.IsDetected = true;
+                    check.Status = oghService.Status == ServiceControllerStatus.Running ? "Running" : "Stopped";
+                    check.Details = $"OGH service found: {oghService.ServiceName} ({check.Status})";
+                }
+                else
+                {
+                    // Check for OGH process
+                    var oghProcess = Process.GetProcesses().FirstOrDefault(p =>
+                        p.ProcessName.Contains("OmenCommand", StringComparison.OrdinalIgnoreCase) ||
+                        p.ProcessName.Contains("HPOmen", StringComparison.OrdinalIgnoreCase));
+                        
+                    check.IsDetected = oghProcess != null;
+                    check.Status = check.IsDetected ? "Running" : "Not Installed";
+                    check.Details = check.IsDetected 
+                        ? "OGH process detected - OmenCore can coexist"
+                        : "OGH not installed - OmenCore running standalone ✓";
+                }
+            }
+            catch (Exception ex)
+            {
+                check.IsDetected = false;
+                check.Status = "Unknown";
+                check.Details = $"Could not check OGH status: {ex.Message}";
+            }
+            
+            _logging.Info($"  [{(check.IsDetected ? "!" : "✓")}] {check.Name}: {check.Status}");
+            return check;
+        }
+        
+        private DependencyCheck CheckHpSystemEventUtility()
+        {
+            var check = new DependencyCheck
+            {
+                Name = "HP System Event Utility",
+                Description = "Required for OMEN key handling on some models",
+                IsRequired = false,
+                IsOptional = true
+            };
+            
+            try
+            {
+                var services = ServiceController.GetServices();
+                var hpSeu = services.FirstOrDefault(s => 
+                    s.ServiceName.Equals("HPSysEventSvc", StringComparison.OrdinalIgnoreCase) ||
+                    s.ServiceName.Contains("HPSystemEvent", StringComparison.OrdinalIgnoreCase));
+                    
+                check.IsDetected = hpSeu != null;
+                check.Status = check.IsDetected 
+                    ? (hpSeu!.Status == ServiceControllerStatus.Running ? "Running" : "Stopped")
+                    : "Not Installed";
+                check.Details = check.IsDetected
+                    ? $"HP System Event Utility: {check.Status}"
+                    : "HP System Event Utility not installed - OMEN key may use fallback";
+            }
+            catch
+            {
+                check.IsDetected = false;
+                check.Status = "Unknown";
+                check.Details = "Could not check HP System Event Utility";
+            }
+            
+            _logging.Info($"  [{(check.IsDetected ? "✓" : "○")}] {check.Name}: {check.Status}");
+            return check;
+        }
+        
+        private DependencyCheck CheckLibreHardwareMonitor()
+        {
+            var check = new DependencyCheck
+            {
+                Name = "LibreHardwareMonitor",
+                Description = "Hardware monitoring library (no longer required — self-sustaining mode)",
+                IsRequired = false,
+                IsOptional = false  // Explicitly not needed; absence should never degrade status
+            };
+            
+            try
+            {
+                // Check if LHM DLL exists (optional enhancement, not required)
+                var lhmPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LibreHardwareMonitorLib.dll");
+                check.IsDetected = File.Exists(lhmPath);
+                check.Status = check.IsDetected ? "OK" : "Not Needed";
+                check.Details = check.IsDetected
+                    ? "LibreHardwareMonitor library present (optional)"
+                    : "Not required — OmenCore uses self-sustaining monitoring (WMI BIOS + NVAPI)";
+            }
+            catch
+            {
+                check.IsDetected = false;
+                check.Status = "Not Needed";
+                check.Details = "Not required — OmenCore uses self-sustaining monitoring";
+            }
+            
+            var symbol = check.IsDetected ? "✓" : "○";
+            _logging.Info($"  [{symbol}] {check.Name}: {check.Status}");
+            return check;
+        }
+        
+private DependencyCheck CheckPawnIODriver()
+        {
+            var check = new DependencyCheck
+            {
+                Name = "PawnIO Driver",
+                Description = "Ring0 driver for EC access (optional)",
+                IsRequired = false,
+                IsOptional = true
+            };
+            
+            try
+            {
+                // Method 1: Check for PawnIO service
+                var services = ServiceController.GetServices();
+                var pawnio = services.FirstOrDefault(s => 
+                    s.ServiceName.Equals("PawnIO", StringComparison.OrdinalIgnoreCase));
+                
+                if (pawnio != null)
+                {
+                    check.IsDetected = true;
+                    check.Status = pawnio.Status == ServiceControllerStatus.Running ? "Running" : "Stopped";
+                    check.Details = $"PawnIO driver: {check.Status} - EC access available";
+                }
+                else
+                {
+                    // Method 2: Check registry (same as CapabilityDetectionService)
+                    using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO");
+                    if (key != null)
+                    {
+                        check.IsDetected = true;
+                        check.Status = "Installed";
+                        check.Details = "PawnIO installed (found in registry)";
+                    }
+                    else
+                    {
+                        // Method 3: Check default installation path
+                        string defaultPath = System.IO.Path.Combine(
+                            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), 
+                            "PawnIO", "PawnIOLib.dll");
+                        if (System.IO.File.Exists(defaultPath))
+                        {
+                            check.IsDetected = true;
+                            check.Status = "Installed";
+                            check.Details = "PawnIO installed (found at default path)";
+                        }
+                        else
+                        {
+                            check.IsDetected = false;
+                            check.Status = "Not Installed";
+                            check.Details = "PawnIO not installed - using WMI fallback";
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                check.IsDetected = false;
+                check.Status = "Unknown";
+                check.Details = "Could not check PawnIO status";
+            }
+            
+            _logging.Info($"  [{(check.IsDetected ? "✓" : "○")}] {check.Name}: {check.Status}");
+            return check;
+        }
+        
+        /// <summary>
+        /// Clear the dependency audit cache to force a fresh check.
+        /// </summary>
+        public void ClearAuditCache()
+        {
+            _cachedAudit = null;
+        }
+        
+        public SystemInfo GetSystemInfo()
+        {
+            if (_cachedInfo != null)
+                return _cachedInfo;
+
+            // Guard against COM STA reentrancy: if the UI thread is already inside this
+            // method building SystemInfo (WMI COM calls may pump the STA message queue and
+            // allow another reentrant call), return an empty placeholder so the caller
+            // gets null-safe values rather than corrupting the build-in-progress.
+            if (_buildingInfoOnThisThread)
+                return new SystemInfo();
+
+            lock (_systemInfoLock)
+            {
+                if (_cachedInfo != null)
+                    return _cachedInfo;
+
+                _buildingInfoOnThisThread = true;
+                var info = new SystemInfo();
+
+                try
+                {
+                    // CPU Information
+                    using (var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_Processor"))
+                    {
+                        var cpu = searcher.Get().Cast<ManagementObject>().FirstOrDefault();
+                        if (cpu != null)
+                        {
+                            info.CpuName = cpu["Name"]?.ToString()?.Trim() ?? "Unknown CPU";
+                            info.CpuCores = Convert.ToInt32(cpu["NumberOfCores"] ?? 0);
+                            info.CpuThreads = Convert.ToInt32(cpu["NumberOfLogicalProcessors"] ?? 0);
+                            
+                            // Detect CPU vendor
+                            var cpuName = info.CpuName.ToLowerInvariant();
+                            if (cpuName.Contains("intel"))
+                                info.CpuVendor = "Intel";
+                            else if (cpuName.Contains("amd"))
+                                info.CpuVendor = "AMD";
+                            else
+                                info.CpuVendor = "Unknown";
+
+                            // detect Strix Point (14th Gen Intel) by name pattern
+                            info.IsStrixPointCpu = IsStrixPointCpu(cpuName);
+                        }
+                    }
+                    
+                    // RAM Information
+                    long totalRamBytes = 0;
+                    using (var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_PhysicalMemory"))
+                    {
+                        foreach (var ram in searcher.Get().Cast<ManagementObject>())
+                        {
+                            totalRamBytes += Convert.ToInt64(ram["Capacity"] ?? 0);
+                        }
+                    }
+                    info.RamSizeBytes = totalRamBytes;
+                    info.RamSizeFormatted = FormatBytes(totalRamBytes);
+                    
+                    // GPU Information - collect all GPUs
+                    using (var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_VideoController"))
+                    {
+                        foreach (var gpu in searcher.Get().Cast<ManagementObject>())
+                        {
+                            var gpuInfo = new GpuInfo
+                            {
+                                Name = gpu["Name"]?.ToString()?.Trim() ?? "Unknown GPU"
+                            };
+
+                            var adapterRam = gpu["AdapterRAM"];
+                            if (adapterRam != null)
+                            {
+                                var vramBytes = Convert.ToInt64(adapterRam);
+                                gpuInfo.MemoryFormatted = FormatBytes(vramBytes);
+                            }
+                            
+                            // Detect GPU vendor
+                            var gpuName = gpuInfo.Name.ToLowerInvariant();
+                            if (gpuName.Contains("nvidia") || gpuName.Contains("geforce") || gpuName.Contains("rtx") || gpuName.Contains("gtx"))
+                                gpuInfo.Vendor = "NVIDIA";
+                            else if (gpuName.Contains("amd") || gpuName.Contains("radeon"))
+                                gpuInfo.Vendor = "AMD";
+                            else if (gpuName.Contains("intel") || gpuName.Contains("arc") || gpuName.Contains("uhd") || gpuName.Contains("iris"))
+                                gpuInfo.Vendor = "Intel";
+                            else
+                                gpuInfo.Vendor = "Unknown";
+                            
+                            // Get driver version from WMI
+                            var driverVersion = gpu["DriverVersion"]?.ToString() ?? "";
+                            if (!string.IsNullOrEmpty(driverVersion))
+                            {
+                                // For NVIDIA, format the driver version (e.g., "32.0.15.6614" -> "566.14")
+                                if (gpuInfo.Vendor == "NVIDIA" && driverVersion.Contains("."))
+                                {
+                                    gpuInfo.DriverVersion = FormatNvidiaDriverVersion(driverVersion);
+                                }
+                                else
+                                {
+                                    gpuInfo.DriverVersion = driverVersion;
+                                }
+                            }
+                                
+                            info.Gpus.Add(gpuInfo);
+                        }
+                    }
+                    
+                    // Log GPU collection results
+                    if (info.Gpus.Count > 0)
+                    {
+                        _logging.Info($"Collected {info.Gpus.Count} GPU(s) from WMI:");
+                        foreach (var g in info.Gpus)
+                        {
+                            _logging.Info($"  → {g.Name} (Vendor: {g.Vendor}, Driver: {g.DriverVersion})");
+                        }
+                    }
+                    
+                    // Computer System Information
+                    using (var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_ComputerSystem"))
+                    {
+                        var system = searcher.Get().Cast<ManagementObject>().FirstOrDefault();
+                        if (system != null)
+                        {
+                            info.Manufacturer = system["Manufacturer"]?.ToString()?.Trim() ?? "Unknown";
+                            info.Model = system["Model"]?.ToString()?.Trim() ?? "Unknown";
+                            info.SystemFamily = system["SystemFamily"]?.ToString()?.Trim() ?? "";
+                            info.SystemSku = system["SystemSKUNumber"]?.ToString()?.Trim() ?? "";
+                            
+                            // Detect HP Gaming laptops (OMEN and Victus) and HP Spectre
+                            var manufacturer = info.Manufacturer.ToLowerInvariant();
+                            var model = info.Model.ToLowerInvariant();
+                            var isHp = manufacturer.Contains("hp") || manufacturer.Contains("hewlett");
+                            
+                            // Also check for generic HP motherboard names (replacement cases)
+                            // "Thetiger" is an HP internal codename used on some replaced motherboards
+                            bool hasOmenCodename = model.Contains("thetiger") || model.Contains("dragonfire") || 
+                                                   model.Contains("shadowcat") || model.Contains("victusdragon");
+                            
+                            info.IsHpOmen = isHp && (model.Contains("omen") || hasOmenCodename);
+                            info.IsHpVictus = isHp && model.Contains("victus");
+                            info.IsHpSpectre = isHp && model.Contains("spectre");
+                            
+                            if (info.IsHpOmen)
+                            {
+                                if (hasOmenCodename && !model.Contains("omen"))
+                                    _logging.Info($"HP OMEN system detected (via codename): {info.Manufacturer} {info.Model}");
+                                else
+                                    _logging.Info($"HP OMEN system detected: {info.Manufacturer} {info.Model}");
+                            }
+                            else if (info.IsHpVictus)
+                                _logging.Info($"HP Victus system detected: {info.Manufacturer} {info.Model}");
+                            else if (info.IsHpSpectre)
+                                _logging.Info($"HP Spectre system detected: {info.Manufacturer} {info.Model}");
+                            else if (isHp)
+                                _logging.Warn($"Non-gaming HP system: {info.Manufacturer} {info.Model}");
+                            else
+                                _logging.Warn($"Non-HP system: {info.Manufacturer} {info.Model}");
+                        }
+                    }
+                    
+                    // BIOS Information (for HP BIOS update checking)
+                    using (var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_BIOS"))
+                    {
+                        var bios = searcher.Get().Cast<ManagementObject>().FirstOrDefault();
+                        if (bios != null)
+                        {
+                            info.BiosVersion = bios["SMBIOSBIOSVersion"]?.ToString()?.Trim() ?? "";
+                            info.BiosDate = bios["ReleaseDate"]?.ToString()?.Trim() ?? "";
+                            info.SerialNumber = bios["SerialNumber"]?.ToString()?.Trim() ?? "";
+                            _logging.Info($"BIOS: {info.BiosVersion} (Released: {info.BiosDate})");
+                        }
+                    }
+                    
+                    // Baseboard Information (ProductId drives OmenCore capability lookup).
+                    using (var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_BaseBoard"))
+                    {
+                        var baseboard = searcher.Get().Cast<ManagementObject>().FirstOrDefault();
+                        if (baseboard != null)
+                        {
+                            info.ProductName = baseboard["Product"]?.ToString()?.Trim() ?? "";
+                        }
+                    }
+                    
+                    // Additional product info from ComputerSystemProduct
+                    using (var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_ComputerSystemProduct"))
+                    {
+                        var product = searcher.Get().Cast<ManagementObject>().FirstOrDefault();
+                        if (product != null)
+                        {
+                            // Some firmware exposes the SKU only through ComputerSystemProduct.
+                            // Prefer Win32_ComputerSystem.SystemSKUNumber when it is present,
+                            // because IdentifyingNumber may be an asset/serial-like identifier.
+                            if (string.IsNullOrEmpty(info.SystemSku))
+                                info.SystemSku = product["SKUNumber"]?.ToString()?.Trim() ?? "";
+                            info.SystemProductIdentifyingNumber = product["IdentifyingNumber"]?.ToString()?.Trim() ?? "";
+                            _logging.Info($"System SKU: {info.SystemSku}; system product identifying number: {info.SystemProductIdentifyingNumber}");
+                        }
+                    }
+                    
+                    // OS Information
+                    using (var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_OperatingSystem"))
+                    {
+                        var os = searcher.Get().Cast<ManagementObject>().FirstOrDefault();
+                        if (os != null)
+                        {
+                            info.OsVersion = os["Caption"]?.ToString()?.Trim() ?? "Unknown OS";
+                        }
+                    }
+                    
+                    _logging.Info($"System Info: {info.CpuName}, {info.CpuCores} cores / {info.CpuThreads} threads, {info.RamSizeFormatted}, {info.Gpus.Count} GPU(s)");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Error($"Failed to retrieve system information: {ex.Message}");
+                }
+                finally
+                {
+                    // Always clear the reentrancy guard regardless of success or failure.
+                    _buildingInfoOnThisThread = false;
+                }
+                
+                // Only publish the fully-populated object — prevents concurrent callers from
+                // seeing a partially-built SystemInfo during the ~3-second WMI population window.
+                _cachedInfo = info;
+                return _cachedInfo;
+            }
+        }
+        
+        private string FormatBytes(long bytes)
+        {
+            if (bytes == 0) return "0 B";
+            
+            string[] sizes = { "B", "KB", "MB", "GB", "TB" };
+            int order = 0;
+            double size = bytes;
+            
+            while (size >= 1024 && order < sizes.Length - 1)
+            {
+                order++;
+                size /= 1024;
+            }
+            
+            return $"{size:F0} {sizes[order]}";
+        }
+        
+        /// <summary>
+        /// Formats NVIDIA driver version from WMI format (e.g., "32.0.15.6614") to user-friendly format (e.g., "566.14").
+        /// </summary>
+        private string FormatNvidiaDriverVersion(string wmiVersion)
+        {
+            try
+            {
+                // NVIDIA WMI driver version format: "32.0.15.6614" or "31.0.15.5525"
+                // The last 5 digits represent the actual driver version: XXXYZ -> XXX.YZ
+                var parts = wmiVersion.Split('.');
+                if (parts.Length >= 4)
+                {
+                    var lastPart = parts[2] + parts[3]; // Combine last two parts
+                    if (lastPart.Length >= 5)
+                    {
+                        // Take last 5 digits and format as XXX.YY
+                        var versionDigits = lastPart.Substring(lastPart.Length - 5);
+                        var major = versionDigits.Substring(0, 3).TrimStart('0');
+                        var minor = versionDigits.Substring(3, 2);
+                        if (string.IsNullOrEmpty(major)) major = "0";
+                        return $"{major}.{minor}";
+                    }
+                }
+                return wmiVersion;
+            }
+            catch
+            {
+                return wmiVersion;
+            }
+        }
+        
+        public void ClearCache()
+        {
+            _cachedInfo = null;
+        }
+
+        /// <summary>
+        /// Determines if a CPU name string corresponds to Intel Strix Point (14th Gen mobile).
+        /// Exposed as static helper for unit tests.
+        /// </summary>
+        public static bool IsStrixPointCpu(string cpuName)
+        {
+            if (string.IsNullOrWhiteSpace(cpuName)) return false;
+            var lower = cpuName.ToLowerInvariant();
+            return lower.Contains("strix point") || lower.Contains("14th gen");
+        }
+    }
+}

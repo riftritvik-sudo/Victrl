@@ -1,0 +1,218 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Linq;
+using System.Threading.Tasks;
+using OmenCore.Services;
+
+namespace OmenCore.Services.Rgb
+{
+    public class CorsairRgbProvider : IRgbProvider
+    {
+        private readonly LoggingService _logging;
+        private readonly ConfigurationService _configService;
+        private CorsairDeviceService? _service;
+
+        public string ProviderName => "Corsair";
+        public string ProviderId => "corsair";
+        public bool IsAvailable { get; private set; } = false;
+        public bool IsConnected => IsAvailable && (_service?.Devices.Count ?? 0) > 0;
+        public int DeviceCount => _service?.Devices.Count ?? 0;
+        private bool _initFailed;
+        private string _initError = string.Empty;
+
+        public RgbProviderConnectionStatus ConnectionStatus
+        {
+            get
+            {
+                if (_initFailed) return RgbProviderConnectionStatus.Error;
+                if (!IsAvailable) return RgbProviderConnectionStatus.Disabled;
+                if (DeviceCount == 0) return RgbProviderConnectionStatus.NoDevices;
+                return RgbProviderConnectionStatus.Connected;
+            }
+        }
+
+        public string StatusDetail
+        {
+            get
+            {
+                if (_initFailed) return _initError;
+                if (!IsAvailable) return "iCUE not detected";
+                if (DeviceCount == 0) return "iCUE running, no devices found";
+                return $"{DeviceCount} device(s) connected";
+            }
+        }
+        
+        public IReadOnlyList<RgbEffectType> SupportedEffects { get; } = new[]
+        {
+            RgbEffectType.Static,
+            RgbEffectType.Breathing,
+            RgbEffectType.Spectrum,
+            RgbEffectType.Wave,
+            RgbEffectType.Custom,
+            RgbEffectType.Off
+        };
+
+        public CorsairRgbProvider(LoggingService logging, ConfigurationService configService)
+        {
+            _logging = logging;
+            _configService = configService;
+        }
+
+        public CorsairRgbProvider(LoggingService logging, ConfigurationService configService, CorsairDeviceService service)
+            : this(logging, configService)
+        {
+            _service = service;
+        }
+
+        public async Task InitializeAsync()
+        {
+            try
+            {
+                _service ??= await CorsairDeviceService.CreateAsync(_logging, _configService);
+                await _service.DiscoverAsync();
+                IsAvailable = _service.Devices.Any();
+                _logging.Info($"CorsairRgbProvider initialized, available={IsAvailable}, devices={DeviceCount}");
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"CorsairRgbProvider init failed: {ex.Message}");
+                IsAvailable = false;
+                _initFailed = true;
+                _initError = ex.Message;
+            }
+        }
+
+        public async Task ApplyEffectAsync(string effectId)
+        {
+            if (!IsAvailable || _service == null)
+                return;
+
+            if (string.IsNullOrWhiteSpace(effectId))
+                return;
+
+            if (effectId.StartsWith("color:", StringComparison.OrdinalIgnoreCase))
+            {
+                var hex = effectId["color:".Length..];
+                await _service.ApplyLightingToAllAsync(hex);
+                return;
+            }
+
+            if (effectId.StartsWith("preset:", StringComparison.OrdinalIgnoreCase))
+            {
+                var presetName = effectId["preset:".Length..];
+
+                // Look up preset from the ConfigurationService
+                var cfgPreset = _configService.Config.CorsairLightingPresets?.FirstOrDefault(p => string.Equals(p.Name, presetName, StringComparison.OrdinalIgnoreCase));
+                if (cfgPreset == null)
+                {
+                    _logging.Warn($"Corsair preset '{presetName}' not found in configuration");
+                    return;
+                }
+
+                // Apply the named preset to each device
+                var presetSucceeded = 0;
+                foreach (var device in _service.Devices)
+                {
+                    try
+                    {
+                        if (await _service.ApplyLightingPresetAsync(device, cfgPreset))
+                        {
+                            presetSucceeded++;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logging.Error($"Failed to apply corsair preset '{presetName}' to {device.Name}: {ex.Message}", ex);
+                    }
+                }
+
+                if (presetSucceeded == _service.Devices.Count)
+                {
+                    _logging.Info($"Applied Corsair preset '{presetName}' to {presetSucceeded}/{_service.Devices.Count} device(s)");
+                }
+                else
+                {
+                    _logging.Warn($"Applied Corsair preset '{presetName}' to only {presetSucceeded}/{_service.Devices.Count} device(s)");
+                }
+                return;
+            }
+
+            // Handle "effect:breathing", "effect:spectrum", "effect:wave"
+            if (effectId.StartsWith("effect:", StringComparison.OrdinalIgnoreCase))
+            {
+                var effectName = effectId["effect:".Length..].Trim().ToLowerInvariant();
+                bool effectSucceeded;
+                switch (effectName)
+                {
+                    case "breathing":
+                        effectSucceeded = await _service.ApplyBreathingToAllAsync("#FF0000");
+                        break;
+                    case "spectrum":
+                    case "colorcycle":
+                    case "rainbow":
+                        effectSucceeded = await _service.ApplySpectrumToAllAsync();
+                        break;
+                    case "wave":
+                        effectSucceeded = await _service.ApplyWaveToAllAsync();
+                        break;
+                    case "off":
+                        await TurnOffAsync();
+                        effectSucceeded = true;
+                        break;
+                    default:
+                        _logging.Warn($"Unknown Corsair effect: {effectName}");
+                        effectSucceeded = false;
+                        break;
+                }
+
+                if (!effectSucceeded && effectName != "off")
+                {
+                    _logging.Warn($"Corsair effect '{effectName}' did not apply to any device");
+                }
+            }
+        }
+        
+        public async Task SetStaticColorAsync(Color color)
+        {
+            if (!IsAvailable || _service == null)
+                return;
+                
+            var hex = $"#{color.R:X2}{color.G:X2}{color.B:X2}";
+            await _service.ApplyLightingToAllAsync(hex);
+        }
+        
+        public async Task SetBreathingEffectAsync(Color color)
+        {
+            if (!IsAvailable || _service == null)
+                return;
+
+            var hex = $"#{color.R:X2}{color.G:X2}{color.B:X2}";
+            await _service.ApplyBreathingToAllAsync(hex);
+        }
+        
+        public async Task SetSpectrumEffectAsync()
+        {
+            if (!IsAvailable || _service == null)
+                return;
+
+            await _service.ApplySpectrumToAllAsync();
+        }
+
+        public async Task SetWaveEffectAsync()
+        {
+            if (!IsAvailable || _service == null)
+                return;
+
+            await _service.ApplyWaveToAllAsync();
+        }
+        
+        public async Task TurnOffAsync()
+        {
+            if (!IsAvailable || _service == null)
+                return;
+                
+            await _service.ApplyLightingToAllAsync("#000000");
+        }
+    }
+}

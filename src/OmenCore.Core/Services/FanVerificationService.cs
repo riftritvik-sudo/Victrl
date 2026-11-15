@@ -1,0 +1,1316 @@
+using System;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using OmenCore.Hardware;
+using OmenCore.Models;
+
+namespace OmenCore.Services
+{
+    /// <summary>
+    /// Results from applying and verifying a fan speed change.
+    /// </summary>
+    public class FanApplyResult
+    {
+        public int FanIndex { get; set; }
+        public string FanName { get; set; } = "";
+        public int RequestedPercent { get; set; }
+        public int AppliedLevel { get; set; }
+        public int ExpectedLevel { get; set; }
+        public int ActualRpmBefore { get; set; }
+        public int ActualRpmAfter { get; set; }
+        public int ExpectedRpm { get; set; }
+        public int ActualLevelAfter { get; set; }
+        public RpmSource RpmSource { get; set; } = RpmSource.Unknown;
+        public bool WmiCallSucceeded { get; set; }
+        public bool VerificationPassed { get; set; }
+        public bool LevelReadbackMatched { get; set; }
+        /// <summary>
+        /// Verification evidence path used for this result: None, RPM, Level, RPM+Level.
+        /// </summary>
+        public string VerificationEvidence { get; set; } = "None";
+        public string? ErrorMessage { get; set; }
+        public TimeSpan Duration { get; set; }
+        
+        /// <summary>
+        /// RPM standard deviation from multi-sample verification (lower = more stable).
+        /// </summary>
+        public double RpmStandardDeviation { get; set; }
+        
+        /// <summary>
+        /// Number of samples taken during verification.
+        /// </summary>
+        public int SampleCount { get; set; }
+        
+        /// <summary>
+        /// True if the fan speed change was successfully applied and verified.
+        /// </summary>
+        public bool Success => WmiCallSucceeded && VerificationPassed;
+        
+        /// <summary>
+        /// Percentage difference from expected RPM (for diagnostics).
+        /// </summary>
+        public double DeviationPercent => ExpectedRpm > 0 
+            ? Math.Abs(ActualRpmAfter - ExpectedRpm) / (double)ExpectedRpm * 100 
+            : (ActualRpmAfter <= 0 ? 0 : 100);
+
+        public string RpmDisplay => RpmSource switch
+        {
+            RpmSource.Estimated => $"~{ActualRpmAfter} RPM (fan-level estimate)",
+            // 878A (#218): the per-fan write itself was refused, so there was never anything to read. Say that, not "unavailable".
+            RpmSource.Unknown when ActualRpmAfter <= 0 && !WmiCallSucceeded && ExpectedLevel > 0 => $"firmware refused level {ExpectedLevel}",
+            RpmSource.Unknown when ActualRpmAfter <= 0 => "Physical RPM unavailable",
+            RpmSource.Unknown => $"{ActualRpmAfter} RPM (source unverified)",
+            _ => $"{ActualRpmAfter} RPM ({RpmSource})"
+        };
+        
+        /// <summary>
+        /// Overall verification score 0-100 (v2.7.0).
+        /// Combines accuracy, stability, and success factors.
+        /// 100 = perfect match, 0 = complete failure.
+        /// </summary>
+        public int VerificationScore
+        {
+            get
+            {
+                if (!WmiCallSucceeded) return 0;
+                if (ActualRpmAfter <= 0 && RequestedPercent > 0) return 5; // Minimal score for zero RPM
+                
+                // Accuracy score (0-50): Based on deviation from expected RPM
+                // 0% deviation = 50 points, 30% deviation = 0 points.
+                // Using 30% threshold instead of 15% so budget HP Victus models
+                // (whose RPM tables differ from high-end OMEN) don't score 0.
+                double accuracyScore = Math.Max(0, 50 - (DeviationPercent / 30.0 * 50));
+
+                // If firmware confirms the requested fan level, don't let a generic shared RPM
+                // expectation curve drag the score to near-zero. This is common on V1/55-level
+                // systems where the real RPM response is more stair-stepped/nonlinear than the
+                // shared verifier baseline but the command still applied correctly.
+                if (LevelReadbackMatched)
+                {
+                    accuracyScore = Math.Max(accuracyScore, 35);
+                }
+                
+                // Stability score (0-30): Based on standard deviation of samples
+                // 0 std dev = 30 points, 200+ std dev = 0 points
+                double stabilityScore = Math.Max(0, 30 - (RpmStandardDeviation / 200.0 * 30));
+                
+                // Response score (0-20): Based on actual change from before
+                // Full change = 20 points, no change = 0 points
+                double responseScore = 0;
+                if (ActualRpmBefore != ActualRpmAfter && RequestedPercent > 0)
+                {
+                    responseScore = 20; // Fan responded
+                }
+                else if (RequestedPercent == 0 && ActualRpmAfter < 1000)
+                {
+                    responseScore = 20; // Correctly went to low/off
+                }
+                else if (LevelReadbackMatched && RequestedPercent > 0)
+                {
+                    responseScore = 20; // Firmware level changed even if RPM curve differs
+                }
+                
+                return (int)Math.Round(accuracyScore + stabilityScore + responseScore);
+            }
+        }
+        
+        /// <summary>
+        /// Human-readable score rating (Excellent/Good/Fair/Poor/Failed).
+        /// </summary>
+        public string ScoreRating => VerificationScore switch
+        {
+            >= 90 => "Excellent",
+            >= 70 => "Good",
+            >= 50 => "Fair",
+            >= 25 => "Poor",
+            _ => "Failed"
+        };
+    }
+
+    /// <summary>
+    /// Provides closed-loop verification for fan control commands.
+    /// After setting a fan speed, reads back the actual RPM to verify it was applied.
+    /// 
+    /// Enhanced with:
+    /// - Multi-sample verification (reads RPM multiple times to ensure stability)
+    /// - Auto-revert on failure (restores previous state if verification fails)
+    /// - Detailed diagnostics (logs suggestion to switch backend if commands ineffective)
+    /// - Retry logic for transient failures
+    /// 
+    /// This addresses the issue where "Requested % doesn't match actual fan speed".
+    /// </summary>
+    public class FanVerificationService : IFanVerificationService
+    {
+        private readonly HpWmiBios? _wmiBios;
+        private readonly FanService? _fanService;
+        private readonly LoggingService _logging;
+        
+        // Verification parameters
+        private const int VerificationRetries = 3;          // Retry verification up to 3 times (increased from 2)
+        private const int VerificationSamples = 5;          // Take 5 RPM samples and average (increased from 3)
+        private const int SampleDelayMs = 300;              // Wait 300ms between samples; avoids racing slow RPM telemetry
+        // MaxRpm calibrated to 6000 RPM � covers high-end OMEN 16/17 models (5500-6500 RPM peaks).
+        // Victus and mid-range HP fans (3800-4500 RPM peak) still pass because the absolute 500 RPM
+        // floor tolerance in VerifyRpm() keeps low-step-count fans within range regardless.
+        private const int DefaultMaxLevel = 55;
+        private const int MaxLevelCeiling = 100;
+        private const int MinRpm = 0;
+        private const int MaxRpm = 6000;  // Covers high-end OMEN fans (5500-6500 RPM); Victus-class handled by 500 RPM floor tolerance
+        
+        // Verification timing
+        // Some 2024/2025 OMEN/Transcend ECs can take 10-15s before RPM telemetry catches
+        // up with a successful duty/max command. Keep diagnostics patient so they measure
+        // hardware response instead of the first stale telemetry window.
+        private const int FanResponseDelayMs = 6000;
+        private const int RetryDelayMs = 2500;
+        // 30% base tolerance accommodates HP Victus-class fans that have fewer RPM steps
+        // and whose actual response curves don't match expected RPM tables.
+        private const double RpmTolerance = 0.30;     // Base tolerance — adaptive scaling applied at low speeds
+        
+        // Auto-revert settings
+        private const bool AutoRevertOnFailure = true;     // Enable auto-revert to previous state
+        private const int RevertDelayMs = 1000;            // Delay before reverting
+        
+        public FanVerificationService(HpWmiBios? wmiBios, FanService? fanService, LoggingService logging)
+        {
+            _wmiBios = wmiBios;
+            _fanService = fanService;
+            _logging = logging;
+        }
+        
+        /// <summary>
+        /// Check if verification is available.
+        /// </summary>
+        public bool IsAvailable => (_wmiBios?.IsAvailable ?? false) || (_fanService != null);
+        
+        /// <summary>
+        /// Get current RPM from fan telemetry.
+        /// </summary>
+        private int GetCurrentRpm(int fanIndex)
+        {
+            if (_fanService?.FanTelemetry != null && _fanService.FanTelemetry.Count > fanIndex)
+            {
+                return _fanService.FanTelemetry[fanIndex].SpeedRpm;
+            }
+            return 0;
+        }
+
+        private RpmSource GetCurrentRpmSource(int fanIndex)
+        {
+            if (_fanService?.FanTelemetry != null && _fanService.FanTelemetry.Count > fanIndex)
+            {
+                return _fanService.FanTelemetry[fanIndex].RpmSource;
+            }
+
+            return RpmSource.Unknown;
+        }
+        
+        /// <summary>
+        /// Get fan name from telemetry.
+        /// </summary>
+        private string GetFanName(int fanIndex)
+        {
+            if (_fanService?.FanTelemetry != null && _fanService.FanTelemetry.Count > fanIndex)
+            {
+                return _fanService.FanTelemetry[fanIndex].Name;
+            }
+            return fanIndex == 0 ? "CPU Fan" : "GPU Fan";
+        }
+        
+        /// <summary>
+        /// Apply a fan speed and verify it was actually applied by reading back RPM.
+        /// </summary>
+        /// <param name="fanIndex">Fan index (0 for CPU, 1 for GPU typically)</param>
+        /// <param name="targetPercent">Target fan speed percentage (0-100)</param>
+        /// <param name="ct">Cancellation token</param>
+        /// <returns>Result containing applied values and verification status</returns>
+        public async Task<FanApplyResult> ApplyAndVerifyFanSpeedAsync(
+            int fanIndex, 
+            int targetPercent,
+            CancellationToken ct = default)
+        {
+            var startTime = DateTime.Now;
+            var result = new FanApplyResult
+            {
+                FanIndex = fanIndex,
+                FanName = GetFanName(fanIndex),
+                RequestedPercent = targetPercent,
+                ExpectedRpm = PercentToExpectedRpm(targetPercent),
+                ExpectedLevel = PercentToLevel(targetPercent)
+            };
+            
+            if (_wmiBios == null || !_wmiBios.IsAvailable)
+            {
+                // Fall back to FanService if WMI is not available
+                if (_fanService == null)
+                {
+                    result.ErrorMessage = "No fan control backend available";
+                    result.Duration = DateTime.Now - startTime;
+                    return result;
+                }
+                
+                // Use FanService for fan control
+                return await ApplyAndVerifyFanSpeedViaFanServiceAsync(fanIndex, targetPercent, ct);
+            }
+            
+            try
+            {
+                // Read current state before change (from telemetry)
+                result.ActualRpmBefore = GetCurrentRpm(fanIndex);
+                _logging.Info($"Fan {fanIndex} ({result.FanName}) before: {result.ActualRpmBefore} RPM");
+                
+                // Convert percent to level
+                result.AppliedLevel = result.ExpectedLevel;
+                var usedSetFanMax = false;
+
+                // For 100%, use SetFanMax which achieves true maximum RPM
+                // SetFanLevel(ExpectedLevel) may be capped by BIOS on some models
+                if (targetPercent >= 100)
+                {
+                    usedSetFanMax = true;
+                    result.WmiCallSucceeded = _wmiBios.SetFanMax(true);
+                    if (result.WmiCallSucceeded)
+                    {
+                        NoteDirectManualFanWrite();
+                        _logging.Info($"Fan {fanIndex} set to MAX (100%) via SetFanMax");
+                    }
+                    else
+                    {
+                        // Fallback to SetFanLevel. GitHub #207 (board 88F8): a hardcoded 55 here
+                        // sent the wrong level entirely on a board whose real ceiling differs -
+                        // this board's own ExpectedLevel (== GetEffectiveMaxLevel() at 100%) is
+                        // what every other write in this method already uses.
+                        usedSetFanMax = false;
+                        result.WmiCallSucceeded = _wmiBios.SetFanLevel((byte)result.ExpectedLevel, (byte)result.ExpectedLevel);
+                        if (result.WmiCallSucceeded)
+                            NoteDirectManualFanWrite();
+                        _logging.Info($"Fan {fanIndex} set to 100% via SetFanLevel({result.ExpectedLevel}) fallback");
+                    }
+                }
+                else
+                {
+                    // For <100%, disable max mode first (in case it was enabled)
+                    _wmiBios.SetFanMax(false);
+                    
+                    // Apply the fan level (need both fans)
+                    byte fan1Level = (byte)(fanIndex == 0 ? result.AppliedLevel : 0);
+                    byte fan2Level = (byte)(fanIndex == 1 ? result.AppliedLevel : 0);
+                    
+                    // Get current levels for the other fan to preserve it
+                    var currentLevels = _wmiBios.GetFanLevel();
+                    if (currentLevels.HasValue)
+                    {
+                        if (fanIndex == 0)
+                            fan2Level = currentLevels.Value.fan2;
+                        else
+                            fan1Level = currentLevels.Value.fan1;
+                    }
+                    
+                    result.WmiCallSucceeded = _wmiBios.SetFanLevel(fan1Level, fan2Level);
+                    
+                    if (result.WmiCallSucceeded)
+                    {
+                        NoteDirectManualFanWrite();
+                        _logging.Info($"Fan {fanIndex} set to level {result.AppliedLevel} ({targetPercent}%)");
+                    }
+                }
+                
+                // Check if WMI call failed
+                if (!result.WmiCallSucceeded)
+                {
+                    _logging.Warn($"WMI fan control failed for fan {fanIndex}, level {result.AppliedLevel}");
+                    result.ErrorMessage = "WMI call returned false";
+                    result.Duration = DateTime.Now - startTime;
+                    return result;
+                }
+                
+                // Wait for fan to respond (fans have mechanical inertia)
+                await Task.Delay(FanResponseDelayMs, ct);
+                
+                // Multi-sample verification: take several RPM readings and average them
+                int totalAttempts = 0;
+                for (int attempt = 0; attempt <= VerificationRetries; attempt++)
+                {
+                    totalAttempts = attempt + 1;
+                    
+                    // Take multiple samples and average them for stability
+                    var rpmSamples = new int[VerificationSamples];
+                    for (int i = 0; i < VerificationSamples; i++)
+                    {
+                        rpmSamples[i] = GetCurrentRpm(fanIndex);
+                        if (i < VerificationSamples - 1)
+                            await Task.Delay(SampleDelayMs, ct);
+                    }
+                    
+                    // Use average RPM for verification
+                    result.ActualRpmAfter = (int)rpmSamples.Average();
+                    result.RpmSource = GetCurrentRpmSource(fanIndex);
+                    result.SampleCount = VerificationSamples;
+                    result.ActualLevelAfter = ReadCurrentLevel(fanIndex);
+                    result.LevelReadbackMatched = IsLevelReadbackMatch(result);
+
+                    // GetCurrentRpm/rpmSamples above read FanService.FanTelemetry, which refreshes on
+                    // its own independent polling cadence rather than synchronously with this command
+                    // - on a board with no real tachometer (RpmSource.Estimated), that cache is
+                    // frequently still holding the *previous* test point's level by the time this loop
+                    // samples it. GitHub #163 (board 8BCA-AMD) showed this directly in its own guided-
+                    // diagnostic log: "Fan levels set: CPU=33" (the 60% test) immediately followed by
+                    // "Fan 0 RPM samples: [1600, 1600, ...]" - 1600 being exactly the *previous* 30%
+                    // test's level (16) times 100, one full test-step stale, while ActualLevelAfter
+                    // (read fresh, synchronously, right above) already correctly showed 33. For the
+                    // estimate-only case, ActualLevelAfter is the reliable source of truth - recompute
+                    // the displayed/scored RPM from it instead of the lagging telemetry cache.
+                    if (result.RpmSource == RpmSource.Estimated)
+                    {
+                        result.ActualRpmAfter = result.ActualLevelAfter * 100;
+                    }
+
+                    // Calculate standard deviation for stability scoring (v2.7.0)
+                    double mean = rpmSamples.Average();
+                    double sumSquares = rpmSamples.Sum(r => Math.Pow(r - mean, 2));
+                    result.RpmStandardDeviation = Math.Sqrt(sumSquares / rpmSamples.Length);
+                    
+                    _logging.Info($"Fan {fanIndex} RPM samples: [{string.Join(", ", rpmSamples)}], Average: {result.ActualRpmAfter} RPM, StdDev: {result.RpmStandardDeviation:F1}");
+                    
+                    // Verify the change with explicit evidence path
+                    var rpmMatched = VerifyRpm(result);
+                    var levelEvidenceAccepted = IsLevelOnlyEvidenceAcceptable(result);
+                    result.VerificationEvidence = DetermineVerificationEvidence(rpmMatched, levelEvidenceAccepted);
+                    result.VerificationPassed = rpmMatched || levelEvidenceAccepted;
+
+                    if (result.VerificationPassed)
+                    {
+                        _logging.Info(DescribeVerificationPass(fanIndex, result));
+                        break;
+                    }
+                    else if (attempt < VerificationRetries)
+                    {
+                        _logging.Warn($"Fan {fanIndex} verification attempt {attempt + 1} inconclusive: {DescribeVerificationMismatch(result)}. Retrying...");
+                        await Task.Delay(RetryDelayMs, ct);
+                    }
+                }
+
+                // GitHub #207 (board 88F8): SetFanMax returned true on every call, but the 100%
+                // test's RPM estimate never moved past the 60% test's value - the same "firmware
+                // accepts Max and ignores it" class already fixed in WmiFanController's maintenance
+                // loop (Ohman cross-check, boards 8A26/8E5E), just reached through this method's own
+                // one-shot apply instead. One direct-level write is a cheap thing to try before
+                // reporting a board as failing its 100% test outright.
+                if (!result.VerificationPassed && usedSetFanMax)
+                {
+                    _logging.Warn($"Fan {fanIndex}: SetFanMax accepted but never verified after {totalAttempts} attempts - retrying via direct SetFanLevel({result.ExpectedLevel}).");
+                    if (_wmiBios.SetFanLevel((byte)result.ExpectedLevel, (byte)result.ExpectedLevel))
+                    {
+                        NoteDirectManualFanWrite();
+                        await Task.Delay(FanResponseDelayMs, ct);
+                        var rpmSamples = new int[VerificationSamples];
+                        for (int i = 0; i < VerificationSamples; i++)
+                        {
+                            rpmSamples[i] = GetCurrentRpm(fanIndex);
+                            if (i < VerificationSamples - 1) await Task.Delay(SampleDelayMs, ct);
+                        }
+                        result.ActualRpmAfter = (int)rpmSamples.Average();
+                        result.RpmSource = GetCurrentRpmSource(fanIndex);
+                        result.ActualLevelAfter = ReadCurrentLevel(fanIndex);
+                        if (result.RpmSource == RpmSource.Estimated)
+                            result.ActualRpmAfter = result.ActualLevelAfter * 100;
+
+                        result.LevelReadbackMatched = IsLevelReadbackMatch(result);
+                        var rpmMatched = VerifyRpm(result);
+                        var levelEvidenceAccepted = IsLevelOnlyEvidenceAcceptable(result);
+                        result.VerificationEvidence = DetermineVerificationEvidence(rpmMatched, levelEvidenceAccepted);
+                        result.VerificationPassed = rpmMatched || levelEvidenceAccepted;
+                        if (result.VerificationPassed)
+                        {
+                            _logging.Info($"Fan {fanIndex}: direct-level fallback confirmed 100% ({DescribeVerificationPass(fanIndex, result)})");
+                        }
+                    }
+                }
+
+                // A 100% request the firmware settles just short of - both through SetFanMax and the
+                // direct-level retry above - is the board's own ceiling, not a failure: 8E35 (#195)
+                // plateaued at 48/55 with both fans audibly at full speed, 88F7 (#215) at 46/55. The
+                // floor is deliberately high: 88F8 (#207), where Max never rose past the 60% step's
+                // level (33/55, 60%), must still fail.
+                if (!result.VerificationPassed && IsFirmwareCeilingPlateau(result))
+                {
+                    result.VerificationPassed = true;
+                    result.VerificationEvidence = "FirmwareCeiling";
+                    _logging.Info($"Fan {fanIndex}: 100% settled at firmware ceiling level {result.ActualLevelAfter}/{result.ExpectedLevel} " +
+                                  "(Max and a direct write both accepted, readback stable) - treated as this board's maximum, not a failure.");
+                }
+
+                // GitHub #198 (board 8BBE): never leave the firmware's Max flag latched behind this
+                // method. It is set here directly, bypassing WmiFanController's own Max tracking.
+                // Guided Fan Verification ends on its 100% steps and then restores auto. Swap Max
+                // for a plain level write at the same ceiling so the 100% request stays in effect
+                // until that restore. The restore only replaces the level when the controller has
+                // been told about the direct write (NoteDirectManualFanWrite). On conservative V1
+                // boards the replacement is the 20/20 transition hint, not SetFanLevel(0, 0).
+                if (usedSetFanMax)
+                {
+                    ReleaseFirmwareMaxFlag(result.ExpectedLevel);
+                }
+
+                // Final diagnostic message if verification still failed
+                if (!result.VerificationPassed)
+                {
+                    _logging.Error($"Fan {fanIndex} verification remained inconclusive after {totalAttempts} attempts: {DescribeVerificationMismatch(result)}");
+                    result.ErrorMessage = $"Fan verification remained inconclusive after {totalAttempts} attempts: {DescribeVerificationMismatch(result)}";
+                    
+                    // Track failure for diagnostics — report only, do NOT change fan state.
+                    // Previously this called SetFanMode(Default) which would kill any active
+                    // fan curve, causing the curve to stop working permanently after the first
+                    // save. The FanService curve engine handles recovery on its own.
+                    _logging.Warn($"⚠️ Fan {fanIndex} verification mismatch. This may indicate OGH interference, EC lag, or confirmation-counter delay in RPM telemetry. The curve engine will maintain target speeds. [TIP: {GetVerificationFailureTip()}]");
+                    result.ErrorMessage += $" [TIP: {GetVerificationFailureTip()}]";
+                }
+            }
+            catch (Exception ex)
+            {
+                result.ErrorMessage = ex.Message;
+                _logging.Error($"Fan verification exception: {ex.Message}", ex);
+            }
+            
+            result.Duration = DateTime.Now - startTime;
+            return result;
+        }
+
+        private void NoteDirectManualFanWrite()
+        {
+            _fanService?.NoteExternalManualFanWrite();
+        }
+
+        private void ReleaseFirmwareMaxFlag(int holdLevel)
+        {
+            if (_wmiBios == null) return;
+            try
+            {
+                var cleared = _wmiBios.SetFanMax(false);
+                var held = _wmiBios.SetFanLevel((byte)holdLevel, (byte)holdLevel);
+                if (held)
+                    NoteDirectManualFanWrite();
+                _logging.Info($"Released firmware Max flag after 100% test (cleared={cleared}); holding level {holdLevel} via direct write (ok={held})");
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Could not release firmware Max flag after 100% test: {ex.Message}");
+            }
+        }
+
+        private static string GetVerificationFailureTip()
+        {
+            return "Use Restore OEM Auto, then try Direct/Max fan control if available. If fans still do not respond, export diagnostics and include the ProductId, backend, requested %, RPM, and level readback.";
+        }
+
+        /// <summary>
+        /// Apply and verify fan speed using FanService (fallback when WMI is unavailable).
+        /// </summary>
+        private async Task<FanApplyResult> ApplyAndVerifyFanSpeedViaFanServiceAsync(
+            int fanIndex, 
+            int targetPercent,
+            CancellationToken ct = default)
+        {
+            var startTime = DateTime.Now;
+            var result = new FanApplyResult
+            {
+                FanIndex = fanIndex,
+                FanName = GetFanName(fanIndex),
+                RequestedPercent = targetPercent,
+                ExpectedRpm = PercentToExpectedRpm(targetPercent),
+                ExpectedLevel = PercentToLevel(targetPercent)
+            };
+
+            try
+            {
+                // Read current state before change (from telemetry)
+                result.ActualRpmBefore = GetCurrentRpm(fanIndex);
+                _logging.Info($"Fan {fanIndex} ({result.FanName}) before: {result.ActualRpmBefore} RPM");
+
+                // Get current fan speeds to preserve the other fan
+                var currentCpuPercent = 50; // Default
+                var currentGpuPercent = 50; // Default
+                
+                // Try to estimate current speeds from telemetry
+                if (_fanService?.FanTelemetry != null && _fanService.FanTelemetry.Count > 0)
+                {
+                    // Estimate based on RPM
+                    for (int i = 0; i < _fanService.FanTelemetry.Count && i < 2; i++)
+                    {
+                        var rpm = _fanService.FanTelemetry[i].SpeedRpm;
+                        var estimatedPercent = RpmToPercent(rpm);
+                        if (i == 0) currentCpuPercent = estimatedPercent;
+                        else currentGpuPercent = estimatedPercent;
+                    }
+                }
+
+                // Set the target fan to the requested percent, keep other fan at current
+                int cpuPercent = fanIndex == 0 ? targetPercent : currentCpuPercent;
+                int gpuPercent = fanIndex == 1 ? targetPercent : currentGpuPercent;
+
+                result.WmiCallSucceeded = _fanService!.ForceSetFanSpeeds(cpuPercent, gpuPercent);
+                
+                if (result.WmiCallSucceeded)
+                {
+                    _logging.Info($"Fan {fanIndex} set to {targetPercent}% via FanService (CPU:{cpuPercent}%, GPU:{gpuPercent}%)");
+                }
+                else
+                {
+                    result.ErrorMessage = "FanService call returned false";
+                    result.Duration = DateTime.Now - startTime;
+                    return result;
+                }
+
+                // Wait for fan to respond
+                await Task.Delay(FanResponseDelayMs, ct);
+
+                // Multi-sample verification
+                int totalAttempts = 0;
+                for (int attempt = 0; attempt <= VerificationRetries; attempt++)
+                {
+                    totalAttempts = attempt + 1;
+
+                    // Take multiple samples
+                    var rpmSamples = new int[VerificationSamples];
+                    for (int i = 0; i < VerificationSamples; i++)
+                    {
+                        rpmSamples[i] = GetCurrentRpm(fanIndex);
+                        if (i < VerificationSamples - 1)
+                            await Task.Delay(SampleDelayMs, ct);
+                    }
+
+                    // Use average RPM
+                    result.ActualRpmAfter = (int)rpmSamples.Average();
+                    result.RpmSource = GetCurrentRpmSource(fanIndex);
+                    result.SampleCount = VerificationSamples;
+                    result.ActualLevelAfter = ReadCurrentLevel(fanIndex);
+                    result.LevelReadbackMatched = IsLevelReadbackMatch(result);
+                    
+                    // Calculate standard deviation for stability scoring (v2.7.0)
+                    double mean = rpmSamples.Average();
+                    double sumSquares = rpmSamples.Sum(r => Math.Pow(r - mean, 2));
+                    result.RpmStandardDeviation = Math.Sqrt(sumSquares / rpmSamples.Length);
+
+                    _logging.Info($"Fan {fanIndex} RPM samples: [{string.Join(", ", rpmSamples)}], Average: {result.ActualRpmAfter} RPM, StdDev: {result.RpmStandardDeviation:F1}");
+
+                    // Verify with explicit evidence path
+                    var rpmMatched = VerifyRpm(result);
+                    var levelEvidenceAccepted = IsLevelOnlyEvidenceAcceptable(result);
+                    result.VerificationEvidence = DetermineVerificationEvidence(rpmMatched, levelEvidenceAccepted);
+                    result.VerificationPassed = rpmMatched || levelEvidenceAccepted;
+
+                    if (result.VerificationPassed)
+                    {
+                        _logging.Info(DescribeVerificationPass(fanIndex, result));
+                        break;
+                    }
+                    else if (attempt < VerificationRetries)
+                    {
+                        _logging.Warn($"Fan {fanIndex} verification attempt {attempt + 1} inconclusive: {DescribeVerificationMismatch(result)}. Retrying...");
+                        await Task.Delay(RetryDelayMs, ct);
+                    }
+                }
+
+                // Final diagnostic
+                if (!result.VerificationPassed)
+                {
+                    _logging.Error($"Fan {fanIndex} verification remained inconclusive after {totalAttempts} attempts: {DescribeVerificationMismatch(result)}");
+                    result.ErrorMessage = $"Fan verification remained inconclusive after {totalAttempts} attempts: {DescribeVerificationMismatch(result)}";
+                }
+            }
+            catch (Exception ex)
+            {
+                result.ErrorMessage = ex.Message;
+                _logging.Error($"Fan verification via FanService exception: {ex.Message}", ex);
+            }
+
+            result.Duration = DateTime.Now - startTime;
+            return result;
+        }
+        
+        /// <summary>
+        /// Read current fan speed without making changes (diagnostic tool).
+        /// </summary>
+        public (int rpm, int level) GetCurrentFanState(int fanIndex)
+        {
+            var rpm = GetCurrentRpm(fanIndex);
+            var level = ReadCurrentLevel(fanIndex);
+            
+            return (rpm, level);
+        }
+        
+        /// <summary>
+        /// Read current fan speed with RPM source information.
+        /// </summary>
+        public (int rpm, int level, RpmSource source) GetCurrentFanStateWithSource(int fanIndex)
+        {
+            var (rpm, level) = GetCurrentFanState(fanIndex);
+            
+            // Get source from telemetry
+            RpmSource source = RpmSource.Unknown;
+            if (_fanService?.FanTelemetry != null && _fanService.FanTelemetry.Count > fanIndex)
+            {
+                source = _fanService.FanTelemetry[fanIndex].RpmSource;
+            }
+            
+            return (rpm, level, source);
+        }
+        
+        /// <summary>
+        /// Verify fan reading by checking it multiple times.
+        /// </summary>
+        public async Task<(int avg, int min, int max)> GetStableFanRpmAsync(int fanIndex, int samples = 3, CancellationToken ct = default)
+        {
+            int sum = 0;
+            int min = int.MaxValue;
+            int max = int.MinValue;
+            
+            for (int i = 0; i < samples; i++)
+            {
+                var rpm = GetCurrentRpm(fanIndex);
+                sum += rpm;
+                min = Math.Min(min, rpm);
+                max = Math.Max(max, rpm);
+                
+                if (i < samples - 1)
+                    await Task.Delay(500, ct);
+            }
+            
+            return (sum / samples, min == int.MaxValue ? 0 : min, max == int.MinValue ? 0 : max);
+        }
+        
+        #region Conversion Helpers
+        
+        /// <summary>
+        /// Convert percentage (0-100) to HP fan level.
+        /// HP typically uses levels 0-55, not 0-100.
+        /// </summary>
+        private int PercentToLevel(int percent)
+        {
+            percent = Math.Clamp(percent, 0, 100);
+            // Linear mapping: 0% -> 0, 100% -> MaxLevel
+            return (int)Math.Round(percent / 100.0 * GetEffectiveMaxLevel());
+        }
+        
+        /// <summary>
+        /// Convert HP fan level back to a percentage.
+        /// </summary>
+        private int LevelToPercent(int level)
+        {
+            var maxLevel = GetEffectiveMaxLevel();
+            level = Math.Clamp(level, 0, maxLevel);
+            return (int)Math.Round(level / (double)maxLevel * 100);
+        }
+
+        /// <summary>
+        /// Convert expected percentage to expected RPM.
+        /// This is an approximation - real calibration data would be better.
+        /// </summary>
+        private int PercentToExpectedRpm(int percent)
+        {
+            percent = Math.Clamp(percent, 0, 100);
+            // Assume linear relationship (could be calibrated per-model)
+            // Most laptops: 0% = 0 RPM, 100% = ~5000-6000 RPM
+            if (percent == 0) return 0;
+            return (int)(MinRpm + (MaxRpm - MinRpm) * (percent / 100.0));
+        }
+        
+        /// <summary>
+        /// Estimate level from RPM (inverse of apply).
+        /// </summary>
+        private int RpmToLevel(int rpm)
+        {
+            if (rpm <= 0) return 0;
+            var percent = Math.Min(100, (rpm / (double)MaxRpm) * 100);
+            return (int)Math.Round(percent / 100.0 * GetEffectiveMaxLevel());
+        }
+
+        /// <summary>
+        /// Estimate percentage from RPM.
+        /// </summary>
+        private int RpmToPercent(int rpm)
+        {
+            if (rpm <= 0) return 0;
+            return (int)Math.Min(100, (rpm / (double)MaxRpm) * 100);
+        }
+
+        private int ReadCurrentLevel(int fanIndex)
+        {
+            if (_wmiBios?.IsAvailable == true)
+            {
+                var levels = _wmiBios.GetFanLevel();
+                if (levels.HasValue)
+                {
+                    return fanIndex == 0 ? levels.Value.fan1 : levels.Value.fan2;
+                }
+            }
+
+            var rpm = GetCurrentRpm(fanIndex);
+            return RpmToLevel(rpm);
+        }
+
+        private static bool IsLevelReadbackMatch(FanApplyResult result)
+        {
+            if (result.ExpectedLevel <= 0)
+            {
+                return result.ActualLevelAfter <= 2;
+            }
+
+            var tolerance = result.RequestedPercent >= 100 ? 3 : 2;
+
+            // When ramping DOWN, mechanical inertia means the fan may still physically spin
+            // faster than the requested level for several seconds after the command is sent.
+            // A readback showing level > expected is NOT a failure — the fan is still coasting.
+            // Only treat it as a mismatch if the actual level is BELOW the expected level
+            // (wrong direction, or command was ignored entirely in the wrong way).
+            if (result.ActualLevelAfter > result.ExpectedLevel)
+            {
+                // Fan is still spinning above requested level — coasting down. Not a failure.
+                return true;
+            }
+
+            return Math.Abs(result.ActualLevelAfter - result.ExpectedLevel) <= tolerance;
+        }
+
+        private int GetEffectiveMaxLevel()
+        {
+            if (_wmiBios?.IsAvailable == true)
+            {
+                return Math.Clamp(_wmiBios.MaxFanLevel, 1, MaxLevelCeiling);
+            }
+
+            return DefaultMaxLevel;
+        }
+
+        private static bool IsLevelOnlyEvidenceAcceptable(FanApplyResult result)
+        {
+            if (!result.LevelReadbackMatched)
+            {
+                return false;
+            }
+
+            // A level readback is the firmware echoing back the value we just wrote. That is real
+            // evidence the command was accepted, but it is NOT evidence the fan moved, and on a
+            // board whose RPM tachometer is unavailable it is the ONLY thing that can ever be
+            // checked - so accepting it unconditionally makes this method incapable of failing.
+            // Requesting a non-zero speed and measuring a flat zero from a physical source is a
+            // contradiction at any percentage, so it is rejected here rather than at >40% only.
+            if (IsPhysicalRpmSource(result.RpmSource) &&
+                result.ActualRpmAfter <= 0 &&
+                result.RequestedPercent > 0)
+            {
+                return false;
+            }
+
+            if (result.RequestedPercent <= 40)
+            {
+                return true;
+            }
+
+            // Classic V1 GetFanLevel values are surfaced as an Estimated RPM for display.
+            // When the requested level itself matches, do not compare that derived estimate
+            // against a second generic RPM curve and call the same evidence contradictory.
+            if (result.RpmSource == RpmSource.Estimated)
+            {
+                return true;
+            }
+
+            if (result.ExpectedRpm <= 0)
+            {
+                return result.ActualRpmAfter <= 1000;
+            }
+
+            // For medium/high requests, level-only confirmation is not enough if RPM remains far below target.
+            var minimumRpmForLevelOnlyPass = Math.Max(1800, (int)Math.Round(result.ExpectedRpm * 0.55));
+            return result.ActualRpmAfter >= minimumRpmForLevelOnlyPass;
+        }
+        
+        /// <summary>
+        /// Check if the actual RPM is within tolerance of expected.
+        /// </summary>
+        private bool VerifyRpm(FanApplyResult result)
+        {
+            if (!IsPhysicalRpmSource(result.RpmSource))
+            {
+                return false;
+            }
+
+            // If requesting 0%, fan should be off or very low
+            if (result.RequestedPercent == 0)
+            {
+                return result.ActualRpmAfter < 1000;  // Should be nearly stopped
+            }
+            
+            // Adaptive tolerance: fans are highly non-linear at low speeds.
+            // At 30% target, many OMEN models report 2000-2200 RPM instead of ~1650
+            // because fans have a minimum RPM floor and spin up in discrete steps.
+            // Use wider tolerance at low percentages, tighter at high percentages.
+            var adaptiveTolerance = RpmTolerance;
+            if (result.RequestedPercent <= 40)
+            {
+                // At 30%: tolerance = 0.25 + (1 - 30/40) * 0.20 = 0.25 + 0.05 = 0.30 (45% effective)
+                // At 40%: tolerance = 0.25 + 0 = 0.25
+                adaptiveTolerance += (1.0 - result.RequestedPercent / 40.0) * 0.20;
+            }
+            
+            var tolerance = result.ExpectedRpm * adaptiveTolerance;
+            // Minimum absolute tolerance of 500 RPM (fans report in ~200rpm steps)
+            tolerance = Math.Max(tolerance, 500);
+            
+            return Math.Abs(result.ActualRpmAfter - result.ExpectedRpm) <= tolerance;
+        }
+
+        private static bool IsPhysicalRpmSource(RpmSource source)
+        {
+            return source == RpmSource.EcDirect ||
+                   source == RpmSource.HardwareMonitor ||
+                   source == RpmSource.Afterburner ||
+                   source == RpmSource.WmiBios;
+        }
+
+        private static string DescribeVerificationMismatch(FanApplyResult result)
+        {
+            if (IsPhysicalRpmSource(result.RpmSource))
+            {
+                return $"expected ~{result.ExpectedRpm} RPM / level {result.ExpectedLevel}, got {result.ActualRpmAfter} RPM ({result.RpmSource}) / level {result.ActualLevelAfter} ({result.DeviationPercent:F1}% deviation)";
+            }
+
+            return $"expected level {result.ExpectedLevel}, got level {result.ActualLevelAfter}; {result.RpmDisplay} is not independent physical RPM evidence";
+        }
+
+        /// <summary>
+        /// A 100% request whose level readback settled at or above 80% of the expected ceiling, with
+        /// no physical RPM source contradicting it. Only consulted after Max and a direct-level write
+        /// have both been tried.
+        /// </summary>
+        internal static bool IsFirmwareCeilingPlateau(FanApplyResult result)
+        {
+            if (result.RequestedPercent < 100 || result.ExpectedLevel <= 0 || result.ActualLevelAfter <= 0)
+                return false;
+
+            if (IsPhysicalRpmSource(result.RpmSource) && result.ActualRpmAfter <= 0)
+                return false;
+
+            return result.ActualLevelAfter * 100 >= result.ExpectedLevel * 80;
+        }
+
+        /// <summary>
+        /// After every fan has been tried at the same 100% step: a fan that settled within 90% of the best level another fan
+        /// reached there is held by the same firmware ceiling, not failing. 88F8 (#207): the CPU fan settled at 43/55 while the GPU
+        /// fan reached 46/55 and passed. The best level must itself be a real ceiling (at least 80% of the expected level), so two
+        /// fans both stuck low (88F8's Max stuck at the 60% level) still fail. Returns how many results were upgraded.
+        /// </summary>
+        public static int ReconcileCeilingAcrossFans(IReadOnlyList<FanApplyResult> stepResults)
+        {
+            var best = 0;
+            foreach (var r in stepResults)
+            {
+                if (r.VerificationPassed && r.RequestedPercent >= 100 && r.ExpectedLevel > 0 &&
+                    r.ActualLevelAfter * 100 >= r.ExpectedLevel * 80)
+                    best = Math.Max(best, r.ActualLevelAfter);
+            }
+            if (best == 0) return 0;
+
+            var upgraded = 0;
+            foreach (var r in stepResults)
+            {
+                if (r.VerificationPassed || r.RequestedPercent < 100 || r.ActualLevelAfter <= 0) continue;
+                if (IsPhysicalRpmSource(r.RpmSource) && r.ActualRpmAfter <= 0) continue;
+                if (r.ActualLevelAfter * 100 < best * 90) continue;
+
+                r.VerificationPassed = true;
+                r.VerificationEvidence = "FirmwareCeiling";
+                r.ErrorMessage = null;
+                upgraded++;
+            }
+            return upgraded;
+        }
+
+        private static string DetermineVerificationEvidence(bool rpmMatched, bool levelMatched)
+        {
+            if (rpmMatched && levelMatched) return "RPM+Level";
+            if (rpmMatched) return "RPM";
+            if (levelMatched) return "Level";
+            return "None";
+        }
+
+        /// <summary>
+        /// Render a passing verification for the log, stating WHICH evidence carried it.
+        /// </summary>
+        /// <remarks>
+        /// A pass on level evidence alone is a weaker claim than a pass corroborated by a
+        /// tachometer, and the two used to be logged with identical wording - so a result with no
+        /// physical RPM reading at all was reported as "✓ verified" alongside its own
+        /// "score 5/100 Failed". The score is not restated here: it grades RPM accuracy and
+        /// stability, which is not what was measured when the evidence is level-only, so quoting it
+        /// on that path invited exactly the contradiction it produced.
+        /// </remarks>
+        private static string DescribeVerificationPass(int fanIndex, FanApplyResult result)
+        {
+            if (result.VerificationEvidence == "Level")
+            {
+                return $"✓ Fan {fanIndex} command accepted: level {result.ActualLevelAfter}/{result.ExpectedLevel} " +
+                       $"read back from firmware. Fan motion NOT confirmed - {result.RpmDisplay}.";
+            }
+
+            var basis = result.VerificationEvidence == "RPM+Level"
+                ? $"RPM + level matched (~{result.ExpectedRpm}, {result.ActualLevelAfter}/{result.ExpectedLevel})"
+                : $"RPM matched (expected ~{result.ExpectedRpm})";
+
+            return $"✓ Fan {fanIndex} verified: {result.ActualRpmAfter} RPM, level {result.ActualLevelAfter} " +
+                   $"({basis}, deviation {result.DeviationPercent:F1}%, score {result.VerificationScore}/100 {result.ScoreRating})";
+        }
+
+        private bool VerifyAppliedState(FanApplyResult result)
+        {
+            return VerifyRpm(result) || IsLevelOnlyEvidenceAcceptable(result);
+        }
+
+        #endregion
+
+        /// <summary>
+        /// Enhanced verification with multiple read-backs and auto-revert capability.
+        /// Attempts multiple verification cycles before giving up.
+        /// </summary>
+        public async Task<FanApplyResult> ApplyWithEnhancedVerificationAsync(
+            int fanIndex,
+            int targetPercent,
+            bool autoRevertOnFailure = true,
+            CancellationToken ct = default)
+        {
+            var startTime = DateTime.Now;
+            var result = new FanApplyResult
+            {
+                FanIndex = fanIndex,
+                FanName = GetFanName(fanIndex),
+                RequestedPercent = targetPercent,
+                ExpectedRpm = PercentToExpectedRpm(targetPercent)
+            };
+
+            if (_wmiBios == null || !_wmiBios.IsAvailable)
+            {
+                result.ErrorMessage = "WMI BIOS not available";
+                result.Duration = DateTime.Now - startTime;
+                return result;
+            }
+
+            // Store original state for potential revert
+            var originalState = GetCurrentFanState(fanIndex);
+            result.ActualRpmBefore = originalState.rpm;
+
+            try
+            {
+                _logging.Info($"Starting enhanced verification for fan {fanIndex} ({result.FanName}) at {targetPercent}%");
+
+                // First attempt with standard verification
+                var standardResult = await ApplyAndVerifyFanSpeedAsync(fanIndex, targetPercent, ct);
+                if (standardResult.Success)
+                {
+                    _logging.Info($"✓ Enhanced verification passed on first attempt for fan {fanIndex}");
+                    return standardResult;
+                }
+
+                // Preserve command/readback provenance from the standard attempt. A failed
+                // verification does not mean the firmware command itself returned failure.
+                result = standardResult;
+
+                _logging.Warn($"Standard verification failed for fan {fanIndex}, attempting enhanced verification cycles...");
+
+                // Enhanced verification: multiple read-back attempts
+                for (int cycle = 1; cycle <= 2; cycle++) // 2 additional cycles
+                {
+                    _logging.Info($"Enhanced verification cycle {cycle} for fan {fanIndex}");
+
+                    // Wait longer for fan to stabilize
+                    await Task.Delay(FanResponseDelayMs + (cycle * 500), ct);
+
+                    // Take more samples for better accuracy
+                    var (avgRpm, minRpm, maxRpm) = await GetStableFanRpmAsync(fanIndex, 7, ct); // 7 samples
+
+                    result.ActualRpmAfter = avgRpm;
+                    result.RpmSource = GetCurrentRpmSource(fanIndex);
+                    result.ActualLevelAfter = ReadCurrentLevel(fanIndex);
+                    result.LevelReadbackMatched = IsLevelReadbackMatch(result);
+
+                    // Check if we're within a more lenient tolerance for enhanced verification
+                    var lenientTolerance = result.ExpectedRpm * (RpmTolerance * 1.5); // 50% more lenient
+                    var withinLenientTolerance = IsPhysicalRpmSource(result.RpmSource) &&
+                        Math.Abs(result.ActualRpmAfter - result.ExpectedRpm) <= lenientTolerance;
+                    var levelEvidenceAccepted = IsLevelOnlyEvidenceAcceptable(result);
+
+                    if (withinLenientTolerance || levelEvidenceAccepted)
+                    {
+                        result.VerificationEvidence = DetermineVerificationEvidence(withinLenientTolerance, levelEvidenceAccepted);
+                        _logging.Info($"✓ Enhanced verification passed on cycle {cycle} for fan {fanIndex}: {avgRpm} RPM (range: {minRpm}-{maxRpm})");
+                        result.VerificationPassed = true;
+                        result.Duration = DateTime.Now - startTime;
+                        return result;
+                    }
+
+                    _logging.Warn($"Enhanced verification cycle {cycle} inconclusive: {DescribeVerificationMismatch(result)} (sample range: {minRpm}-{maxRpm})");
+                }
+
+                // All verification attempts failed
+                result.ActualRpmAfter = GetCurrentRpm(fanIndex);
+                result.RpmSource = GetCurrentRpmSource(fanIndex);
+                result.VerificationPassed = false;
+                result.ErrorMessage = $"Enhanced verification remained inconclusive after multiple attempts: expected level {result.ExpectedLevel}, got {result.ActualLevelAfter}; RPM source={result.RpmSource}";
+
+                // Auto-revert if enabled and requested
+                if (autoRevertOnFailure && AutoRevertOnFailure)
+                {
+                    _logging.Warn($"Auto-reverting fan {fanIndex} to previous state due to verification failure...");
+                    await Task.Delay(RevertDelayMs, ct);
+
+                    try
+                    {
+                        // Try to restore original fan level
+                        var originalPercent = LevelToPercent(originalState.level);
+                        var revertResult = await ApplyAndVerifyFanSpeedAsync(fanIndex, originalPercent, ct);
+
+                        if (revertResult.Success)
+                        {
+                            _logging.Info($"✓ Successfully reverted fan {fanIndex} to {originalPercent}% ({originalState.rpm} RPM)");
+                            result.ErrorMessage += " [Auto-reverted to previous state]";
+                        }
+                        else
+                        {
+                            _logging.Warn($"Failed to auto-revert fan {fanIndex} to previous state");
+                            result.ErrorMessage += " [Auto-revert failed]";
+                        }
+                    }
+                    catch (Exception revertEx)
+                    {
+                        _logging.Error($"Exception during auto-revert: {revertEx.Message}");
+                        result.ErrorMessage += " [Auto-revert exception]";
+                    }
+                }
+
+                _logging.Error($"✗ Enhanced verification completely failed for fan {fanIndex}: {result.ErrorMessage}");
+            }
+            catch (Exception ex)
+            {
+                result.ErrorMessage = $"Enhanced verification exception: {ex.Message}";
+                _logging.Error($"Enhanced verification exception for fan {fanIndex}: {ex.Message}", ex);
+            }
+
+            result.Duration = DateTime.Now - startTime;
+            return result;
+        }
+
+        /// <summary>
+        /// Perform a comprehensive fan calibration test across multiple speeds.
+        /// Useful for generating calibration data for specific laptop models.
+        /// </summary>
+        public async Task<FanCalibrationResult> PerformFanCalibrationAsync(
+            int fanIndex,
+            CancellationToken ct = default)
+        {
+            var calibrationResult = new FanCalibrationResult
+            {
+                FanIndex = fanIndex,
+                FanName = GetFanName(fanIndex),
+                CalibrationPoints = new List<FanCalibrationPoint>(),
+                StartTime = DateTime.Now
+            };
+
+            _logging.Info($"Starting fan calibration for {calibrationResult.FanName} (fan {fanIndex})");
+
+            // Test speeds: 0%, 20%, 40%, 60%, 80%, 100%
+            var testSpeeds = new[] { 0, 20, 40, 60, 80, 100 };
+
+            try
+            {
+                foreach (var speed in testSpeeds)
+                {
+                if (ct.IsCancellationRequested)
+                {
+                    calibrationResult.ErrorMessage = "Calibration cancelled";
+                    break;
+                }
+
+                _logging.Info($"Calibrating fan {fanIndex} at {speed}%...");
+
+                try
+                {
+                    // Apply the speed
+                    var applyResult = await ApplyWithEnhancedVerificationAsync(fanIndex, speed, false, ct);
+
+                    // Wait for stabilization
+                    await Task.Delay(3000, ct);
+
+                    // Take multiple readings
+                    var (avgRpm, minRpm, maxRpm) = await GetStableFanRpmAsync(fanIndex, 10, ct);
+
+                    var point = new FanCalibrationPoint
+                    {
+                        RequestedPercent = speed,
+                        AppliedLevel = applyResult.AppliedLevel,
+                        MeasuredRpm = avgRpm,
+                        RpmRangeMin = minRpm,
+                        RpmRangeMax = maxRpm,
+                        VerificationPassed = applyResult.Success,
+                        Duration = applyResult.Duration
+                    };
+
+                    calibrationResult.CalibrationPoints.Add(point);
+
+                    _logging.Info($"Calibration point: {speed}% → {avgRpm} RPM (range: {minRpm}-{maxRpm}, verified: {applyResult.Success})");
+
+                    // Wait between tests to prevent thermal stress
+                    if (speed < 100)
+                        await Task.Delay(2000, ct);
+                }
+                catch (Exception ex)
+                {
+                    _logging.Error($"Calibration failed at {speed}%: {ex.Message}");
+
+                    var errorPoint = new FanCalibrationPoint
+                    {
+                        RequestedPercent = speed,
+                        ErrorMessage = ex.Message
+                    };
+                    calibrationResult.CalibrationPoints.Add(errorPoint);
+                }
+                }
+            }
+            finally
+            {
+                RestoreFanControlAfterCalibration(fanIndex);
+            }
+
+            calibrationResult.EndTime = DateTime.Now;
+            calibrationResult.Duration = calibrationResult.EndTime - calibrationResult.StartTime;
+            calibrationResult.Success = calibrationResult.CalibrationPoints.All(p => p.VerificationPassed);
+
+            _logging.Info($"Fan calibration completed for {calibrationResult.FanName}: {calibrationResult.CalibrationPoints.Count} points, success: {calibrationResult.Success}");
+
+            return calibrationResult;
+        }
+
+        public bool RestoreFanControlAfterCalibration()
+        {
+            return RestoreFanControlAfterCalibration(fanIndex: -1);
+        }
+
+        private bool RestoreFanControlAfterCalibration(int fanIndex)
+        {
+            try
+            {
+                var target = fanIndex >= 0 ? $"fan {fanIndex}" : "manual request";
+                if (_fanService != null)
+                {
+                    _fanService.RestoreAutoControl();
+                    _logging.Info($"Fan calibration cleanup restored BIOS auto control after {target}");
+                    return true;
+                }
+
+                if (_wmiBios?.IsAvailable == true)
+                {
+                    _wmiBios.ReleaseMaxAndHandBackToBios();
+                    _logging.Info($"Fan calibration cleanup cleared max override and restored default fan mode after {target}");
+                    return true;
+                }
+
+                _logging.Warn("Fan calibration cleanup skipped: no fan service or WMI BIOS backend available");
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Fan calibration cleanup failed after testing fan {fanIndex}: {ex.Message}");
+            }
+
+            return false;
+                }
+            }
+
+    /// <summary>
+    /// Result of a fan calibration operation.
+    /// </summary>
+    public class FanCalibrationResult
+    {
+        public int FanIndex { get; set; }
+        public string FanName { get; set; } = "";
+        public List<FanCalibrationPoint> CalibrationPoints { get; set; } = new();
+        public DateTime StartTime { get; set; }
+        public DateTime EndTime { get; set; }
+        public TimeSpan Duration { get; set; }
+        public bool Success { get; set; }
+        public string? ErrorMessage { get; set; }
+        
+        /// <summary>
+        /// Overall calibration score (0-100) based on all test points (v2.7.0).
+        /// </summary>
+        public int OverallScore
+        {
+            get
+            {
+                if (!CalibrationPoints.Any()) return 0;
+                var validPoints = CalibrationPoints.Where(p => p.VerificationPassed).ToList();
+                if (!validPoints.Any()) return 0;
+                return (int)validPoints.Average(p => p.Score);
+            }
+        }
+        
+        /// <summary>
+        /// Human-readable score rating for the overall calibration.
+        /// </summary>
+        public string OverallRating => OverallScore switch
+        {
+            >= 90 => "Excellent",
+            >= 70 => "Good",
+            >= 50 => "Fair",
+            >= 25 => "Poor",
+            _ => "Failed"
+        };
+    }
+
+    /// <summary>
+    /// Single calibration point data.
+    /// </summary>
+    public class FanCalibrationPoint
+    {
+        public int RequestedPercent { get; set; }
+        public int AppliedLevel { get; set; }
+        public int MeasuredRpm { get; set; }
+        public int RpmRangeMin { get; set; }
+        public int RpmRangeMax { get; set; }
+        public bool VerificationPassed { get; set; }
+        public TimeSpan Duration { get; set; }
+        public string? ErrorMessage { get; set; }
+        
+        /// <summary>
+        /// Expected RPM for the requested percent.
+        /// </summary>
+        public int ExpectedRpm => (int)(RequestedPercent / 100.0 * 5500);
+        
+        /// <summary>
+        /// Deviation percentage from expected RPM.
+        /// </summary>
+        public double DeviationPercent => ExpectedRpm > 0 
+            ? Math.Abs(MeasuredRpm - ExpectedRpm) / (double)ExpectedRpm * 100 
+            : (MeasuredRpm <= 0 ? 0 : 100);
+        
+        /// <summary>
+        /// Score for this calibration point (0-100).
+        /// </summary>
+        public int Score
+        {
+            get
+            {
+                if (!VerificationPassed) return 0;
+                if (MeasuredRpm <= 0 && RequestedPercent > 0) return 5;
+                
+                // Score based on deviation (15% = 0, 0% = 100)
+                double score = Math.Max(0, 100 - (DeviationPercent / 15.0 * 100));
+                
+                // Bonus for stability (narrow RPM range)
+                int range = RpmRangeMax - RpmRangeMin;
+                if (range < 50) score = Math.Min(100, score + 5); // Very stable
+                else if (range > 200) score = Math.Max(0, score - 10); // Unstable
+                
+                return (int)Math.Round(score);
+            }
+        }
+    }
+}

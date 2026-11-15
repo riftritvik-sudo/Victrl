@@ -1,0 +1,547 @@
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Threading;
+using OmenCore.Models;
+using OmenCore.Services;
+using OmenCore.Services.Diagnostics;
+using OmenCore.Utils;
+
+namespace OmenCore.Views
+{
+    /// <summary>
+    /// Quick popup window that appears near the system tray for fast access to common settings.
+    /// Shows CPU/GPU temps, fan mode, performance mode, and quick actions.
+    /// </summary>
+    public partial class QuickPopupWindow : Window
+    {
+        private const string UpdateTimerRegistryName = "TrayQuickPopupRefresh";
+        private const int UpdateTimerIntervalMs = 1000;
+
+        private readonly DisplayService _displayService;
+        private IDisposable? _updateTimerSubscription;
+        private MonitoringSample? _latestSample;
+        
+        private string _currentFanMode = "Auto";
+        private string _currentPerformanceMode = "Balanced";
+        private string? _curvePresetName;
+        private string _monitoringHealth = "Unknown";
+        private bool _isFanPerformanceLinked;
+        private List<DisplayTarget> _displayTargets = new();
+        private int _activeDisplayTargetIndex;
+        private PopupTelemetryDisplayState? _lastRenderedTelemetryState;
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool LockWorkStation();
+
+        private readonly record struct PopupTelemetryDisplayState(
+            string CpuTemp,
+            string GpuTemp,
+            string CpuLoad,
+            string GpuLoad,
+            string MonitoringHealth,
+            string LinkMode);
+        
+        /// <summary>
+        /// Raised when user requests a fan mode change.
+        /// </summary>
+        public event Action<string>? FanModeChangeRequested;
+        
+        /// <summary>
+        /// Raised when user wants to open the full dashboard from Quick Access.
+        /// </summary>
+        public event Action? OpenDashboardRequested;
+
+        /// <summary>
+        /// Raised when user requests a combined quick profile.
+        /// </summary>
+        public event Action<string>? QuickProfileChangeRequested;
+
+        /// <summary>
+        /// Raised when user requests a safe RAM clean from Quick Access.
+        /// </summary>
+        public event Action? MemoryCleanRequested;
+
+        public QuickPopupWindow()
+        {
+            InitializeComponent();
+            
+            _displayService = new DisplayService(App.Logging);
+
+            RefreshDisplayTargets();
+            // Update display info
+            UpdateRefreshRateDisplay();
+            UpdateFanModeButtons();
+            UpdatePerformanceModeButtons();
+            UpdateLinkModeText();
+            
+            // Update timer for temperatures is started/stopped with window visibility
+            // (see StartUpdateTimer/StopUpdateTimer) rather than running continuously.
+            IsVisibleChanged += QuickPopupWindow_IsVisibleChanged;
+            
+            // Allow dragging the window
+            MouseLeftButtonDown += (s, e) => 
+            {
+                if (e.ButtonState == MouseButtonState.Pressed)
+                    DragMove();
+            };
+        }
+
+        /// <summary>
+        /// Position the popup near the system tray area.
+        /// </summary>
+        public void PositionNearTray()
+        {
+            // Get the working area (excludes taskbar)
+            var workArea = SystemParameters.WorkArea;
+            
+            // Position in bottom-right corner, above taskbar
+            Left = workArea.Right - Width - 12;
+            Top = workArea.Bottom - Height - 12;
+
+            // Resume timer when showing
+            StartUpdateTimer();
+        }
+
+        /// <summary>
+        /// Update monitoring data from the main app.
+        /// </summary>
+        public void UpdateMonitoringSample(MonitoringSample sample)
+        {
+            _latestSample = sample;
+        }
+
+        /// <summary>
+        /// Update the current fan mode display.
+        /// </summary>
+        public void UpdateFanMode(string mode)
+        {
+            var normalizedMode = NormalizeFanModeForDisplay(mode);
+            if (string.Equals(_currentFanMode, normalizedMode, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _currentFanMode = normalizedMode;
+            UpdateFanModeButtons();
+        }
+
+        /// <summary>
+        /// Update the Curve button tooltip with the active preset name so users know
+        /// which saved fan curve will be applied when they click Curve.
+        /// </summary>
+        public void UpdateCurvePresetName(string? presetName)
+        {
+            if (string.Equals(_curvePresetName, presetName, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _curvePresetName = presetName;
+            var tooltip = string.IsNullOrWhiteSpace(presetName)
+                ? "Apply saved fan curve"
+                : $"Curve: {presetName}";
+            if (!string.Equals(FanCustomBtn.ToolTip as string, tooltip, StringComparison.Ordinal))
+            {
+                FanCustomBtn.ToolTip = tooltip;
+            }
+            UpdatePerformanceModeTooltips();
+        }
+
+        /// <summary>
+        /// Update the current performance mode display.
+        /// </summary>
+        public void UpdatePerformanceMode(string mode)
+        {
+            var normalizedMode = PerformanceModeNameResolver.Normalize(mode);
+            if (string.Equals(_currentPerformanceMode, normalizedMode, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _currentPerformanceMode = normalizedMode;
+            UpdatePerformanceModeButtons();
+        }
+
+        private static string NormalizeFanModeForDisplay(string? mode)
+        {
+            if (FanModeNameResolver.IsMaxAlias(mode))
+            {
+                return "Max";
+            }
+
+            if (FanModeNameResolver.IsQuietAlias(mode))
+            {
+                return "Quiet";
+            }
+
+            if (FanModeNameResolver.IsAutoAlias(mode))
+            {
+                return "Auto";
+            }
+
+            if (FanModeNameResolver.IsCustomAlias(mode))
+            {
+                return "Custom";
+            }
+
+            return string.IsNullOrWhiteSpace(mode) ? "Auto" : mode.Trim();
+        }
+
+        public void UpdateMonitoringHealth(string health)
+        {
+            var normalizedHealth = string.IsNullOrWhiteSpace(health) ? "Unknown" : health;
+            if (string.Equals(_monitoringHealth, normalizedHealth, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _monitoringHealth = normalizedHealth;
+            var healthText = $"Monitoring: {_monitoringHealth}";
+            if (!string.Equals(HealthStatusText.Text, healthText, StringComparison.Ordinal))
+            {
+                HealthStatusText.Text = healthText;
+            }
+            HealthStatusText.Foreground = _monitoringHealth switch
+            {
+                "Healthy" => new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x00, 0xC8, 0xC8)),  // Teal
+                "Degraded" => new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0xFF, 0xB8, 0x00)), // Amber
+                "Stale" => new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0xFF, 0x00, 0x5C)),    // Red
+                _ => new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x9C, 0xA3, 0xAF))           // Grey
+            };
+        }
+
+        public void UpdateLinkedMode(bool linked)
+        {
+            if (_isFanPerformanceLinked == linked)
+            {
+                return;
+            }
+
+            _isFanPerformanceLinked = linked;
+            UpdateLinkModeText();
+            LinkModeText.Foreground = linked
+                ? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x00, 0xC8, 0xC8))
+                : new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x9C, 0xA3, 0xAF));
+            LinkModeText.ToolTip = linked
+                ? "Linked mode is enabled. Performance changes may also rewrite fan policy."
+                : "Decoupled mode is enabled. Performance changes leave your current fan preset or curve untouched.";
+            UpdatePerformanceModeTooltips();
+        }
+
+        private void UpdateDisplay(object? sender, EventArgs e)
+        {
+            if (_latestSample == null) return;
+
+            var displayState = BuildTelemetryDisplayState(_latestSample);
+            if (_lastRenderedTelemetryState.HasValue && _lastRenderedTelemetryState.Value.Equals(displayState))
+            {
+                   // v3.6.2: Cache hit - popup display state unchanged, no text update needed
+                   RuntimeUiPerformanceCounters.RecordPopupRenderCacheHit();
+                return;
+            }
+            
+               // v3.6.2: Cache miss - popup display state changed, update text fields
+               RuntimeUiPerformanceCounters.RecordPopupRenderCacheMiss();
+            CpuTempText.Text = displayState.CpuTemp;
+            GpuTempText.Text = displayState.GpuTemp;
+            CpuLoadText.Text = displayState.CpuLoad;
+            GpuLoadText.Text = displayState.GpuLoad;
+            HealthStatusText.Text = displayState.MonitoringHealth;
+            LinkModeText.Text = displayState.LinkMode;
+            _lastRenderedTelemetryState = displayState;
+        }
+
+        private PopupTelemetryDisplayState BuildTelemetryDisplayState(MonitoringSample sample)
+        {
+            return new PopupTelemetryDisplayState(
+                sample.CpuTemperatureC > 0 ? sample.CpuTemperatureC.ToString("0") : "—",
+                sample.GpuTemperatureC > 0 ? sample.GpuTemperatureC.ToString("0") : "—",
+                $"{sample.CpuLoadPercent:0}%",
+                $"{sample.GpuLoadPercent:0}%",
+                $"Monitoring: {_monitoringHealth}",
+                BuildLinkModeText());
+        }
+
+        private void UpdateLinkModeText()
+        {
+            var linkModeText = BuildLinkModeText();
+            if (!string.Equals(LinkModeText.Text, linkModeText, StringComparison.Ordinal))
+            {
+                LinkModeText.Text = linkModeText;
+            }
+        }
+
+        private string BuildLinkModeText()
+        {
+            return _isFanPerformanceLinked
+                ? "Fan/Perf: Linked"
+                : "Fan/Perf: Decoupled - fan stays";
+        }
+
+        private void UpdatePerformanceModeTooltips()
+        {
+            var preservedFanText = string.IsNullOrWhiteSpace(_curvePresetName)
+                ? "your current fan preset"
+                : $"the active curve preset '{_curvePresetName}'";
+
+            var tooltip = _isFanPerformanceLinked
+                ? "Apply this performance mode. Linked mode can also update fan policy."
+                : $"Apply this performance mode. Decoupled mode keeps {preservedFanText} active.";
+
+            QuickQuietBtn.ToolTip = tooltip;
+            QuickBalancedBtn.ToolTip = tooltip;
+            QuickPerformanceBtn.ToolTip = tooltip;
+        }
+
+        private void UpdateFanModeButtons()
+        {
+            // Reset all buttons to default style
+            FanAutoBtn.Style = (Style)FindResource("ModeButtonStyle");
+            FanMaxBtn.Style = (Style)FindResource("ModeButtonStyle");
+            FanCustomBtn.Style = (Style)FindResource("ModeButtonStyle");
+            
+            // Highlight active button
+            var activeStyle = (Style)FindResource("ActiveModeButtonStyle");
+            if (FanModeNameResolver.IsAutoAlias(_currentFanMode))
+            {
+                FanAutoBtn.Style = activeStyle;
+            }
+            else if (FanModeNameResolver.IsMaxAlias(_currentFanMode))
+            {
+                FanMaxBtn.Style = activeStyle;
+            }
+            else if (FanModeNameResolver.IsCustomAlias(_currentFanMode))
+            {
+                FanCustomBtn.Style = activeStyle;
+            }
+        }
+
+        private void UpdatePerformanceModeButtons()
+        {
+            // Reset all buttons to default style
+            QuickBalancedBtn.Style = (Style)FindResource("ModeButtonStyle");
+            QuickPerformanceBtn.Style = (Style)FindResource("ModeButtonStyle");
+            QuickQuietBtn.Style = (Style)FindResource("ModeButtonStyle");
+            
+            // Highlight active button
+            var activeStyle = (Style)FindResource("ActiveModeButtonStyle");
+            switch (_currentPerformanceMode.ToLower())
+            {
+                case "balanced":
+                case "default":
+                    QuickBalancedBtn.Style = activeStyle;
+                    break;
+                case "performance":
+                case "high":
+                    QuickPerformanceBtn.Style = activeStyle;
+                    break;
+                case "quiet":
+                case "powersaver":
+                    QuickQuietBtn.Style = activeStyle;
+                    break;
+            }
+        }
+
+        private void UpdateRefreshRateDisplay()
+        {
+            var target = GetActiveDisplayTarget();
+            int currentRate = _displayService.GetCurrentRefreshRate(target?.DeviceName);
+
+            if (target == null)
+            {
+                RefreshRateText.Text = currentRate > 0 ? $"{currentRate}Hz" : "N/A";
+                RefreshRateBtn.ToolTip = "Toggle refresh rate";
+                return;
+            }
+
+            var targetLabel = $"D{_activeDisplayTargetIndex + 1}";
+            RefreshRateText.Text = currentRate > 0 ? $"{targetLabel} {currentRate}Hz" : $"{targetLabel} N/A";
+            RefreshRateBtn.ToolTip = $"Toggle refresh rate for {target.FriendlyName}. Click again to move to the next display.";
+        }
+
+        private void RefreshDisplayTargets()
+        {
+            _displayTargets = _displayService.GetDisplayTargets();
+            if (_displayTargets.Count == 0)
+            {
+                _activeDisplayTargetIndex = 0;
+                return;
+            }
+
+            var primaryIndex = _displayTargets.FindIndex(target => target.IsPrimary);
+            _activeDisplayTargetIndex = primaryIndex >= 0 ? primaryIndex : 0;
+        }
+
+        private DisplayTarget? GetActiveDisplayTarget()
+        {
+            if (_displayTargets.Count == 0)
+            {
+                return null;
+            }
+
+            if (_activeDisplayTargetIndex < 0 || _activeDisplayTargetIndex >= _displayTargets.Count)
+            {
+                _activeDisplayTargetIndex = 0;
+            }
+
+            return _displayTargets[_activeDisplayTargetIndex];
+        }
+
+        private void FanMode_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is Button btn && btn.Tag is string mode)
+            {
+                FanModeChangeRequested?.Invoke(mode);
+                UpdateFanMode(mode);
+            }
+        }
+
+        private void QuickProfile_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is Button btn && btn.Tag is string profile)
+            {
+                QuickProfileChangeRequested?.Invoke(profile);
+                UpdatePerformanceMode(profile);
+                UpdateFanMode(string.Equals(profile, "Balanced", StringComparison.OrdinalIgnoreCase)
+                    ? "Auto"
+                    : profile);
+            }
+        }
+
+        private void OpenDashboard_Click(object sender, RoutedEventArgs e)
+        {
+            OpenDashboardRequested?.Invoke();
+            Hide();
+        }
+
+        private void DisplayOff_Click(object sender, RoutedEventArgs e)
+        {
+            Hide();
+
+            if (string.Equals(DisplayOffBtn.Tag as string, "LockWindows", StringComparison.Ordinal))
+            {
+                if (!LockWorkStation())
+                {
+                    App.Logging.Warn("Quick Access could not lock Windows");
+                }
+                return;
+            }
+
+            _displayService.TurnOffDisplay();
+        }
+
+        private void MemoryClean_Click(object sender, RoutedEventArgs e)
+        {
+            MemoryCleanRequested?.Invoke();
+            Hide();
+        }
+
+        /// <summary>
+        /// Applies the persisted Quick Access shortcut preference. Unknown values retain
+        /// the legacy Display Off behavior for backward compatibility.
+        /// </summary>
+        public void ConfigureQuickAction(string? action)
+        {
+            switch (action)
+            {
+                case "Disabled":
+                    DisplayOffBtn.Visibility = Visibility.Collapsed;
+                    break;
+                case "LockWindows":
+                    DisplayOffBtn.Visibility = Visibility.Visible;
+                    DisplayOffBtn.Tag = "LockWindows";
+                    DisplayOffBtn.ToolTip = "Lock Windows";
+                    QuickActionIcon.Text = "🔒";
+                    QuickActionText.Text = "Lock";
+                    break;
+                default:
+                    DisplayOffBtn.Visibility = Visibility.Visible;
+                    DisplayOffBtn.Tag = "DisplayOff";
+                    DisplayOffBtn.ToolTip = "Turn off display";
+                    QuickActionIcon.Text = "🌙";
+                    QuickActionText.Text = "Display Off";
+                    break;
+            }
+        }
+
+        private void RefreshRate_Click(object sender, RoutedEventArgs e)
+        {
+            var target = GetActiveDisplayTarget();
+            int newRate = _displayService.ToggleRefreshRate(target?.DeviceName);
+            if (newRate > 0)
+            {
+                if (_displayTargets.Count > 1)
+                {
+                    _activeDisplayTargetIndex = (_activeDisplayTargetIndex + 1) % _displayTargets.Count;
+                }
+
+                UpdateRefreshRateDisplay();
+            }
+        }
+
+        private void CloseButton_Click(object sender, RoutedEventArgs e)
+        {
+            StopUpdateTimer();
+            Hide();
+        }
+
+        private void Window_Deactivated(object sender, EventArgs e)
+        {
+            // Auto-hide when clicking outside
+            StopUpdateTimer();
+            Hide();
+        }
+
+        private void QuickPopupWindow_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+        {
+            if (IsVisible)
+            {
+                StartUpdateTimer();
+            }
+            else
+            {
+                StopUpdateTimer();
+            }
+        }
+
+        private void StartUpdateTimer()
+        {
+            if (_updateTimerSubscription != null)
+            {
+                return;
+            }
+
+            _updateTimerSubscription = UiPollingCoordinator.Subscribe(
+                UpdateTimerRegistryName,
+                TimeSpan.FromMilliseconds(UpdateTimerIntervalMs),
+                () => UpdateDisplay(null, EventArgs.Empty));
+            BackgroundTimerRegistry.Register(
+                UpdateTimerRegistryName,
+                nameof(QuickPopupWindow),
+                "Visible tray quick-popup telemetry refresh",
+                UpdateTimerIntervalMs,
+                BackgroundTimerTier.VisibleOnly);
+        }
+
+        private void StopUpdateTimer()
+        {
+            _updateTimerSubscription?.Dispose();
+            _updateTimerSubscription = null;
+
+            BackgroundTimerRegistry.Unregister(UpdateTimerRegistryName);
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            StopUpdateTimer();
+            IsVisibleChanged -= QuickPopupWindow_IsVisibleChanged;
+            // DisplayService doesn't need disposal
+            base.OnClosed(e);
+        }
+    }
+}

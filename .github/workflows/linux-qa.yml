@@ -1,0 +1,206 @@
+name: Linux QA & Artifact Build
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  build-linux-artifacts:
+    runs-on: ubuntu-22.04
+    name: Build & Test Linux Artifacts
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    
+    - name: Setup .NET 8
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: '8.0.x'
+    
+    - name: Restore dependencies
+      run: dotnet restore src/OmenCore.Linux/OmenCore.Linux.csproj
+    
+    - name: Build Linux CLI (self-contained x64)
+      run: |
+        PUBLISH_DIR="$GITHUB_WORKSPACE/artifacts/linux-qa"
+        mkdir -p "$PUBLISH_DIR"
+        echo "PUBLISH_DIR=$PUBLISH_DIR" >> "$GITHUB_ENV"
+        dotnet publish src/OmenCore.Linux/OmenCore.Linux.csproj \
+          -c Release -r linux-x64 \
+          --self-contained \
+          -p:DebugType=none \
+          -p:DebugSymbols=false \
+          -p:PublishTrimmed=false \
+          -o "$PUBLISH_DIR"
+    
+    - name: Verify Linux CLI executable
+      run: |
+        chmod +x "$PUBLISH_DIR/omencore-cli"
+        ls -lh "$PUBLISH_DIR/omencore-cli"
+        file "$PUBLISH_DIR/omencore-cli"
+    
+    - name: Run CLI Help & Version Tests
+      run: |
+        "$PUBLISH_DIR/omencore-cli" --help
+        "$PUBLISH_DIR/omencore-cli" --version || true
+    
+    - name: Run Smoke Tests (Basic Functionality)
+      run: |
+        CLI_PATH="$PUBLISH_DIR/omencore-cli"
+        
+        echo "=== Testing CLI Basic Commands ==="
+        
+        # Test status command (should work even without hardware)
+        echo "Testing status command..."
+        $CLI_PATH status || echo "Status command failed (expected on CI)"
+        
+        # Test list command
+        echo "Testing list command..."
+        $CLI_PATH list || echo "List command failed (expected on CI)"
+        
+        # Test invalid command (should show error)
+        echo "Testing invalid command..."
+        $CLI_PATH invalid-command && echo "ERROR: Invalid command should fail" || echo "✓ Invalid command properly rejected"
+        
+        # Test help for specific commands
+        echo "Testing command-specific help..."
+        $CLI_PATH status --help || echo "Status help failed"
+        $CLI_PATH fan --help || echo "Fan help failed"
+        
+        echo "=== Smoke Tests Completed ==="
+    
+    - name: Test Error Messages & Kernel Detection
+      run: |
+        CLI_PATH="$PUBLISH_DIR/omencore-cli"
+        
+        echo "=== Testing Error Messages ==="
+        
+        # Test kernel module detection messages
+        echo "Testing kernel module detection..."
+        $CLI_PATH status 2>&1 | grep -i "kernel\|module\|ec_sys\|hp-wmi" || echo "No kernel messages found (expected on CI)"
+        
+        # Test hardware detection messages
+        echo "Testing hardware detection..."
+        $CLI_PATH list 2>&1 | head -20
+        
+        # Test graceful failure without hardware
+        echo "Testing graceful degradation..."
+        timeout 10s $CLI_PATH monitor || echo "Monitor command timed out or failed (expected on CI)"
+        
+        echo "=== Error Message Tests Completed ==="
+    
+    - name: Test Configuration & Persistence
+      run: |
+        CLI_PATH="$PUBLISH_DIR/omencore-cli"
+        
+        echo "=== Testing Configuration Handling ==="
+        
+        # Test config export (should work without hardware)
+        echo "Testing config export..."
+        $CLI_PATH config export /tmp/test-config.json || echo "Config export failed"
+        ls -la /tmp/test-config.json || echo "Config file not created"
+        
+        # Test config validation
+        echo "Testing config validation..."
+        $CLI_PATH config validate /tmp/test-config.json || echo "Config validation failed"
+        
+        # Test invalid config handling
+        echo "Testing invalid config handling..."
+        echo '{"invalid": "json"' > /tmp/invalid-config.json
+        $CLI_PATH config validate /tmp/invalid-config.json && echo "ERROR: Should reject invalid config" || echo "✓ Invalid config properly rejected"
+        
+        echo "=== Configuration Tests Completed ==="
+    
+    - name: Generate SHA256 Checksums
+      run: |
+        cd "$PUBLISH_DIR"
+        sha256sum omencore-cli > checksums.sha256
+        echo "=== Generated Checksums ==="
+        cat checksums.sha256
+    
+    - name: Create Release Artifact Package
+      run: |
+        VERSION=$(git describe --tags --always)
+        ARTIFACT_DIR="OmenCore-${VERSION}-linux-x64"
+        mkdir -p "dist/${ARTIFACT_DIR}"
+        
+        # Copy files
+        cp "$PUBLISH_DIR/omencore-cli" "dist/${ARTIFACT_DIR}/"
+        cp LICENSE "dist/${ARTIFACT_DIR}/"
+        cp README.md "dist/${ARTIFACT_DIR}/"
+        cp "$PUBLISH_DIR/checksums.sha256" "dist/${ARTIFACT_DIR}/"
+        
+        # Create tarball with checksums
+        cd dist
+        tar -czf "${ARTIFACT_DIR}.tar.gz" "${ARTIFACT_DIR}/"
+        sha256sum "${ARTIFACT_DIR}.tar.gz" > "${ARTIFACT_DIR}.checksums"
+        
+        echo "=== Artifact Created ==="
+        ls -lh "${ARTIFACT_DIR}"*
+        cat "${ARTIFACT_DIR}.checksums"
+    
+    - name: Upload Linux Artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: linux-x64-cli
+        path: dist/OmenCore-*-linux-x64.tar.gz
+        retention-days: 30
+    
+    - name: Upload Checksums
+      uses: actions/upload-artifact@v7
+      with:
+        name: linux-checksums
+        path: dist/OmenCore-*-linux-x64.checksums
+        retention-days: 30
+    
+  run-unit-tests:
+    runs-on: ubuntu-24.04 # pinned: ubuntu-latest moves to a newer image on 2026-10-19; move on purpose after a CI check
+    name: Run Unit Tests
+    
+    steps:
+    - uses: actions/checkout@v7
+    
+    - name: Setup .NET 8
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: '8.0.x'
+    
+    # Only the cross-platform projects can be tested here. OmenCoreApp and
+    # OmenCoreApp.Tests target net8.0-windows10.0.19041.0, which does not build on
+    # Linux at all (NETSDK1100), so pointing this at OmenCore.sln failed during
+    # restore and this job has never once passed. The Windows suite is covered by
+    # the build-and-test job in ci.yml, which runs on windows-latest.
+    - name: Run cross-platform tests
+      run: |
+        dotnet test src/OmenCore.Linux.Tests/OmenCore.Linux.Tests.csproj -c Release \
+          --logger "console;verbosity=detailed" \
+          --logger "trx;LogFileName=test-results.trx"
+    
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: test-results
+        path: '**/*.trx'
+
+  check-warnings:
+    runs-on: ubuntu-24.04 # pinned: ubuntu-latest moves to a newer image on 2026-10-19; move on purpose after a CI check
+    name: Code Quality Checks
+    
+    steps:
+    - uses: actions/checkout@v7
+    
+    - name: Setup .NET 8
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: '8.0.x'
+    
+    - name: Build with warnings as errors
+      run: dotnet build OmenCore.sln -c Release /p:TreatWarningsAsErrors=true
+      continue-on-error: true

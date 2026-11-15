@@ -1,0 +1,1116 @@
+using System;
+using System.Collections.Generic;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using OmenCore.Corsair;
+using OmenCore.Services;
+
+namespace OmenCore.Models
+{
+    public class AppConfig
+    {
+        /// <summary>
+        /// Schema of this file. 0 means a config written before 5.0.0, which had no version; the loader migrates it
+        /// step by step up to <see cref="OmenCore.Services.ConfigurationService.CurrentSchemaVersion"/> and keeps a copy
+        /// of the original. Left at 0 here (not the current value) so a file without the field reads as old.
+        /// </summary>
+        public int SchemaVersion { get; set; }
+
+        /// <summary>
+        /// Keys this build does not know, kept and written back unchanged, so opening a config from a newer OmenCore
+        /// (or one a later version added fields to) does not silently strip its settings.
+        /// </summary>
+        [JsonExtensionData]
+        public Dictionary<string, JsonElement>? UnknownSettings { get; set; }
+
+        public string EcDevicePath { get; set; } = string.Empty;
+        public int MonitoringIntervalMs { get; set; } = 1000;
+        public List<FanPreset> FanPresets { get; set; } = new();
+        public List<PerformanceMode> PerformanceModes { get; set; } = new();
+        public List<ServiceToggle> SystemToggles { get; set; } = new();
+        public List<LightingProfile> LightingProfiles { get; set; } = new();
+        public List<CorsairLightingPreset> CorsairLightingPresets { get; set; } = new();
+        public List<CorsairDpiStage> DefaultCorsairDpi { get; set; } = new();
+        
+        /// <summary>
+        /// Named DPI profiles saved by the user for quick apply across devices.
+        /// </summary>
+        public List<OmenCore.Corsair.CorsairDpiProfile> CorsairDpiProfiles { get; set; } = new();
+        public List<MacroProfile> MacroProfiles { get; set; } = new();
+        public Dictionary<string, int> EcFanRegisterMap { get; set; } = new();
+        public UndervoltPreferences Undervolt { get; set; } = new();
+        public MonitoringPreferences Monitoring { get; set; } = new();
+        public UpdatePreferences Updates { get; set; } = new();
+        public FeaturePreferences Features { get; set; } = new();
+        public FanHysteresisSettings FanHysteresis { get; set; } = new();
+        /// <summary>
+        /// Fan transition / smoothing settings for ramping and immediate apply behavior.
+        /// </summary>
+        public FanTransitionSettings FanTransition { get; set; } = new();
+
+        /// <summary>
+        /// v3.7.0: Quiet profile thermal safety auto-switch settings.
+        /// When in Quiet profile and temperature exceeds SafetyOnTempC, OmenCore
+        /// automatically applies Max fan cooling until temp drops below SafetyOffTempC.
+        /// </summary>
+        public QuietSafetySettings QuietSafety { get; set; } = new();
+        
+        /// <summary>
+        /// Override the auto-detected maximum fan level (0 = auto-detect).
+        /// Classic HP OMEN models use 0-55 (krpm), but some models support higher levels
+        /// (e.g., OMEN 16-xd0xxx maxes at level 63 = 6300 RPM).
+        /// Set this if your fans don't reach full speed. Typical values: 55, 63, 100.
+        /// The BIOS will clamp to the actual hardware maximum if the value is too high.
+        /// </summary>
+        public int MaxFanLevelOverride { get; set; } = 0;
+        public OsdSettings Osd { get; set; } = new();
+        public BatterySettings Battery { get; set; } = new();
+        public AmbientLightingSettings AmbientLighting { get; set; } = new();
+
+        /// <summary>
+        /// Controls whether the Scene Quick Select card is enabled in the RGB tab.
+        /// When false, only the card header remains visible so users can re-enable it.
+        /// </summary>
+        public bool SceneQuickSelectCardEnabled { get; set; } = true;
+
+        public bool FirstRunCompleted { get; set; } = false;
+
+        /// <summary>
+        /// If true, the Corsair service will NOT fall back to the iCUE SDK when direct HID access fails.
+        /// This allows OmenCore to operate without iCUE but may result in reduced device support on some systems.
+        /// Default: false (iCUE fallback allowed).
+        /// </summary>
+        public bool CorsairDisableIcueFallback { get; set; } = false;
+
+        /// <summary>
+        /// Telemetry: anonymous, aggregated counts of PID successes/failures for HID writes.
+        /// Opt-in only; default is false.
+        /// </summary>
+        public bool TelemetryEnabled { get; set; } = false;
+        
+        /// <summary>
+        /// Enable detailed diagnostics logging at startup (OGH commands, WMI status, etc.)
+        /// </summary>
+        public bool EnableDiagnostics { get; set; } = false;
+        
+        /// <summary>
+        /// Logging verbosity level. Options: Error, Warning, Info, Debug.
+        /// Default is Info. Set to Warning for less verbose logs.
+        /// </summary>
+        public LogLevel LogLevel { get; set; } = LogLevel.Info;
+        
+        /// <summary>
+        /// Keep the main window always on top of other windows.
+        /// </summary>
+        public bool StayOnTop { get; set; } = false;
+
+        /// <summary>
+        /// Action shown in the middle Quick Access shortcut. Supported values are
+        /// DisplayOff, LockWindows, and Disabled.
+        /// </summary>
+        public string QuickAccessAction { get; set; } = "DisplayOff";
+
+        /// <summary>
+        /// When false, left-clicking the tray icon opens the main window directly instead
+        /// of showing the Quick Access popup. Also suppresses the popup on OMEN-key press
+        /// when its action is configured to ShowQuickPopup.
+        /// </summary>
+        public bool QuickPopupEnabled { get; set; } = true;
+        
+        /// <summary>
+        /// When true, switching performance modes also writes a fan policy (legacy coupled behavior).
+        /// Default is false — performance mode switches only affect power plan and EC power limits;
+        /// fan presets or curves set by the user are preserved across profile switches.
+        /// </summary>
+        public bool LinkFanToPerformanceMode { get; set; } = false;
+
+        /// <summary>
+        /// Hides the one-time explainer that fan control is decoupled from performance mode by default.
+        /// </summary>
+        public bool DismissedFanPerformanceDecouplingNotice { get; set; } = false;
+
+        /// <summary>
+        /// Hides the Fan Control page's explainer that a saved preset/curve will not reapply at
+        /// startup unless Startup Hardware Restore (and its Fans category) is enabled in Settings.
+        /// </summary>
+        public bool DismissedStartupRestoreHint { get; set; } = false;
+
+        /// <summary>
+        /// Enables beginner-friendly Lite Mode by hiding advanced tabs and controls.
+        /// </summary>
+        public bool LiteModeEnabled { get; set; } = false;
+
+        /// <summary>
+        /// Last applied performance mode name (e.g., "Balanced", "Performance", "Quiet")
+        /// Restored on startup.
+        /// </summary>
+        public string? LastPerformanceModeName { get; set; }
+
+        /// <summary>
+        /// Safety switch: when false (default), OmenCore will NOT auto-reapply BIOS/EC power settings at startup.
+        /// Users can still apply Performance mode / GPU Power Boost manually from UI.
+        /// </summary>
+        public bool EnableStartupHardwareRestore { get; set; } = false;
+
+        /// <summary>
+        /// Whether to lift an under-rated adapter's power clamps without being asked each time.
+        ///
+        /// Deliberately outside <see cref="EnableStartupHardwareRestore"/>. That gate is about
+        /// re-applying settings the user chose; this is about a clamp the user never chose, it
+        /// re-applies on power events rather than only at startup, and its GPU half has a condition
+        /// no other startup restore has - see <see cref="AdapterClampLiftSettings"/>. Both halves
+        /// default to off regardless.
+        /// </summary>
+        public AdapterClampLiftSettings AdapterClampLift { get; set; } = new();
+
+        /// <summary>
+        /// Optional per-category startup restore switch for fan state.
+        /// Null preserves legacy behavior: enabled when the broad startup restore gate is enabled.
+        /// </summary>
+        public bool? StartupRestoreFansEnabled { get; set; }
+
+        /// <summary>Explicit opt-in for restoring full-speed Max at launch; ordinary fan restore does not imply it.</summary>
+        public bool RestoreMaxFanOnStartup { get; set; }
+
+        /// <summary>
+        /// Optional per-category startup restore switch for performance mode and GPU power boost.
+        /// Null preserves legacy behavior: enabled when the broad startup restore gate is enabled.
+        /// </summary>
+        public bool? StartupRestorePerformanceEnabled { get; set; }
+
+        /// <summary>
+        /// Optional per-category startup restore switch for keyboard/peripheral RGB.
+        /// Null preserves legacy behavior: enabled when the broad startup restore gate is enabled.
+        /// </summary>
+        public bool? StartupRestoreRgbEnabled { get; set; }
+
+        /// <summary>
+        /// Optional per-category startup restore switch for tuning values such as undervolt, TCC, and GPU OC.
+        /// Null preserves legacy behavior: enabled when the broad startup restore gate is enabled.
+        /// </summary>
+        public bool? StartupRestoreTuningEnabled { get; set; }
+
+        /// <summary>
+        /// Extra guardrail for models with reported firmware instability.
+        /// When false (default), startup hardware restore remains blocked on OMEN 16 / Victus class devices.
+        /// </summary>
+        public bool AllowStartupRestoreOnOmen16OrVictus { get; set; } = false;
+        
+        /// <summary>
+        /// Last applied GPU Power Boost level ("Minimum", "Medium", "Maximum").
+        /// Note: GPU power settings may reset after sleep/reboot on some OMEN models due to BIOS behavior.
+        /// </summary>
+        public string? LastGpuPowerBoostLevel { get; set; }
+        
+        /// <summary>
+        /// GPU overclocking settings (NVAPI-based core/memory clock offsets and power limit).
+        /// </summary>
+        public GpuOcSettings? GpuOc { get; set; }
+        
+        /// <summary>
+        /// Saved GPU overclocking profiles for quick switching.
+        /// </summary>
+        public List<GpuOcProfile> GpuOcProfiles { get; set; } = new();
+        
+        /// <summary>
+        /// Name of the last applied GPU OC profile (for UI selection).
+        /// </summary>
+        public string? LastGpuOcProfileName { get; set; }
+        
+        /// <summary>
+        /// AMD Ryzen power and temperature limits (STAPM, Tctl).
+        /// </summary>
+        public AmdPowerLimits? AmdPowerLimits { get; set; }
+        
+        /// <summary>
+        /// Per-game automatic profile configurations.
+        /// </summary>
+        public List<GameProfile> GameProfiles { get; set; } = new();
+        
+        /// <summary>
+        /// Automation rules for conditional profile switching.
+        /// </summary>
+        public List<AutomationRule> AutomationRules { get; set; } = new();
+        
+        /// <summary>
+        /// Last applied TCC (Thermal Control Circuit) offset in degrees C.
+        /// Re-applied on startup to maintain CPU temperature limits.
+        /// 0 = no limit (full TjMax), higher values = lower temp limit.
+        /// </summary>
+        public int? LastTccOffset { get; set; }
+        
+        /// <summary>
+        /// Last applied CPU PL1 (sustained power limit) in watts.
+        /// </summary>
+        public int? LastCpuPl1Watts { get; set; }
+        
+        /// <summary>
+        /// Last applied CPU PL2 (burst power limit) in watts.
+        /// </summary>
+        public int? LastCpuPl2Watts { get; set; }
+        
+        /// <summary>
+        /// Last applied fan preset name for restoration on startup.
+        /// </summary>
+        public string? LastFanPresetName { get; set; }
+        
+        /// <summary>
+        /// Custom fan curve points for unified fan control (non-independent mode).
+        /// Each point maps a temperature (°C) to a fan percentage.
+        /// </summary>
+        public List<FanCurvePoint>? CustomFanCurve { get; set; }
+        
+        /// <summary>
+        /// Whether independent CPU/GPU fan curves are enabled.
+        /// When enabled, CPU and GPU fans are controlled separately based on their respective temperatures.
+        /// </summary>
+        public bool IndependentFanCurvesEnabled { get; set; } = false;
+        
+        /// <summary>
+        /// Custom CPU fan curve points (used when IndependentFanCurvesEnabled is true).
+        /// Each point maps a temperature (°C) to a fan percentage.
+        /// </summary>
+        public List<FanCurvePoint>? CpuFanCurve { get; set; }
+        
+        /// <summary>
+        /// Custom GPU fan curve points (used when IndependentFanCurvesEnabled is true).
+        /// Each point maps a temperature (°C) to a fan percentage.
+        /// </summary>
+        public List<FanCurvePoint>? GpuFanCurve { get; set; }
+        
+        /// <summary>
+        /// Power automation settings for AC/Battery profile switching.
+        /// </summary>
+        public PowerAutomationSettings? PowerAutomation { get; set; }
+        
+        // OMEN Key Interception settings
+        /// <summary>Enable OMEN key interception to prevent OGH from launching</summary>
+        public bool OmenKeyEnabled { get; set; } = true;
+        
+        /// <summary>Whether to block the key (true) or let it pass through (false)</summary>
+        public bool OmenKeyIntercept { get; set; } = true;
+
+        /// <summary>
+        /// When true (default), VK_F24 and VK_OMEN_157 are only accepted as the OMEN key if their
+        /// scan code is also in the known OMEN scan code set. This prevents games or apps that
+        /// happen to send F24 (vkCode 0x87) from accidentally triggering OmenCore actions.
+        /// Set to false only if your hardware model's OMEN key is not recognised in strict mode.
+        /// </summary>
+        public bool StrictOmenKeyMode { get; set; } = true;
+        
+        /// <summary>Action to perform when OMEN key is pressed</summary>
+        public string OmenKeyAction { get; set; } = "ToggleOmenCore";
+        
+        /// <summary>Path to external app when OmenKeyAction is LaunchExternalApp</summary>
+        public string? OmenKeyExternalApp { get; set; }
+
+        /// <summary>Optional command-line arguments passed to <see cref="OmenKeyExternalApp"/>.</summary>
+        public string? OmenKeyExternalArgs { get; set; }
+        
+        /// <summary>
+        /// EXPERIMENTAL: Enable direct EC writes for keyboard RGB control.
+        /// WARNING: This feature is DISABLED by default because EC keyboard registers vary by model.
+        /// Writing to wrong EC addresses can cause hard system crashes requiring forced restart.
+        /// Only enable this if WMI keyboard lighting doesn't work and you accept the risk.
+        /// </summary>
+        public bool ExperimentalEcKeyboardEnabled { get; set; } = false;
+        
+        /// <summary>
+        /// EXPERIMENTAL: Enable exclusive EC access diagnostic mode.
+        /// When enabled, EC providers will acquire exclusive mutex access and hold it,
+        /// collecting diagnostic snapshots when other applications try to access EC registers.
+        /// This helps diagnose EC register contention issues but may interfere with other apps.
+        /// WARNING: This is for diagnostic purposes only and may cause system instability.
+        /// </summary>
+        public bool ExclusiveEcAccessDiagnosticsEnabled { get; set; } = false;
+        
+        /// <summary>
+        /// Preferred keyboard lighting backend: "Auto" (default), "WmiBios", "Wmi", "Ec".
+        /// Auto will use WMI BIOS > WMI > EC priority.
+        /// Setting a specific backend forces that backend if available.
+        /// </summary>
+        public string PreferredKeyboardBackend { get; set; } = "Auto";
+        
+        /// <summary>
+        /// Invert the order of RGB zones (right-to-left instead of left-to-right).
+        /// Needed for OMEN Max 16 light bar which has inverted zone order.
+        /// Zone mapping when inverted: Zone1=Right, Zone2=Middle-Right, Zone3=Middle-Left, Zone4=Left
+        /// </summary>
+        public bool InvertRgbZoneOrder { get; set; } = false;
+        
+        /// <summary>
+        /// Saved keyboard zone colors (4 zones). Applied on startup.
+        /// </summary>
+        public KeyboardLightingSettings KeyboardLighting { get; set; } = new();
+        
+        /// <summary>
+        /// Memory optimizer: whether periodic/interval auto-clean is enabled.
+        /// Persisted so it survives app restarts.
+        /// </summary>
+        public bool MemoryIntervalCleanEnabled { get; set; } = false;
+        
+        /// <summary>
+        /// Memory optimizer: interval in minutes for periodic auto-clean.
+        /// Persisted so it survives app restarts. Range: 1-120, default: 10.
+        /// </summary>
+        public int MemoryIntervalCleanMinutes { get; set; } = 10;
+        
+        /// <summary>
+        /// Memory optimizer: whether threshold-based auto-clean is enabled.
+        /// Persisted so it survives app restarts.
+        /// </summary>
+        public bool MemoryAutoCleanEnabled { get; set; } = false;
+        
+        /// <summary>
+        /// Memory optimizer: memory usage % threshold that triggers auto-clean.
+        /// Persisted so it survives app restarts. Range: 50-95, default: 80.
+        /// </summary>
+        public int MemoryAutoCleanThreshold { get; set; } = 80;
+
+        /// <summary>
+        /// Memory optimizer auto-clean profile: Aggressive, Balanced, Conservative, OffPeakOnly, or Manual.
+        /// </summary>
+        public string MemoryAutoCleanProfile { get; set; } = "Balanced";
+
+        /// <summary>
+        /// Memory optimizer: avoid full standby/cache purges while a fullscreen game is foreground unless memory pressure is critical.
+        /// </summary>
+        public bool MemoryGameAwareQuietWindowEnabled { get; set; } = true;
+
+        /// <summary>
+        /// Memory optimizer: optional auto-clean cooldown override in minutes. 0 uses the selected profile default.
+        /// </summary>
+        public int MemoryAutoCleanCooldownMinutes { get; set; } = 0;
+
+        /// <summary>
+        /// Process names excluded from memory working-set trimming (without .exe).
+        /// </summary>
+        public List<string> MemoryExcludedProcesses { get; set; } = new();
+        
+        /// <summary>
+        /// Hardware worker: whether orphan timeout is enabled (worker exits after parent dies with no reconnection).
+        /// Default: true. Set to false for headless/server scenarios where worker should persist indefinitely.
+        /// </summary>
+        public bool HardwareWorkerOrphanTimeoutEnabled { get; set; } = true;
+        
+        /// <summary>
+        /// Hardware worker: timeout in minutes after parent dies before worker exits if no client reconnects.
+        /// Only applies if HardwareWorkerOrphanTimeoutEnabled is true. Range: 1-60, default: 5.
+        /// </summary>
+        public int HardwareWorkerOrphanTimeoutMinutes { get; set; } = 5;        
+        /// <summary>
+        /// Application: run in headless mode (no main window, only tray icon and background services).
+        /// Useful for servers or when only fan/performance control is needed. Default: false.
+        /// </summary>
+        public bool HeadlessMode { get; set; } = false;
+
+        /// <summary>
+        /// Force WPF into software rendering mode (RenderMode.SoftwareOnly).
+        /// Prevents UCEERR_RENDERTHREADFAILURE crashes caused by RTSS/MSI Afterburner D3D hooks.
+        /// OmenCore also enables this automatically when RTSS is detected at startup.
+        /// Default: false. Enable this if you see repeated render-thread crash dialogs.
+        /// </summary>
+        public bool UseSoftwareRendering { get; set; } = false;
+
+        /// <summary>
+        /// Explicit in-app override to suppress OmenCore's own motion (view transitions,
+        /// state-change easing) regardless of the Windows-wide "Show animations" preference.
+        /// Default: false - motion still follows the OS preference either way (see
+        /// OmenCore.Utils.MotionPreference), this only forces it off when the user wants
+        /// OmenCore quiet without changing Windows-wide settings.
+        /// </summary>
+        public bool ReduceMotion { get; set; } = false;
+
+        /// <summary>
+        /// UI language: "auto" (the language Windows is installed in), "en", "ru" or "tr".
+        ///
+        /// Read once at startup, before the first window loads, because the shell's strings are
+        /// resolved by <c>x:Static</c> as each view is parsed; changing it therefore takes effect on
+        /// the next launch rather than half-repainting the open window. Numbers are unaffected: they
+        /// stay invariant whatever this says.
+        /// </summary>
+        public string Language { get; set; } = "auto";
+
+        /// <summary>
+        /// Display scale for the shell, in percent: 80, 90, 100, 110, 125, 140 or 150 (roadmap WP-33;
+        /// this is the font-scale setting WP-45 deferred, because it is a layout zoom rather than a
+        /// font-size change). Values that are not a supported step are snapped to the nearest one on
+        /// load, so a hand-edited value cannot produce an unreadable window.
+        /// </summary>
+        public int UiScalePercent { get; set; } = 100;
+
+        /// <summary>
+        /// Thermal alert thresholds (CPU/GPU/SSD temperature warnings and critical alerts).
+        /// </summary>
+        public ThermalMonitoringSettings ThermalAlerts { get; set; } = new();
+
+        /// <summary>
+        /// Time-of-day automation rules: each rule applies a fan preset and/or performance mode at a scheduled time.
+        /// </summary>
+        public List<ScheduleRule> ScheduleRules { get; set; } = new();
+    }
+    
+    /// <summary>
+    /// Thermal alert thresholds for CPU, GPU, and SSD over-temperature notifications.
+    /// </summary>
+    public class ThermalMonitoringSettings
+    {
+        /// <summary>CPU temperature (°C) for warning notification. Default: 85°C.</summary>
+        public double CpuWarningC { get; set; } = 85;
+        
+        /// <summary>CPU temperature (°C) for critical notification. Default: 95°C.</summary>
+        public double CpuCriticalC { get; set; } = 95;
+        
+        /// <summary>GPU temperature (°C) for warning notification. Default: 85°C.</summary>
+        public double GpuWarningC { get; set; } = 85;
+        
+        /// <summary>GPU temperature (°C) for critical notification. Default: 95°C.</summary>
+        public double GpuCriticalC { get; set; } = 95;
+        
+        /// <summary>SSD temperature (°C) for warning notification. Default: 70°C.</summary>
+        public double SsdWarningC { get; set; } = 70;
+        
+        /// <summary>Enable or disable thermal alert notifications entirely. Default: true.</summary>
+        public bool IsEnabled { get; set; } = true;
+    }
+    
+    /// <summary>
+    /// Settings for HP OMEN keyboard 4-zone RGB lighting.
+    /// </summary>
+    public class KeyboardLightingSettings
+    {
+        /// <summary>Zone 1 (Left) color in hex format (e.g., "#E6002E")</summary>
+        public string Zone1Color { get; set; } = "#E6002E";
+        
+        /// <summary>Zone 2 (Middle-Left) color in hex format</summary>
+        public string Zone2Color { get; set; } = "#E6002E";
+        
+        /// <summary>Zone 3 (Middle-Right) color in hex format</summary>
+        public string Zone3Color { get; set; } = "#E6002E";
+        
+        /// <summary>Zone 4 (Right) color in hex format</summary>
+        public string Zone4Color { get; set; } = "#E6002E";
+        
+        /// <summary>Whether to apply keyboard colors on startup</summary>
+        public bool ApplyOnStartup { get; set; } = true;
+        
+        /// <summary>
+        /// Whether the keyboard backlight was ON when user last used OmenCore.
+        /// Used to restore backlight state on startup.
+        /// </summary>
+        public bool BacklightWasEnabled { get; set; } = true;
+
+        /// <summary>Physical RGB/backlight surface observed after the latest user probe.</summary>
+        public string ObservedSurface { get; set; } = "Not recorded";
+
+        /// <summary>Safe probe color used for the latest observed-surface capture.</summary>
+        public string ObservedProbeColorHex { get; set; } = "#00FF66";
+
+        /// <summary>Keyboard lighting backend active when the latest observation was recorded.</summary>
+        public string ObservedBackend { get; set; } = "";
+
+        /// <summary>Backend apply status captured with the latest observation.</summary>
+        public string ObservedApplyStatus { get; set; } = "";
+
+        /// <summary>UTC time when the latest RGB observed-surface record was captured.</summary>
+        public DateTime? ObservedAtUtc { get; set; }
+
+        /// <summary>
+        /// The last per-key picture applied from the editor, as painted.
+        ///
+        /// Kept because nothing else remembers it. The keyboard MCU holds the colour map it is
+        /// drawing but cannot be asked what is in it — there is no colour readback on either
+        /// interface — so a picture that is not written down here exists only as light. The
+        /// keyboard's own flash is the other durable copy and it is deliberately a separate,
+        /// explicit action; this one costs nothing and covers the ordinary case of reopening the
+        /// app and finding the editor as it was left.
+        ///
+        /// Empty means the editor has never been applied, which is why restore is skipped rather
+        /// than blanking the keyboard to a saved picture of nothing.
+        /// </summary>
+        public List<SavedPerKeyCell> PerKeyPicture { get; set; } = new();
+
+        /// <summary>Master brightness the per-key picture was applied at, 0-100.</summary>
+        public int PerKeyBrightness { get; set; } = 100;
+
+        /// <summary>
+        /// Whether to repaint <see cref="PerKeyPicture"/> at startup.
+        ///
+        /// Separate from <see cref="ApplyOnStartup"/>, which restores the four zone colours. The two
+        /// describe the same keyboard at different resolutions and cannot both run: whichever goes
+        /// last wins, and a zone fill would erase a per-key picture completely. Where a picture
+        /// exists it is the more specific answer and takes precedence.
+        /// </summary>
+        public bool RestorePerKeyPictureOnStartup { get; set; } = true;
+
+        /// <summary>
+        /// Profiles staged for the keyboard's Fn+1 / Fn+2 cycle.
+        ///
+        /// This is the STAGED set, not a readback — the MCU will not enumerate its cycle, so the
+        /// only record of what a user curated is ours. Losing it would leave profiles on the
+        /// keyboard that nothing in the UI could account for.
+        /// </summary>
+        public List<FnCycleSlot> FnCycleSlots { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Settings for automatic profile switching based on power source.
+    /// </summary>
+    public class PowerAutomationSettings
+    {
+        public bool Enabled { get; set; } = false;
+        
+        // AC Power settings
+        public string AcFanPreset { get; set; } = "Auto";
+        public string AcPerformanceMode { get; set; } = "Balanced";
+        public string AcGpuMode { get; set; } = "Hybrid";
+        
+        // Battery settings
+        public string BatteryFanPreset { get; set; } = "Quiet";
+        public string BatteryPerformanceMode { get; set; } = "Silent";
+        public string BatteryGpuMode { get; set; } = "Eco";
+
+        /// <summary>
+        /// AC/Battery state PowerAutomationService last confirmed, persisted so a fresh launch can
+        /// tell "the power source changed while the app was closed" (a real transition automation
+        /// should react to) apart from "the app just restarted on the same power source" (not a
+        /// transition - the user's last manual fan/performance selection should stand). Null means
+        /// no prior session has recorded one yet (first run, or automation just enabled).
+        /// </summary>
+        public bool? LastKnownAcState { get; set; } = null;
+    }
+    
+    /// <summary>
+    /// Fan hysteresis settings to prevent fan speed oscillation.
+    /// </summary>
+    public class FanHysteresisSettings
+    {
+        /// <summary>Enable hysteresis (dead-zone) to prevent fan oscillation</summary>
+        public bool Enabled { get; set; } = true;
+        
+        /// <summary>Temperature dead-zone in °C. Fans won't change unless temp moves beyond this threshold.</summary>
+        public double DeadZone { get; set; } = 4.0;
+        
+        /// <summary>Ramp-up delay in seconds before increasing fan speed.</summary>
+        public double RampUpDelay { get; set; } = 1.0;
+        
+        /// <summary>Ramp-down delay in seconds before decreasing fan speed.</summary>
+        public double RampDownDelay { get; set; } = 5.0;
+        
+        /// <summary>Enable thermal protection override - forces max fans when temps exceed threshold, even in Auto mode.</summary>
+        public bool ThermalProtectionEnabled { get; set; } = true;
+        
+        /// <summary>
+        /// Temperature threshold in °C for thermal protection to activate (start ramping fans).
+        /// Default: 90°C. Advanced users can lower to 80-85°C for more aggressive cooling.
+        /// v2.8.0: Raised from 80°C — laptops routinely hit 80-85°C under gaming load.
+        /// Range: 75-95°C. Values outside this range will be clamped.
+        /// </summary>
+        public double ThermalProtectionThreshold { get; set; } = 90.0;
+
+        /// <summary>
+        /// Temperature threshold in °C for the hard emergency override — fans forced to 100%
+        /// immediately, no debounce. Default: 95°C. Range: 90-99°C, and kept at least 2°C
+        /// above <see cref="ThermalProtectionThreshold"/> (values that would invert the two
+        /// are bumped up automatically). Only takes effect while
+        /// <see cref="ThermalProtectionEnabled"/> is true — requested by field reports asking
+        /// for control over the "thermal emergency forces max fan" behavior.
+        /// </summary>
+        public double ThermalEmergencyThreshold { get; set; } = 95.0;
+    }
+
+    /// <summary>
+    /// Settings for fan transition smoothing and immediate-apply behavior.
+    /// </summary>
+    public class FanTransitionSettings
+    {
+        /// <summary>Enable smoothing (ramp fans gradually) when applying a new target.</summary>
+        public bool EnableSmoothing { get; set; } = true;
+
+        /// <summary>Total smoothing duration in milliseconds when ramping between fan percentages.</summary>
+        public int SmoothingDurationMs { get; set; } = 1000;
+
+        /// <summary>Step interval in milliseconds for incremental ramp steps.</summary>
+        public int SmoothingStepMs { get; set; } = 200;
+
+        /// <summary>
+        /// When true, user-initiated apply actions (Save/Apply preset) will force immediate application
+        /// rather than waiting for smoothing / hysteresis.
+        /// </summary>
+        public bool ApplyImmediatelyOnUserAction { get; set; } = false;
+    }
+    
+    /// <summary>
+    /// In-game OSD overlay settings.
+    /// </summary>
+    public class OsdSettings
+    {
+        /// <summary>Master toggle - when disabled, no OSD process runs at all</summary>
+        public bool Enabled { get; set; } = false;
+        
+        /// <summary>Toggle hotkey (e.g., Ctrl+Shift+F12)</summary>
+        public string ToggleHotkey { get; set; } = "Ctrl+Shift+F12";
+        
+        /// <summary>Position: TopLeft, TopCenter, TopRight, BottomLeft, BottomCenter, BottomRight</summary>
+        public string Position { get; set; } = "TopRight";
+
+        /// <summary>Which monitor to target: Primary, ActiveWindow, or MouseCursor.</summary>
+        public string MonitorTarget { get; set; } = "ActiveWindow";
+        
+        /// <summary>Opacity 0.0-1.0 (lower = more transparent)</summary>
+        public double Opacity { get; set; } = 0.6;
+        
+        /// <summary>Show CPU temperature</summary>
+        public bool ShowCpuTemp { get; set; } = true;
+        
+        /// <summary>Show GPU temperature</summary>
+        public bool ShowGpuTemp { get; set; } = true;
+        
+        /// <summary>Show CPU load percentage</summary>
+        public bool ShowCpuLoad { get; set; } = true;
+        
+        /// <summary>Show GPU load percentage</summary>
+        public bool ShowGpuLoad { get; set; } = true;
+        
+        /// <summary>Show fan speeds</summary>
+        public bool ShowFanSpeed { get; set; } = true;
+        
+        /// <summary>Show RAM usage</summary>
+        public bool ShowRamUsage { get; set; } = false;
+        
+        /// <summary>Show current fan/performance mode</summary>
+        public bool ShowCurrentMode { get; set; } = true;
+        
+        /// <summary>Show current FPS from RTSS shared memory when available</summary>
+        public bool ShowFps { get; set; } = false;
+        
+        /// <summary>Show current fan mode (Auto, Performance, Silent, Max)</summary>
+        public bool ShowFanMode { get; set; } = true;
+
+        /// <summary>Hotkey OSD toast duration in milliseconds (800-6000).</summary>
+        public int HotkeyToastDurationMs { get; set; } = 2200;
+
+        /// <summary>Hotkey OSD toast scale percent (80-140).</summary>
+        public int HotkeyToastScalePercent { get; set; } = 100;
+
+        /// <summary>Use compact hotkey OSD layout (smaller card, less secondary text).</summary>
+        public bool HotkeyToastCompact { get; set; } = false;
+
+        /// <summary>Accent mode for hotkey OSD card: Auto, Cyan, Orange, Teal, Magenta.</summary>
+        public string HotkeyToastAccent { get; set; } = "Auto";
+        
+        /// <summary>Show performance mode (Balanced, Performance, Silent)</summary>
+        public bool ShowPerformanceMode { get; set; } = false;
+        
+        /// <summary>Show frametime in milliseconds (inverse of FPS)</summary>
+        public bool ShowFrametime { get; set; } = false;
+        
+        /// <summary>Show current clock time</summary>
+        public bool ShowTime { get; set; } = false;
+        
+        /// <summary>Show GPU power consumption in watts</summary>
+        public bool ShowGpuPower { get; set; } = false;
+        
+        /// <summary>Show CPU power consumption in watts</summary>
+        public bool ShowCpuPower { get; set; } = false;
+        
+        /// <summary>Show network latency (ping to common servers)</summary>
+        public bool ShowNetworkLatency { get; set; } = false;
+        
+        /// <summary>Show GPU memory usage</summary>
+        public bool ShowVramUsage { get; set; } = false;
+        
+        /// <summary>Show package power (CPU+GPU combined wattage)</summary>
+        public bool ShowPackagePower { get; set; } = false;
+        
+        /// <summary>Show GPU hotspot (junction) temperature</summary>
+        public bool ShowGpuHotspot { get; set; } = false;
+        
+        /// <summary>Show toast notifications when mode changes (fan profile, performance mode, etc.)</summary>
+        public bool ShowModeChangeNotifications { get; set; } = true;
+        
+        /// <summary>Use RTSS (RivaTuner) for accurate FPS data when available</summary>
+        public bool UseRtssForFps { get; set; } = true;
+        
+        /// <summary>Layout orientation: Vertical or Horizontal</summary>
+        public string Layout { get; set; } = "Vertical";
+
+        /// <summary>Overlay density: Compact, Balanced, Comfortable</summary>
+        public string DensityMode { get; set; } = "Balanced";
+
+        /// <summary>Show thermal-focused metric group.</summary>
+        public bool ShowThermalsGroup { get; set; } = true;
+
+        /// <summary>Show performance-focused metric group.</summary>
+        public bool ShowPerformanceGroup { get; set; } = true;
+
+        /// <summary>Show network-focused metric group.</summary>
+        public bool ShowNetworkGroup { get; set; } = true;
+
+        /// <summary>Show system-focused metric group.</summary>
+        public bool ShowSystemGroup { get; set; } = true;
+        
+        /// <summary>Show network upload speed in Mbps</summary>
+        public bool ShowNetworkUpload { get; set; } = false;
+        
+        /// <summary>Show network download speed in Mbps</summary>
+        public bool ShowNetworkDownload { get; set; } = false;
+        
+        /// <summary>Show battery percentage and charge status</summary>
+        public bool ShowBattery { get; set; } = false;
+        
+        /// <summary>Show CPU clock speed (average across cores)</summary>
+        public bool ShowCpuClock { get; set; } = false;
+        
+        /// <summary>Show GPU clock speed</summary>
+        public bool ShowGpuClock { get; set; } = false;
+    }
+    
+    /// <summary>
+    /// Battery care settings.
+    /// </summary>
+    public class BatterySettings
+    {
+        /// <summary>Enable charge limit for battery longevity</summary>
+        public bool ChargeLimitEnabled { get; set; } = false;
+        
+        /// <summary>Charge threshold percentage (60-100%, default 80%)</summary>
+        public int ChargeThresholdPercent { get; set; } = 80;
+        
+        /// <summary>Show battery health warnings</summary>
+        public bool ShowHealthWarnings { get; set; } = true;
+        
+        /// <summary>
+        /// Disable all battery monitoring (Win32_Battery WMI queries, LibreHardwareMonitor battery sensors).
+        /// Enable this if your battery is dead/removed and OmenCore causes EC timeout errors or unexpected shutdowns.
+        /// When disabled, battery % will show as 100% (AC assumed) and no battery WMI queries will be made.
+        /// </summary>
+        public bool DisableMonitoring { get; set; } = false;
+    }
+    
+    /// <summary>
+    /// Ambient lighting (screen color sampling) settings.
+    /// </summary>
+    public class AmbientLightingSettings
+    {
+        /// <summary>Enable ambient lighting feature</summary>
+        public bool Enabled { get; set; } = false;
+        
+        /// <summary>Update interval in milliseconds (16-500, default 33 = ~30 FPS)</summary>
+        public int UpdateIntervalMs { get; set; } = 33;
+        
+        /// <summary>Saturation boost (0.5-2.0, default 1.2)</summary>
+        public float SaturationBoost { get; set; } = 1.2f;
+        
+        /// <summary>Brightness multiplier (0.0-1.0, default 1.0)</summary>
+        public float Brightness { get; set; } = 1.0f;
+        
+        /// <summary>Number of frames to smooth colors over (1-10, default 3)</summary>
+        public int SmoothingFrames { get; set; } = 3;
+        
+        /// <summary>Apply ambient colors to keyboard</summary>
+        public bool ApplyToKeyboard { get; set; } = true;
+        
+        /// <summary>Apply ambient colors to peripherals (mouse, headset)</summary>
+        public bool ApplyToPeripherals { get; set; } = true;
+    }
+    
+    /// <summary>
+    /// GPU overclocking settings (NVAPI-based).
+    /// </summary>
+    public class GpuOcSettings
+    {
+        /// <summary>GPU core clock offset in MHz (-500 to +300)</summary>
+        public int CoreClockOffsetMHz { get; set; } = 0;
+        
+        /// <summary>GPU memory clock offset in MHz (-500 to +2000)</summary>
+        public int MemoryClockOffsetMHz { get; set; } = 0;
+        
+        /// <summary>Power limit percentage (50-125, 100 = default TDP)</summary>
+        public int PowerLimitPercent { get; set; } = 100;
+        
+        /// <summary>GPU voltage offset in mV (optional, not all GPUs support)</summary>
+        public int? VoltageOffsetMv { get; set; } = null;
+        
+        /// <summary>Reapply OC settings on application startup</summary>
+        public bool ApplyOnStartup { get; set; } = false;
+
+        /// <summary>
+        /// True while a GPU OC Test Apply session is active.
+        /// Persisted for interrupted-session crash recovery.
+        /// </summary>
+        public bool PendingTestApply { get; set; } = false;
+
+        /// <summary>
+        /// True when the current tuning profile is pending user confirmation.
+        /// If the app exits unexpectedly while this is true, next launch performs a safe reset.
+        /// </summary>
+        public bool StartupPendingConfirmation { get; set; } = false;
+
+        /// <summary>
+        /// Set when startup recovery performed a safe reset because an unconfirmed profile was detected.
+        /// </summary>
+        public bool LastStartupHadUnconfirmedState { get; set; } = false;
+
+        /// <summary>Last confirmed GPU core clock offset in MHz.</summary>
+        public int LastConfirmedCoreClockOffsetMHz { get; set; } = 0;
+
+        /// <summary>Last confirmed GPU memory clock offset in MHz.</summary>
+        public int LastConfirmedMemoryClockOffsetMHz { get; set; } = 0;
+
+        /// <summary>Last confirmed power limit in percent.</summary>
+        public int LastConfirmedPowerLimitPercent { get; set; } = 100;
+
+        /// <summary>Last confirmed GPU voltage offset in mV.</summary>
+        public int LastConfirmedVoltageOffsetMv { get; set; } = 0;
+
+        /// <summary>UTC timestamp of last explicit user confirmation.</summary>
+        public DateTime? LastConfirmedAtUtc { get; set; }
+    }
+    
+    /// <summary>
+    /// GPU overclocking profile for save/load functionality.
+    /// </summary>
+    public class GpuOcProfile
+    {
+        /// <summary>Profile name (user-defined)</summary>
+        public string Name { get; set; } = "Default";
+        
+        /// <summary>GPU core clock offset in MHz</summary>
+        public int CoreClockOffsetMHz { get; set; } = 0;
+        
+        /// <summary>GPU memory clock offset in MHz</summary>
+        public int MemoryClockOffsetMHz { get; set; } = 0;
+        
+        /// <summary>Power limit percentage</summary>
+        public int PowerLimitPercent { get; set; } = 100;
+
+        /// <summary>GPU voltage offset in mV</summary>
+        public int VoltageOffsetMv { get; set; } = 0;
+        
+        /// <summary>Optional description or notes</summary>
+        public string? Description { get; set; }
+        
+        /// <summary>When this profile was created</summary>
+        public DateTime CreatedAt { get; set; } = DateTime.Now;
+        
+        /// <summary>When this profile was last modified</summary>
+        public DateTime ModifiedAt { get; set; } = DateTime.Now;
+    }
+
+    /// <summary>
+    /// AMD Ryzen power and temperature limits.
+    /// </summary>
+    public class AmdPowerLimits
+    {
+        /// <summary>STAPM (Sustained Power) limit in Watts (15-54W typical range)</summary>
+        public uint StapmLimitWatts { get; set; } = 25;
+        
+        /// <summary>CPU temperature limit in Celsius (75-105°C range)</summary>
+        public uint TempLimitC { get; set; } = 95;
+    }
+
+    /// <summary>
+    /// Automation rule for conditional system behavior.
+    /// Triggers when specified conditions are met, applies actions automatically.
+    /// </summary>
+    public class AutomationRule
+    {
+        /// <summary>Unique identifier for this rule</summary>
+        public string Id { get; set; } = Guid.NewGuid().ToString();
+        
+        /// <summary>Display name for the rule (e.g., "Silent Mode at Night")</summary>
+        public string Name { get; set; } = "";
+        
+        /// <summary>Optional description</summary>
+        public string? Description { get; set; }
+        
+        /// <summary>Is this rule enabled?</summary>
+        public bool Enabled { get; set; } = true;
+        
+        /// <summary>Rule priority (lower number = higher priority). Default: 50</summary>
+        public int Priority { get; set; } = 50;
+        
+        /// <summary>Trigger type</summary>
+        public TriggerType Trigger { get; set; }
+        
+        /// <summary>Trigger configuration (JSON-serialized based on trigger type)</summary>
+        public TriggerConfig TriggerData { get; set; } = new();
+        
+        /// <summary>Actions to execute when triggered</summary>
+        public List<RuleAction> Actions { get; set; } = new();
+        
+        /// <summary>When was this rule created</summary>
+        public DateTime CreatedAt { get; set; } = DateTime.Now;
+        
+        /// <summary>When was this rule last triggered</summary>
+        public DateTime? LastTriggeredAt { get; set; }
+        
+        /// <summary>How many times this rule has triggered</summary>
+        public int TriggerCount { get; set; }
+    }
+
+    /// <summary>
+    /// Automation trigger types
+    /// </summary>
+    public enum TriggerType
+    {
+        /// <summary>Time-based trigger (specific time or time range)</summary>
+        Time,
+        
+        /// <summary>Battery percentage threshold</summary>
+        Battery,
+        
+        /// <summary>AC power connected/disconnected</summary>
+        ACPower,
+        
+        /// <summary>Temperature threshold (CPU or GPU)</summary>
+        Temperature,
+        
+        /// <summary>Specific process running</summary>
+        Process,
+        
+        /// <summary>System idle for duration</summary>
+        Idle,
+        
+        /// <summary>WiFi SSID connected (location-based)</summary>
+        WiFiSSID,
+
+        /// <summary>Laptop lid opened/closed</summary>
+        LidState
+    }
+
+    /// <summary>
+    /// Trigger configuration data (type-specific)
+    /// </summary>
+    public class TriggerConfig
+    {
+        // Time trigger
+        public TimeSpan? StartTime { get; set; }
+        public TimeSpan? EndTime { get; set; }
+        public List<DayOfWeek>? Days { get; set; }
+        
+        // Battery trigger
+        public int? BatteryThreshold { get; set; }
+        public string? BatteryCondition { get; set; } // "Below", "Above"
+        
+        // ACPower trigger
+        public bool? ACConnected { get; set; }
+        
+        // Temperature trigger
+        public string? TemperatureSensor { get; set; } // "CPU", "GPU"
+        public int? TemperatureThreshold { get; set; }
+        public string? TemperatureCondition { get; set; } // "Above", "Below"
+        
+        // Process trigger
+        public string? ProcessName { get; set; }
+        
+        // Idle trigger
+        public int? IdleMinutes { get; set; }
+        
+        // WiFi trigger
+        public string? WiFiSSID { get; set; }
+
+        // LidState trigger
+        public bool? LidClosed { get; set; }
+    }
+
+    /// <summary>
+    /// Action to execute when rule triggers
+    /// </summary>
+    public class RuleAction
+    {
+        /// <summary>Action type</summary>
+        public ActionType Type { get; set; }
+        
+        /// <summary>Action-specific parameter (e.g., preset name, mode name)</summary>
+        public string? Parameter { get; set; }
+        
+        /// <summary>Optional numeric parameter (e.g., power limit watts)</summary>
+        public int? NumericParameter { get; set; }
+    }
+
+    /// <summary>
+    /// Automation action types
+    /// </summary>
+    public enum ActionType
+    {
+        /// <summary>Apply fan preset by name</summary>
+        SetFanPreset,
+        
+        /// <summary>Set performance mode (Balanced/Performance/Silent)</summary>
+        SetPerformanceMode,
+        
+        /// <summary>Apply GPU OC profile by name</summary>
+        SetGpuOcProfile,
+        
+        /// <summary>Set power limit in watts</summary>
+        SetPowerLimit,
+        
+        /// <summary>Set AMD STAPM limit</summary>
+        SetAmdStapmLimit,
+        
+        /// <summary>Set AMD temperature limit</summary>
+        SetAmdTempLimit,
+        
+        /// <summary>Enable/disable keyboard lighting</summary>
+        SetKeyboardLighting,
+        
+        /// <summary>Show notification message</summary>
+        ShowNotification
+    }
+
+    /// <summary>
+    /// A time-of-day automation rule that applies a fan preset and/or performance mode at a scheduled time.
+    /// </summary>
+    public class ScheduleRule
+    {
+        /// <summary>User-displayed name for the rule.</summary>
+        public string RuleName { get; set; } = "New Rule";
+
+        /// <summary>Whether this rule is active. Disabled rules are stored but not enforced.</summary>
+        public bool IsEnabled { get; set; } = true;
+
+        /// <summary>Time of day to trigger the rule (24-hour "HH:mm" format, e.g. "09:00").</summary>
+        public string TriggerTime { get; set; } = "09:00";
+
+        /// <summary>Fan preset to apply at trigger time. Empty string = no change.</summary>
+        public string FanPreset { get; set; } = "Auto";
+
+        /// <summary>Performance mode to apply at trigger time. Empty string = no change.</summary>
+        public string PerformanceMode { get; set; } = "";
+
+        /// <summary>Days of the week on which this rule is active (0=Sun..6=Sat). Empty = every day.</summary>
+        public List<int> ActiveDays { get; set; } = new();
+    }
+
+    /// <summary>
+    /// v3.7.0: Quiet profile thermal safety auto-switch settings.
+    /// When the Quiet profile is active and temperature rises critically high, OmenCore
+    /// temporarily applies Max fan cooling, then restores Quiet fans once temperature
+    /// drops back to a safe level.
+    /// </summary>
+    public class QuietSafetySettings
+    {
+        /// <summary>
+        /// Enable the Quiet profile thermal safety auto-switch.
+        /// Default: true. Disable only if you want fully manual fan control in Quiet.
+        /// </summary>
+        public bool Enabled { get; set; } = true;
+
+        /// <summary>
+        /// Temperature (°C) at which safety override activates and switches fans to Max.
+        /// Default: 90°C. Lower this if you want earlier intervention (e.g. 85°C).
+        /// Range: 70–100°C.
+        /// </summary>
+        public double SafetyOnTempC { get; set; } = 90.0;
+
+        /// <summary>
+        /// Temperature (°C) at which the safety override releases and Quiet fans resume.
+        /// Default: 70°C. Must be lower than SafetyOnTempC to provide hysteresis.
+        /// Range: 50–90°C.
+        /// </summary>
+        public double SafetyOffTempC { get; set; } = 70.0;
+    }
+}
+

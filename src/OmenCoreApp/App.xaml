@@ -1,0 +1,37 @@
+<Application x:Class="OmenCore.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:tb="http://www.hardcodet.net/taskbar"
+             xmlns:controls="clr-namespace:OmenCore.Controls">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="pack://application:,,,/OmenCore;component/Styles/ModernStyles.xaml" />
+            </ResourceDictionary.MergedDictionaries>
+            
+            <!-- Legacy compatibility -->
+            <Color x:Key="OmenRed">#FFE6002E</Color>
+            <Color x:Key="OmenGray">#FF1D1F27</Color>
+            <SolidColorBrush x:Key="ChromeBrush" Color="{StaticResource OmenGray}" />
+            <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+            <BooleanToVisibilityConverter x:Key="BoolToVisibilityConverter" />
+            <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+            <local:InverseBoolToVisibilityConverter x:Key="InverseBoolToVisibility" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:InverseBooleanConverter x:Key="InverseBooleanConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:NullToVisibilityConverter x:Key="NullToVisibilityConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:StringNotEmptyToVisibilityConverter x:Key="StringNotEmptyToVisibilityConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:IntGreaterThanZeroToVisibilityConverter x:Key="IntGreaterThanZeroToVisibilityConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:IntZeroToVisibilityConverter x:Key="IntZeroToVisibilityConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:TemperatureToColorConverter x:Key="TemperatureToColorConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:LoadToColorConverter x:Key="LoadToColorConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:BoolToYesNoConverter x:Key="BoolToYesNo" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:BoolToColorConverter x:Key="BoolToColor" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:HexToBrushConverter x:Key="HexToBrushConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:PowerToTotalConverter x:Key="PowerToTotalConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:FanSpeedConverter x:Key="FanSpeedConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:LatestFanSpeedConverter x:Key="LatestFanSpeedConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:ZeroDoubleToPlaceholderConverter x:Key="ZeroDoubleToPlaceholderConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+            <local:ModeDisplayNameConverter x:Key="ModeDisplayNameConverter" xmlns:local="clr-namespace:OmenCore.Utils" />
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

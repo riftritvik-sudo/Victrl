@@ -1,0 +1,1377 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Management;
+using Microsoft.Win32;
+using OmenCore.Services;
+
+namespace OmenCore.Hardware
+{
+    /// <summary>
+    /// Detects hardware capabilities at runtime to determine available providers.
+    /// Builds a capability matrix specific to this device.
+    /// </summary>
+    public class CapabilityDetectionService : IDisposable
+    {
+        private static readonly object BackendStatusLock = new();
+        private static readonly Dictionary<string, (bool Available, bool Healthy)> LastBackendState = new(StringComparer.OrdinalIgnoreCase);
+
+        private readonly LoggingService? _logging;
+        private bool _disposed;
+        private readonly Dictionary<string, string> _backendFailures = new(StringComparer.OrdinalIgnoreCase);
+        
+        public DeviceCapabilities Capabilities { get; private set; } = new();
+        
+        // Provider instances for testing
+        private OghServiceProxy? _oghProxy;
+        private HpWmiBios? _wmiBios;
+
+        public CapabilityDetectionService(LoggingService? logging = null)
+        {
+            _logging = logging;
+        }
+
+        /// <summary>
+        /// Run full capability detection. Call this at startup.
+        /// </summary>
+        public DeviceCapabilities DetectCapabilities()
+        {
+            _logging?.Info("═══════════════════════════════════════════════════");
+            _logging?.Info("Starting device capability detection...");
+            _logging?.Info("═══════════════════════════════════════════════════");
+            
+            Capabilities = new DeviceCapabilities();
+            
+            // Phase 1: Device identification
+            DetectDeviceInfo();
+            
+            // Phase 1.5: Load model-specific capabilities from database
+            LoadModelCapabilities();
+            
+            // Phase 2: Security status
+            DetectSecurityStatus();
+            
+            // Phase 3: OGH status (important - affects other detection)
+            DetectOghStatus();
+            
+            // Phase 4: Driver availability
+            DetectDriverAvailability();
+            
+            // Phase 5: WMI BIOS capabilities
+            DetectWmiBiosCapabilities();
+            
+            // Phase 6: Determine best fan control method
+            DetermineFanControlMethod();
+            
+            // Phase 7: Thermal sensor capabilities
+            DetectThermalCapabilities();
+            
+            // Phase 8: GPU capabilities
+            DetectGpuCapabilities();
+            
+            // Phase 9: Undervolt capabilities
+            DetectUndervoltCapabilities();
+            
+            // Phase 10: Lighting capabilities
+            DetectLightingCapabilities();
+            
+            // Phase 11: Refine capabilities based on model database
+            RefineCapabilitiesFromModel();
+
+            // Phase 12: Structured backend health snapshot (additive diagnostics)
+            BuildBackendStatuses();
+            
+            // Log summary
+            _logging?.Info("═══════════════════════════════════════════════════");
+            _logging?.Info("Capability detection complete:");
+            _logging?.Info("═══════════════════════════════════════════════════");
+            _logging?.Info(Capabilities.GetSummary());
+            
+            return Capabilities;
+        }
+        
+        /// <summary>
+        /// Load model-specific capabilities from the database.
+        /// </summary>
+        private void LoadModelCapabilities()
+        {
+            _logging?.Info("Phase 1.5: Loading model-specific capabilities...");
+            
+            var productId = Capabilities.ProductId;
+            var modelMatch = ModelCapabilityDatabase.GetPreferredCapabilities(productId, Capabilities.ModelName);
+            if (modelMatch != null)
+            {
+                Capabilities.IsKnownModel = true;
+                Capabilities.ModelConfig = modelMatch;
+
+                // Report how the profile was ACTUALLY resolved. Previously this claimed "ProductId"
+                // for anything that wasn't an ambiguous-ID disambiguation, which was misleading when
+                // GetPreferredCapabilities had in fact fallen through to a ModelNamePattern match on
+                // a *different* board's entry: e.g. board 8A25 has no entry of its own and resolves
+                // to the 8A26 entry via its "16-d1" pattern, yet the log read "Found model by
+                // ProductId" — obscuring that the running board was never actually in the database
+                // (Discord report, GPU Power Boost on Victus 16-d1176TX).
+                var resolvedByExactProductId =
+                    !string.IsNullOrWhiteSpace(productId) &&
+                    string.Equals(modelMatch.ProductId, productId.Trim(), StringComparison.OrdinalIgnoreCase);
+                string resolutionSource;
+                if (resolvedByExactProductId)
+                {
+                    resolutionSource = ModelCapabilityDatabase.IsAmbiguousProductId(productId)
+                        ? "model-name disambiguation"
+                        : "ProductId";
+                }
+                else
+                {
+                    resolutionSource = $"model-name pattern '{modelMatch.ModelNamePattern}' (no entry for ProductId '{productId}')";
+                }
+
+                _logging?.Info($"  ✓ Found model by {resolutionSource}: {Capabilities.ModelConfig.ModelName}");
+                _logging?.Info($"    Year: {Capabilities.ModelConfig.ModelYear}, Family: {Capabilities.ModelConfig.Family}");
+                
+                if (Capabilities.ModelConfig.UserVerified)
+                {
+                    _logging?.Info($"    ✓ User-verified configuration");
+                }
+                else
+                {
+                    _logging?.Warn($"    ⚠ Configuration not yet verified by users");
+                }
+
+                if (!string.IsNullOrEmpty(Capabilities.ModelConfig.Notes))
+                {
+                    _logging?.Info($"    Note: {Capabilities.ModelConfig.Notes}");
+                }
+
+                return;
+            }
+            
+            // Check if model is in the database by ProductId
+            Capabilities.IsKnownModel = ModelCapabilityDatabase.IsKnownModel(productId);
+            
+            if (Capabilities.IsKnownModel)
+            {
+                Capabilities.ModelConfig = ModelCapabilityDatabase.GetCapabilities(productId);
+                _logging?.Info($"  ✓ Found model in database: {Capabilities.ModelConfig.ModelName}");
+                _logging?.Info($"    Year: {Capabilities.ModelConfig.ModelYear}, Family: {Capabilities.ModelConfig.Family}");
+                
+                if (Capabilities.ModelConfig.UserVerified)
+                {
+                    _logging?.Info($"    ✓ User-verified configuration");
+                }
+                else
+                {
+                    _logging?.Warn($"    ⚠ Configuration not yet verified by users");
+                }
+                
+                if (!string.IsNullOrEmpty(Capabilities.ModelConfig.Notes))
+                {
+                    _logging?.Info($"    Note: {Capabilities.ModelConfig.Notes}");
+                }
+            }
+            else
+            {
+                // A board other HP projects and the Linux kernel name: same conservative flags as the family fallback, proper identity
+                var listedBoard = ModelCapabilityDatabase.GetListedBoard(productId);
+                if (listedBoard != null)
+                {
+                    Capabilities.ModelConfig = listedBoard;
+                    _logging?.Info($"  ✓ Board {productId} is listed by other HP control projects and the Linux kernel: {listedBoard.ModelName}");
+                    _logging?.Warn($"    ⚠ No OmenCore field report yet - conservative family defaults apply");
+                }
+                // Try to get capabilities by model family
+                else if (Capabilities.ModelFamily != OmenModelFamily.Unknown)
+                {
+                    Capabilities.ModelConfig = ModelCapabilityDatabase.GetCapabilitiesByFamily(Capabilities.ModelFamily);
+                    _logging?.Warn($"  ⚠ Model not in database - using {Capabilities.ModelFamily} family defaults");
+                }
+                else
+                {
+                    Capabilities.ModelConfig = ModelCapabilityDatabase.DefaultCapabilities;
+                    _logging?.Warn($"  ⚠ Unknown model - using default capabilities");
+                }
+                
+                _logging?.Info($"  💡 Please report your model (Product ID: {productId}) to improve support");
+            }
+        }
+        
+        /// <summary>
+        /// Refine detected capabilities based on model database.
+        /// Model-specific info overrides runtime detection in some cases.
+        /// </summary>
+        private void RefineCapabilitiesFromModel()
+        {
+            if (Capabilities.ModelConfig == null) return;
+            
+            _logging?.Info("Phase 11: Refining capabilities from model database...");
+            
+            var model = Capabilities.ModelConfig;
+            
+            // Apply model-specific overrides
+            
+            // Fan control
+            if (Capabilities.FanWritesBlockedForSafety)
+            {
+                ForceMonitoringOnlyFanControl("Desktop fan writes disabled by v3.6.3 safety gate");
+            }
+
+            if (!model.SupportsFanControlWmi && !model.SupportsFanControlEc)
+            {
+                // Model is known to not support fan control (e.g., desktops)
+                if (Capabilities.FanControl != FanControlMethod.None && Capabilities.FanControl != FanControlMethod.MonitoringOnly)
+                {
+                    _logging?.Warn($"  Fan control disabled per model database (not supported on {model.ModelName})");
+                    Capabilities.FanControl = FanControlMethod.MonitoringOnly;
+                    Capabilities.CanSetFanSpeed = false;
+                }
+            }
+
+            // SystemDesignData.IsSwFanControlSupport is deliberately DIAGNOSTIC ONLY - it must never
+            // narrow a capability. v4.3.1 briefly forced monitoring-only whenever this bit read
+            // false on an unverified board, on the reasoning that a firmware-authored "no" beats a
+            // template's guess. GitHub #203 (board 8C2F), #202 (8BB1) and every field bundle since
+            // showed that reasoning was wrong: on V0-thermal-policy firmware the byte is simply
+            // not populated (raw block 'C8 00 00 00 00 ...': policy 0, flag 0), yet WMI 0x2E
+            // fan-level writes are accepted, read back from firmware, and audibly move the fans -
+            // and Custom Fan Curve that worked in 4.3.0 was switched off. The bit tells us what the
+            // firmware chose to declare, not what the hardware does; only an actual write outcome
+            // (refusal, failed readback) can say a board can't be driven, and the write paths
+            // already verify those. Logged so the disagreement stays visible in diagnostics.
+            if (!model.UserVerified &&
+                _wmiBios?.SystemDesign is HpWmiBios.SystemDesignData design &&
+                !design.IsSwFanControlSupport &&
+                Capabilities.CanSetFanSpeed)
+            {
+                _logging?.Warn($"  Firmware SystemDesignData reports IsSwFanControlSupport=false (thermal policy {design.ThermalPolicyVersion}) on {model.ModelName} - not acted on: the bit reads false on V0 boards where software fan control demonstrably works, so fan control stays enabled and write outcomes decide");
+            }
+            
+            // Fan count override. The database used to win unconditionally, which is how a family
+            // default of "1 fan" silently cut two-fan firmware down to one: 88F8 (#207), 8C2D (#205),
+            // 8C30 (#208/#220 - firmware answered Fan Count 2 while the entry said 1). A firmware
+            // answer that was actually read now beats an UNVERIFIED entry that has fewer; a
+            // user-verified entry still wins, because that is evidence rather than a family guess.
+            if (model.FanZoneCount != Capabilities.FanCount)
+            {
+                if (ShouldTrustFirmwareFanCount(model.UserVerified, _wmiBios?.FanCountFromFirmware ?? false,
+                                                model.FanZoneCount, Capabilities.FanCount))
+                {
+                    _logging?.Warn($"  Fan count: firmware reports {Capabilities.FanCount}, model database ({model.ModelName}, unverified) says {model.FanZoneCount} - using the firmware's answer");
+                }
+                else
+                {
+                    _logging?.Info($"  Fan count adjusted: {Capabilities.FanCount} → {model.FanZoneCount} (per model database)");
+                    Capabilities.FanCount = model.FanZoneCount;
+                }
+            }
+            
+            // MUX switch
+            if (model.HasMuxSwitch && !Capabilities.HasMuxSwitch)
+            {
+                _logging?.Info($"  MUX switch enabled per model database");
+                Capabilities.HasMuxSwitch = true;
+            }
+            else if (!model.HasMuxSwitch && Capabilities.HasMuxSwitch)
+            {
+                _logging?.Info($"  MUX switch disabled per model database (not present on {model.ModelName})");
+                Capabilities.HasMuxSwitch = false;
+            }
+            
+            // Lighting
+            if (model.HasPerKeyRgb && !Capabilities.HasPerKeyLighting)
+            {
+                _logging?.Info($"  Per-key RGB enabled per model database");
+                Capabilities.HasPerKeyLighting = true;
+                Capabilities.Lighting = LightingCapability.PerKey;
+            }
+            else if (!model.HasFourZoneRgb && !model.HasPerKeyRgb && Capabilities.HasZoneLighting)
+            {
+                _logging?.Info($"  Zone lighting disabled per model database (not present on {model.ModelName})");
+                Capabilities.HasZoneLighting = false;
+                Capabilities.Lighting = model.HasKeyboardBacklight ? LightingCapability.SingleColor : LightingCapability.None;
+            }
+            
+            // Undervolt
+            if (!model.SupportsUndervolt && Capabilities.CanUndervolt)
+            {
+                _logging?.Info($"  Undervolt disabled per model database (not supported on {model.ModelName})");
+                Capabilities.CanUndervolt = false;
+                Capabilities.UndervoltMethod = UndervoltMethod.None;
+            }
+            
+            // Performance modes
+            if (model.PerformanceModes.Length > 0 && Capabilities.AvailablePerformanceModes.Length == 0)
+            {
+                Capabilities.AvailablePerformanceModes = model.PerformanceModes;
+                Capabilities.HasOemPerformanceModes = true;
+                _logging?.Info($"  Performance modes set from model database: {string.Join(", ", model.PerformanceModes)}");
+            }
+        }
+
+        private void ForceMonitoringOnlyFanControl(string reason)
+        {
+            if (Capabilities.FanControl != FanControlMethod.MonitoringOnly || Capabilities.CanSetFanSpeed)
+            {
+                _logging?.Warn($"  {reason}; forcing fan control to monitoring-only");
+            }
+
+            Capabilities.FanControl = FanControlMethod.MonitoringOnly;
+            Capabilities.CanSetFanSpeed = false;
+            Capabilities.CanReadRpm = true;
+            Capabilities.HasFanModes = false;
+            Capabilities.AvailableFanModes = Array.Empty<string>();
+        }
+
+        private void DetectDeviceInfo()
+        {
+            _logging?.Info("Phase 1: Device identification...");
+            
+            try
+            {
+                // Get system info from WMI
+                using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_ComputerSystem");
+                foreach (var obj in searcher.Get())
+                {
+                    Capabilities.ModelName = obj["Model"]?.ToString() ?? "";
+                    _logging?.Info($"  Model: {Capabilities.ModelName}");
+                }
+                
+                // Detect model family based on name
+                DetectModelFamily();
+                
+                // Get chassis type (desktop vs laptop)
+                DetectChassisType();
+                
+                // Get BIOS info
+                using var biosSearcher = new ManagementObjectSearcher("SELECT * FROM Win32_BIOS");
+                foreach (var obj in biosSearcher.Get())
+                {
+                    Capabilities.BiosVersion = obj["SMBIOSBIOSVersion"]?.ToString() ?? "";
+                    Capabilities.SerialNumber = obj["SerialNumber"]?.ToString() ?? "";
+                    _logging?.Info($"  BIOS: {Capabilities.BiosVersion}");
+                }
+                
+                // Get baseboard info for product ID
+                using var boardSearcher = new ManagementObjectSearcher("SELECT * FROM Win32_BaseBoard");
+                foreach (var obj in boardSearcher.Get())
+                {
+                    Capabilities.ProductId = obj["Product"]?.ToString() ?? "";
+                    Capabilities.BoardId = obj["SerialNumber"]?.ToString() ?? "";
+                    _logging?.Info($"  Product ID: {Capabilities.ProductId}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging?.Warn($"Device identification error: {ex.Message}");
+            }
+        }
+        
+        /// <summary>
+        /// Detect OMEN model family from model name.
+        /// Different families have different fan control support levels.
+        /// </summary>
+        private void DetectModelFamily()
+        {
+            var model = Capabilities.ModelName?.ToUpperInvariant() ?? "";
+            var productId = Capabilities.ProductId?.ToUpperInvariant() ?? "";
+            
+            // First check for known HP Gaming Product IDs (for motherboard replacement cases)
+            // HP uses Product IDs like 8BCA, 8B2J, etc. for OMEN laptops
+            // These start with 8 for gaming laptops typically
+            bool isOmenByProductId = IsOmenProductId(productId);
+            
+            if (isOmenByProductId && !model.Contains("OMEN") && !model.Contains("VICTUS"))
+            {
+                _logging?.Info($"  Note: OMEN device detected via Product ID ({productId}) - motherboard may have been replaced");
+            }
+            
+            // OMEN Transcend models (newer ultrabook-style, may need OGH)
+            if (model.Contains("TRANSCEND"))
+            {
+                Capabilities.ModelFamily = OmenModelFamily.Transcend;
+                _logging?.Info($"  Model Family: OMEN Transcend (may require OGH proxy for fan control)");
+                return;
+            }
+            
+            // Check for desktop models
+            if (model.Contains("25L") || model.Contains("30L") || model.Contains("40L") || model.Contains("45L"))
+            {
+                Capabilities.ModelFamily = OmenModelFamily.Desktop;
+                _logging?.Info($"  Model Family: OMEN Desktop");
+                return;
+            }
+            
+            // HP Victus models
+            if (model.Contains("VICTUS"))
+            {
+                Capabilities.ModelFamily = OmenModelFamily.Victus;
+                _logging?.Info($"  Model Family: HP Victus");
+                return;
+            }
+            
+            // Check for OMEN models (by name or Product ID)
+            bool isOmen = model.Contains("OMEN") || model.Contains("THETIGER") || isOmenByProductId;
+            
+            // Try to detect year from model for 2024+ detection
+            // Models like "OMEN by HP 16-wf1xxx" where 1xxx suggests 2024+
+            if (isOmen)
+            {
+                // Look for OMEN 16/17 with year indicators
+                // wf0xxx = 2023, wf1xxx = 2024, xf0xxx = 2024, etc.
+                if (model.Contains("-WF1") || model.Contains("-XF1") || model.Contains("-XF0") ||
+                    model.Contains(" 14-") || // OMEN 14 is newer line
+                    model.Contains("2024") ||
+                    productId.StartsWith("8B"))  // 8Bxx Product IDs are typically 2023+ OMEN
+                {
+                    Capabilities.ModelFamily = OmenModelFamily.OMEN2024Plus;
+                    _logging?.Info($"  Model Family: OMEN 2024+ (may require OGH proxy for fan control)");
+                    return;
+                }
+                
+                // Classic OMEN 16/17
+                if (model.Contains(" 16") || model.Contains("16-"))
+                {
+                    Capabilities.ModelFamily = OmenModelFamily.OMEN16;
+                    _logging?.Info($"  Model Family: OMEN 16");
+                    return;
+                }
+                
+                if (model.Contains(" 17") || model.Contains("17-"))
+                {
+                    Capabilities.ModelFamily = OmenModelFamily.OMEN17;
+                    _logging?.Info($"  Model Family: OMEN 17");
+                    return;
+                }
+                
+                // Generic OMEN without specific model number might be legacy
+                // Or motherboard replacement case - treat as standard OMEN
+                Capabilities.ModelFamily = OmenModelFamily.Legacy;
+                _logging?.Info($"  Model Family: OMEN (legacy/unknown generation)");
+                return;
+            }
+            
+            Capabilities.ModelFamily = OmenModelFamily.Unknown;
+            _logging?.Info($"  Model Family: Unknown (non-OMEN device?)");
+        }
+        
+        /// <summary>
+        /// Check if a Product ID belongs to an OMEN/Gaming laptop.
+        /// HP uses specific product ID patterns for their gaming lines.
+        /// </summary>
+        private static bool IsOmenProductId(string productId)
+        {
+            if (string.IsNullOrEmpty(productId)) return false;
+            
+            // Known OMEN Product ID patterns:
+            // - 8Bxx: OMEN 16/17 2023-2024 models
+            // - 8Axx: OMEN 16/17 earlier models  
+            // - 88xx: Some OMEN 15 models
+            // - 8Cxx: Some newer OMEN variants
+            // The first character is typically '8' for gaming laptops
+            
+            // Specific known OMEN Product IDs (add more as discovered)
+            var knownOmenIds = new[]
+            {
+                "8BCA", "8B2J", "8B2K", "8B2L", "8B2M",  // OMEN 16 xf series
+                "8B9D", "8B9E", "8B9F",                   // OMEN 17 variants
+                "88D9", "88DA", "88DB",                   // OMEN 15 variants
+                "8A12", "8A13", "8A14",                   // OMEN 16 wf series
+                "8C3A", "8C3B", "8C3C",                   // Newer OMEN variants
+            };
+            
+            // Check exact match first
+            if (knownOmenIds.Contains(productId.ToUpperInvariant()))
+                return true;
+            
+            // Pattern matching: 8Bxx, 8Axx, 88xx, 8Cxx are typically gaming
+            if (productId.Length >= 2)
+            {
+                var prefix = productId.Substring(0, 2).ToUpperInvariant();
+                if (prefix == "8B" || prefix == "8A" || prefix == "88" || prefix == "8C")
+                    return true;
+            }
+            
+            return false;
+        }
+        
+        private void DetectChassisType()
+        {
+            try
+            {
+                using var searcher = new ManagementObjectSearcher("SELECT ChassisTypes FROM Win32_SystemEnclosure");
+                foreach (var obj in searcher.Get())
+                {
+                    if (obj["ChassisTypes"] is ushort[] chassisTypes && chassisTypes.Length > 0)
+                    {
+                        var chassisValue = chassisTypes[0];
+                        Capabilities.Chassis = (ChassisType)chassisValue;
+
+                        var formFactor = Capabilities.IsDesktop ? "Desktop" :
+                                        Capabilities.IsLaptop ? "Laptop" : "Other";
+                        _logging?.Info($"  Chassis: {Capabilities.Chassis} ({formFactor})");
+
+                        // Warn about different desktop architecture
+                        if (Capabilities.IsDesktop)
+                        {
+                            _logging?.Info("  Desktop PC detected — WMI fan control available, EC-based control not applicable");
+                            _logging?.Info("  💡 OMEN desktops (25L/30L/35L/40L/45L) use WMI for fan control and USB HID for RGB");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging?.Warn($"Chassis detection error: {ex.Message}");
+                Capabilities.Chassis = ChassisType.Unknown;
+            }
+        }
+
+        private void DetectSecurityStatus()
+        {
+            _logging?.Info("Phase 2: Security status...");
+            
+            try
+            {
+                // Check Secure Boot
+                using var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\SecureBoot\State");
+                if (key != null)
+                {
+                    var value = key.GetValue("UEFISecureBootEnabled");
+                    Capabilities.SecureBootEnabled = value != null && Convert.ToInt32(value) == 1;
+                }
+                
+                _logging?.Info($"  Secure Boot: {(Capabilities.SecureBootEnabled ? "Enabled" : "Disabled")}");
+                
+                if (Capabilities.SecureBootEnabled)
+                {
+                    _logging?.Warn("  ⚠️ Secure Boot blocks unsigned low-level drivers; PawnIO remains the supported EC/MSR backend.");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging?.Warn($"Security status detection error: {ex.Message}");
+            }
+        }
+
+        private void DetectOghStatus()
+        {
+            _logging?.Info("Phase 3: OMEN Gaming Hub status...");
+            
+            try
+            {
+                _oghProxy = new OghServiceProxy(_logging);
+                
+                Capabilities.OghInstalled = _oghProxy.Status.IsInstalled;
+                Capabilities.OghRunning = _oghProxy.Status.IsRunning;
+                
+                // If OGH is installed but not running, we might need it
+                // This will be refined in Phase 5 when we test WMI BIOS
+                if (Capabilities.OghInstalled && !Capabilities.OghRunning)
+                {
+                    _logging?.Info("  OGH installed but not running - may need to start for control");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging?.Warn($"OGH detection error: {ex.Message}");
+            }
+        }
+
+        private void DetectDriverAvailability()
+        {
+            _logging?.Info("Phase 4: Driver availability...");
+            
+            // Check PawnIO first (Secure Boot compatible)
+            Capabilities.PawnIOAvailable = CheckPawnIOAvailable();
+            if (Capabilities.PawnIOAvailable)
+            {
+                _logging?.Info($"  PawnIO: Available ✓ (Secure Boot compatible)");
+            }
+            
+            // Determine overall driver status
+            if (Capabilities.PawnIOAvailable)
+            {
+                Capabilities.DriverStatus = "PawnIO available (Secure Boot compatible)";
+            }
+            else if (Capabilities.SecureBootEnabled)
+            {
+                Capabilities.DriverStatus = "No EC driver - install bundled PawnIO for Secure Boot compatible access";
+            }
+            else
+            {
+                Capabilities.DriverStatus = "No EC driver available";
+            }
+        }
+
+        private bool CheckPawnIOAvailable()
+        {
+            try
+            {
+                // Step 1: Check if PawnIO is installed (registry or default path)
+                bool installedInRegistry = false;
+                using (var key = Registry.LocalMachine.OpenSubKey(
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\PawnIO"))
+                {
+                    if (key != null) installedInRegistry = true;
+                }
+                
+                if (!installedInRegistry)
+                {
+                    // Check default installation path
+                    string defaultPath = System.IO.Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), 
+                        "PawnIO", "PawnIOLib.dll");
+                    if (System.IO.File.Exists(defaultPath))
+                        installedInRegistry = true;
+                }
+                
+                if (!installedInRegistry)
+                {
+                    // Check if PawnIO driver is loaded via WMI
+                    using var searcher = new ManagementObjectSearcher(
+                        "SELECT * FROM Win32_SystemDriver WHERE Name LIKE '%PawnIO%'");
+                    if (searcher.Get().Count > 0)
+                        installedInRegistry = true;
+                }
+                
+                if (!installedInRegistry)
+                    return false;
+                
+                // Step 2: PawnIO is installed — probe the driver to confirm it can actually
+                // be initialized. Registry presence alone doesn't guarantee the driver is loaded
+                // (e.g., installed but awaiting reboot, or partially uninstalled).
+                var ecAccess = EcAccessFactory.GetEcAccess();
+                if (ecAccess != null && ecAccess.IsAvailable)
+                {
+                    _logging?.Info("  PawnIO: Probed successfully — EC access confirmed (Secure Boot compatible)");
+                    return true;
+                }
+                
+                // PawnIO installed but driver initialization failed
+                _logging?.Warn("  PawnIO: Found in registry but driver initialization failed");
+                _logging?.Warn("    → EC and MSR features will be unavailable until driver is operational");
+                _logging?.Info("    → Possible causes: driver awaiting reboot, service not started, or module missing");
+                RecordBackendFailure("PawnIO", "PawnIO detected but EC access probe failed.", "Restart and reinstall PawnIO if needed.");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                RecordBackendFailure("PawnIO", ex.Message, "Retry probe or reinstall PawnIO.");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Whether to keep the firmware's fan count over a smaller database value. Only for a count
+        /// the firmware actually answered, only within the 1-2 fans HP boards expose, and never
+        /// against a user-verified entry.
+        /// </summary>
+        internal static bool ShouldTrustFirmwareFanCount(
+            bool modelUserVerified, bool firmwareCountWasRead, int databaseCount, int firmwareCount) =>
+            firmwareCountWasRead &&
+            !modelUserVerified &&
+            firmwareCount is >= 1 and <= 2 &&
+            firmwareCount > databaseCount;
+
+        private void DetectWmiBiosCapabilities()
+        {
+            _logging?.Info("Phase 5: WMI BIOS capabilities...");
+            
+            try
+            {
+                _wmiBios = new HpWmiBios(_logging);
+                
+                if (_wmiBios.IsAvailable)
+                {
+                    _logging?.Info($"  WMI BIOS available - Status: {_wmiBios.Status}");
+                    Capabilities.FanCount = _wmiBios.FanCount;
+                    Capabilities.HasFanModes = true;
+                    Capabilities.AvailableFanModes = new[] { "Default", "Performance", "Cool" };
+                }
+                else
+                {
+                    _logging?.Info($"  WMI BIOS not available: {_wmiBios.Status}");
+                    
+                    // WMI BIOS failed - will fall back to OGH proxy if available
+                    if (Capabilities.OghRunning)
+                    {
+                        _logging?.Info("  → Will use OGH proxy as fallback");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging?.Warn($"WMI BIOS detection error: {ex.Message}");
+                RecordBackendFailure("WMI", ex.Message, "Verify HP WMI BIOS provider availability.");
+            }
+        }
+
+        private void DetermineFanControlMethod()
+        {
+            _logging?.Info("Phase 6: Determining fan control method...");
+
+            if (Capabilities.FanWritesBlockedForSafety)
+            {
+                ForceMonitoringOnlyFanControl("Desktop fan writes disabled by v3.6.3 safety gate");
+                return;
+            }
+            
+            // OmenCore is designed to be FULLY INDEPENDENT from OMEN Gaming Hub.
+            // Priority order (OGH-independent methods first):
+            // 1. WMI BIOS (no driver needed, works on most OMEN laptops)
+            // 2. Direct EC via PawnIO (Secure Boot compatible)
+            // 3. OGH Proxy (LAST RESORT - only if WMI BIOS fails)
+            // 4. Monitoring only
+            
+            // Check if model database says WMI is ineffective for this model
+            // Some models (Transcend, 17-ck2xxx) have WMI that returns success but doesn't work
+            var modelSaysWmiWorks = Capabilities.ModelConfig?.SupportsFanControlWmi ?? true;
+            if (!modelSaysWmiWorks)
+            {
+                _logging?.Warn($"  ⚠ Model database indicates WMI fan control is ineffective for {Capabilities.ModelConfig?.ModelName}");
+                _logging?.Info("  → Skipping WMI BIOS, trying EC or OGH proxy...");
+            }
+            
+            // Primary: WMI BIOS - works on most OMEN models without any dependencies
+            // BUT skip if model database says WMI is ineffective for this model
+            if (modelSaysWmiWorks && _wmiBios?.IsAvailable == true)
+            {
+                Capabilities.FanControl = FanControlMethod.WmiBios;
+                Capabilities.CanSetFanSpeed = true;
+                Capabilities.CanReadRpm = true;
+                _logging?.Info("  → Using WMI BIOS for fan control (OGH-independent)");
+                return;
+            }
+            
+            // Secondary: PawnIO for EC access (Secure Boot compatible)
+            if (Capabilities.PawnIOAvailable)
+            {
+                Capabilities.FanControl = FanControlMethod.EcDirect;
+                Capabilities.CanSetFanSpeed = true;
+                Capabilities.CanReadRpm = true;
+                _logging?.Info("  → Using PawnIO for EC access (OGH-independent, Secure Boot compatible)");
+                return;
+            }
+            
+            // Last resort: OGH Proxy (requires OGH services running)
+            if (Capabilities.OghRunning && _oghProxy?.IsAvailable == true)
+            {
+                Capabilities.FanControl = FanControlMethod.OghProxy;
+                Capabilities.CanSetFanSpeed = true;
+                Capabilities.CanReadRpm = true;
+                Capabilities.UsingOghFallback = true;
+                _logging?.Warn("  → Using OGH proxy as FALLBACK (WMI BIOS unavailable)");
+                _logging?.Info("  💡 Report your model to help add native support");
+                return;
+            }
+            
+            // Suggestions if nothing works
+            if (Capabilities.OghInstalled && !Capabilities.OghRunning)
+            {
+                Capabilities.FanControl = FanControlMethod.None;
+                _logging?.Warn("  → Fan control unavailable. OGH installed but not running.");
+                _logging?.Info("  💡 Start OGH services as temporary workaround, or report your model");
+            }
+            else if (Capabilities.SecureBootEnabled)
+            {
+                Capabilities.FanControl = FanControlMethod.MonitoringOnly;
+                Capabilities.CanSetFanSpeed = false;
+                Capabilities.CanReadRpm = true;
+                _logging?.Warn("  → Fan control unavailable. Install the bundled PawnIO option for Secure Boot compatible EC access.");
+            }
+            else
+            {
+                Capabilities.FanControl = FanControlMethod.MonitoringOnly;
+                Capabilities.CanSetFanSpeed = false;
+                Capabilities.CanReadRpm = true;
+                _logging?.Warn("  → Fan control unavailable, monitoring only");
+            }
+        }
+
+        private void DetectThermalCapabilities()
+        {
+            _logging?.Info("Phase 7: Thermal sensor capabilities...");
+            
+            // Thermal monitoring is typically available even without control
+            Capabilities.CanReadCpuTemp = true;
+            Capabilities.CanReadGpuTemp = true;
+            
+            if (_wmiBios?.IsAvailable == true)
+            {
+                Capabilities.ThermalMethod = ThermalSensorMethod.Wmi;
+                _logging?.Info("  → Using WMI for thermal sensors");
+            }
+            else if (Capabilities.PawnIOAvailable)
+            {
+                Capabilities.ThermalMethod = ThermalSensorMethod.LibreHardwareMonitor;
+                _logging?.Info("  → Using LibreHardwareMonitor for thermal sensors");
+            }
+            else
+            {
+                Capabilities.ThermalMethod = ThermalSensorMethod.Wmi;
+                _logging?.Info("  → Using WMI for thermal sensors (basic)");
+            }
+        }
+
+        private void DetectGpuCapabilities()
+        {
+            _logging?.Info("Phase 8: GPU capabilities...");
+            
+            try
+            {
+                // Detect GPU vendor
+                using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_VideoController");
+                foreach (var obj in searcher.Get())
+                {
+                    var name = obj["Name"]?.ToString() ?? "";
+                    if (name.Contains("NVIDIA", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Capabilities.GpuVendor = GpuVendor.Nvidia;
+                        Capabilities.NvApiAvailable = true;
+                        _logging?.Info($"  GPU: {name} (NVIDIA)");
+                    }
+                    else if (name.Contains("AMD", StringComparison.OrdinalIgnoreCase) || 
+                             name.Contains("Radeon", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Capabilities.GpuVendor = GpuVendor.Amd;
+                        Capabilities.AmdAdlAvailable = true;
+                        _logging?.Info($"  GPU: {name} (AMD)");
+                    }
+                    else if (name.Contains("Intel", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Intel integrated, keep looking for discrete
+                        if (Capabilities.GpuVendor == GpuVendor.Unknown)
+                            Capabilities.GpuVendor = GpuVendor.Intel;
+                    }
+                }
+                
+                // Check MUX switch availability
+                if (_wmiBios?.IsAvailable == true)
+                {
+                    Capabilities.HasMuxSwitch = true;
+                    Capabilities.HasGpuPowerControl = true;
+                    _logging?.Info("  MUX Switch: Available (via WMI BIOS)");
+                }
+                else if (Capabilities.OghRunning)
+                {
+                    Capabilities.HasMuxSwitch = true;
+                    Capabilities.HasGpuPowerControl = true;
+                    _logging?.Info("  MUX Switch: Available (via OGH)");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging?.Warn($"GPU detection error: {ex.Message}");
+                RecordBackendFailure("NVAPI", ex.Message, "Update GPU driver and verify vendor APIs are available.");
+            }
+        }
+
+        private void DetectUndervoltCapabilities()
+        {
+            _logging?.Info("Phase 9: Undervolt capabilities...");
+
+            if (Capabilities.ModelConfig?.SupportsUndervolt == false)
+            {
+                Capabilities.CanUndervolt = false;
+                Capabilities.UndervoltMethod = UndervoltMethod.None;
+                Capabilities.UndervoltRuntimeReady = false;
+                Capabilities.UndervoltBlockReason =
+                    $"Undervolt disabled per model database (not supported on {Capabilities.ModelConfig.ModelName})";
+                _logging?.Info($"  -> {Capabilities.UndervoltBlockReason}");
+                return;
+            }
+            
+            // Undervolting requires MSR access
+            if (Capabilities.SecureBootEnabled)
+            {
+                if (Capabilities.PawnIOAvailable)
+                {
+                    Capabilities.CanUndervolt = true;
+                    Capabilities.UndervoltMethod = UndervoltMethod.IntelMsrPawnIO;
+                    _logging?.Info("  → Undervolt available via PawnIO (Secure Boot compatible)");
+                }
+                else
+                {
+                    Capabilities.CanUndervolt = false;
+                    Capabilities.UndervoltMethod = UndervoltMethod.None;
+                    _logging?.Warn("  → Undervolt unavailable (Secure Boot blocks MSR access)");
+                }
+            }
+            else
+            {
+                Capabilities.CanUndervolt = false;
+                Capabilities.UndervoltMethod = UndervoltMethod.None;
+                _logging?.Warn("  → Undervolt unavailable (no MSR access driver)");
+            }
+        }
+
+        private void DetectLightingCapabilities()
+        {
+            _logging?.Info("Phase 10: Lighting capabilities...");
+            
+            // Check for HP OMEN keyboard backlight
+            try
+            {
+                if (_wmiBios?.IsAvailable == true)
+                {
+                    // Ask the firmware what the keyboard actually is before claiming a topology.
+                    // This used to report "4-zone keyboard backlight detected" for every board
+                    // with a working WMI BIOS, without ever probing - which is wrong wherever the
+                    // keyboard is per-key, and wrong in a way that reads like a detection result.
+                    // Board 8D87 (OMEN MAX 16) is per-key: its keyboard is a 120-lamp HID
+                    // LampArray, and the four-zone command path does not drive it.
+                    var topology = _wmiBios.GetKeyboardLightingType();
+                    if (topology != null)
+                    {
+                        ApplyLightingTopology(topology.Value);
+                    }
+                    else
+                    {
+                        // No topology probe on this board. Keep the previous assumption rather
+                        // than regress boards that rely on it, but say that it is an assumption.
+                        Capabilities.HasKeyboardBacklight = true;
+                        Capabilities.Lighting = LightingCapability.FourZone;
+                        Capabilities.HasZoneLighting = true;
+                        _logging?.Info("  → Keyboard lighting topology not reported; assuming 4-zone");
+                    }
+                }
+                else if (Capabilities.OghRunning)
+                {
+                    Capabilities.HasKeyboardBacklight = true;
+                    Capabilities.Lighting = LightingCapability.FourZone;
+                    Capabilities.HasZoneLighting = true;
+                    _logging?.Info("  → Lighting available via OGH");
+                }
+                else
+                {
+                    Capabilities.Lighting = LightingCapability.None;
+                    _logging?.Info("  → Lighting control not available");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging?.Warn($"Lighting detection error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Translate the firmware's keyboard lighting topology into capability flags.
+        ///
+        /// Zone and per-key lighting are mutually exclusive here: they are different command
+        /// surfaces, and a board reporting both would offer the user a zone control that writes
+        /// to a path its keyboard does not listen on.
+        /// </summary>
+        private void ApplyLightingTopology(HpWmiBios.KeyboardLightingType topology)
+        {
+            switch (topology)
+            {
+                case HpWmiBios.KeyboardLightingType.RgbPerKey:
+                    Capabilities.HasKeyboardBacklight = true;
+                    Capabilities.HasPerKeyLighting = true;
+                    Capabilities.HasZoneLighting = false;
+                    Capabilities.Lighting = LightingCapability.PerKey;
+                    _logging?.Info("  → Per-key RGB keyboard reported by firmware");
+                    break;
+
+                case HpWmiBios.KeyboardLightingType.FourZoneWithNumpad:
+                case HpWmiBios.KeyboardLightingType.FourZoneWithoutNumpad:
+                    Capabilities.HasKeyboardBacklight = true;
+                    Capabilities.HasZoneLighting = true;
+                    Capabilities.Lighting = LightingCapability.FourZone;
+                    _logging?.Info("  → 4-zone keyboard backlight reported by firmware");
+                    break;
+
+                case HpWmiBios.KeyboardLightingType.OneZoneWithNumpad:
+                case HpWmiBios.KeyboardLightingType.OneZoneWithoutNumpad:
+                    // One addressable zone. LightingCapability has no OneZone member, and FourZone
+                    // is the closest thing meaning "zoned colour control" - the zone COUNT comes
+                    // from ModelCapabilities, not from this enum, so nothing downstream reads a
+                    // count out of it. Named awkwardly rather than wrongly.
+                    Capabilities.HasKeyboardBacklight = true;
+                    Capabilities.HasZoneLighting = true;
+                    Capabilities.Lighting = LightingCapability.FourZone;
+                    _logging?.Info("  → Single-zone RGB keyboard backlight reported by firmware");
+                    break;
+
+                case HpWmiBios.KeyboardLightingType.Normal:
+                    // Backlit, but with no colour control at all.
+                    Capabilities.HasKeyboardBacklight = true;
+                    Capabilities.HasZoneLighting = false;
+                    Capabilities.Lighting = LightingCapability.SingleColor;
+                    _logging?.Info("  → Keyboard is backlit but not colour-addressable");
+                    break;
+
+                case HpWmiBios.KeyboardLightingType.None:
+                    Capabilities.HasKeyboardBacklight = false;
+                    Capabilities.HasZoneLighting = false;
+                    Capabilities.HasPerKeyLighting = false;
+                    Capabilities.Lighting = LightingCapability.None;
+                    _logging?.Info("  → No keyboard lighting reported by firmware");
+                    break;
+            }
+        }
+
+        private void BuildBackendStatuses()
+        {
+            var nowUtc = DateTime.UtcNow;
+            var wmiAvailable = _wmiBios?.IsAvailable == true;
+            var pawnIoAvailable = Capabilities.PawnIOAvailable;
+            var nvapiAvailable = Capabilities.NvApiAvailable;
+
+            var winRingFailure = pawnIoAvailable
+                ? "Legacy WinRing0 backend is retired; PawnIO is active."
+                : "Legacy WinRing0 backend is retired in current builds.";
+            var winRingAction = pawnIoAvailable
+                ? "No action required while PawnIO remains healthy."
+                : "Install PawnIO for Secure Boot compatible EC/MSR access.";
+
+            var statuses = new List<BackendStatus>
+            {
+                new()
+                {
+                    Name = "WMI",
+                    Required = true,
+                    Available = wmiAvailable,
+                    Healthy = wmiAvailable,
+                    Capabilities = new[]
+                    {
+                        BackendCapability.Telemetry,
+                        BackendCapability.FanControl,
+                        BackendCapability.PerformanceProfiles
+                    },
+                    FailureReason = wmiAvailable ? null : GetFailureReason("WMI", "WMI BIOS provider unavailable"),
+                    RecommendedAction = wmiAvailable ? null : "Verify HP WMI BIOS provider and permissions.",
+                    LastUpdatedUtc = nowUtc
+                },
+                new()
+                {
+                    Name = "PawnIO",
+                    Required = false,
+                    Available = pawnIoAvailable,
+                    Healthy = pawnIoAvailable,
+                    Capabilities = new[]
+                    {
+                        BackendCapability.ECAccess,
+                        BackendCapability.Undervolt
+                    },
+                    FailureReason = pawnIoAvailable ? null : GetFailureReason("PawnIO", "PawnIO driver not available"),
+                    RecommendedAction = pawnIoAvailable ? null : "Install or repair PawnIO.",
+                    LastUpdatedUtc = nowUtc
+                },
+                new()
+                {
+                    Name = "NVAPI",
+                    Required = false,
+                    Available = nvapiAvailable,
+                    Healthy = nvapiAvailable,
+                    Capabilities = new[] { BackendCapability.Telemetry },
+                    FailureReason = nvapiAvailable ? null : GetFailureReason("NVAPI", "NVAPI unavailable or no NVIDIA GPU detected"),
+                    RecommendedAction = nvapiAvailable ? null : "Optional for NVIDIA-specific telemetry.",
+                    LastUpdatedUtc = nowUtc
+                },
+                new()
+                {
+                    Name = "WinRing0",
+                    Required = false,
+                    Available = false,
+                    Healthy = pawnIoAvailable,
+                    Capabilities = new[]
+                    {
+                        BackendCapability.ECAccess,
+                        BackendCapability.Undervolt
+                    },
+                    FailureReason = pawnIoAvailable ? null : winRingFailure,
+                    RecommendedAction = winRingAction,
+                    LastUpdatedUtc = nowUtc
+                }
+            };
+
+            Capabilities.BackendStatuses = statuses;
+            LogBackendStatusChanges(statuses);
+        }
+
+        private void LogBackendStatusChanges(IEnumerable<BackendStatus> statuses)
+        {
+            lock (BackendStatusLock)
+            {
+                foreach (var status in statuses)
+                {
+                    if (LastBackendState.TryGetValue(status.Name, out var previous) &&
+                        previous.Available == status.Available &&
+                        previous.Healthy == status.Healthy)
+                    {
+                        continue;
+                    }
+
+                    LastBackendState[status.Name] = (status.Available, status.Healthy);
+                    var levelPrefix = status.Required && !status.Healthy
+                        ? "[Backend][CriticalLoss]"
+                        : "[Backend][AvailabilityChange]";
+                    var message = $"{levelPrefix} {status.Name}: available={status.Available}, healthy={status.Healthy}, required={status.Required}, reason={status.FailureReason ?? "n/a"}";
+
+                    if (status.Required && !status.Healthy)
+                    {
+                        _logging?.Warn(message);
+                    }
+                    else
+                    {
+                        _logging?.Info(message);
+                    }
+                }
+            }
+        }
+
+        private void RecordBackendFailure(string backendName, string message, string recommendedAction)
+        {
+            _backendFailures[backendName] = $"{message} (action: {recommendedAction})";
+            _logging?.Warn($"[Backend][InitFailure] {backendName}: {message}");
+        }
+
+        private string GetFailureReason(string backendName, string fallback)
+        {
+            return _backendFailures.TryGetValue(backendName, out var reason) ? reason : fallback;
+        }
+
+        /// <summary>
+        /// Probe hardware capabilities at runtime to verify detection accuracy.
+        /// This performs actual hardware tests to confirm what works on this specific device.
+        /// Should be called after DetectCapabilities() for more accurate results.
+        /// </summary>
+        public void ProbeRuntimeCapabilities()
+        {
+            _logging?.Info("═══════════════════════════════════════════════════");
+            _logging?.Info("Probing runtime capabilities...");
+            _logging?.Info("═══════════════════════════════════════════════════");
+            
+            int successCount = 0;
+            int failCount = 0;
+            
+            // Test 1: Fan RPM readback
+            if (Capabilities.CanReadRpm)
+            {
+                try
+                {
+                    if (_wmiBios?.IsAvailable == true)
+                    {
+                        var rpmResult = _wmiBios.GetFanRpmDirect();
+                        
+                        if (rpmResult.HasValue && (rpmResult.Value.fan1Rpm > 0 || rpmResult.Value.fan2Rpm > 0))
+                        {
+                            _logging?.Info($"  ✓ Fan RPM readback works: CPU={rpmResult.Value.fan1Rpm}, GPU={rpmResult.Value.fan2Rpm}");
+                            successCount++;
+                        }
+                        else if (rpmResult.HasValue)
+                        {
+                            _logging?.Warn($"  ⚠ Fan RPM returned 0 - fans may be off or readback not working");
+                        }
+                        else
+                        {
+                            _logging?.Warn($"  ✗ Fan RPM readback returned null");
+                            failCount++;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logging?.Warn($"  ✗ Fan RPM probe failed: {ex.Message}");
+                    failCount++;
+                }
+            }
+            
+            // Test 2: Temperature readback
+            if (Capabilities.CanReadCpuTemp)
+            {
+                try
+                {
+                    if (_wmiBios?.IsAvailable == true)
+                    {
+                        var cpuTemp = _wmiBios.GetTemperature();
+                        
+                        if (cpuTemp.HasValue && cpuTemp.Value > 20 && cpuTemp.Value < 100)
+                        {
+                            _logging?.Info($"  ✓ CPU temperature readback works: {cpuTemp.Value}°C");
+                            successCount++;
+                        }
+                        else if (cpuTemp.HasValue)
+                        {
+                            _logging?.Warn($"  ⚠ CPU temperature out of range: {cpuTemp.Value}°C");
+                        }
+                        else
+                        {
+                            _logging?.Warn($"  ✗ CPU temperature readback returned null");
+                            failCount++;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logging?.Warn($"  ✗ CPU temperature probe failed: {ex.Message}");
+                    failCount++;
+                }
+            }
+            
+            // Test 3: Fan level read (verifies WMI BIOS communication)
+            if (Capabilities.HasFanModes || Capabilities.CanSetFanSpeed)
+            {
+                try
+                {
+                    if (_wmiBios?.IsAvailable == true)
+                    {
+                        var level = _wmiBios.GetFanLevel();
+                        if (level.HasValue)
+                        {
+                            _logging?.Info($"  ✓ Fan level readback works: Fan1={level.Value.fan1}, Fan2={level.Value.fan2}");
+                            successCount++;
+                        }
+                        else
+                        {
+                            _logging?.Warn($"  ✗ Fan level readback returned null");
+                            failCount++;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logging?.Warn($"  ✗ Fan level probe failed: {ex.Message}");
+                    failCount++;
+                }
+            }
+            
+            // Test 4: Undervolt runtime readiness (MSR/SMU access probe)
+            if (Capabilities.CanUndervolt)
+            {
+                try
+                {
+                    _logging?.Info("  Testing undervolt runtime readiness...");
+                    
+                    // Create the provider asynchronously to test MSR/SMU access
+                    var provider = CpuUndervoltProviderFactory.Create(out var backendInfo);
+                    
+                    // Synchronously probe for runtime readiness
+                    // (normally this is async, but we run it synchronously for startup probing)
+                    var ct = System.Threading.CancellationToken.None;
+                    var probeTask = provider.ProbeAsync(ct);
+                    
+                    // Wait for probe with 5 second timeout
+                    if (probeTask.Wait(TimeSpan.FromSeconds(5)))
+                    {
+                        var probeStatus = probeTask.Result;
+                        
+                        if (probeStatus.IsRuntimeReady)
+                        {
+                            _logging?.Info($"  ✓ Undervolt runtime ready via {backendInfo}");
+                            Capabilities.UndervoltRuntimeReady = true;
+                            Capabilities.UndervoltBlockReason = null;
+                            successCount++;
+                        }
+                        else
+                        {
+                            string reason = probeStatus.RuntimeBlockReason ?? probeStatus.Error ?? "Unknown block reason";
+                            _logging?.Warn($"  ✗ Undervolt blocked: {reason}");
+                            Capabilities.UndervoltRuntimeReady = false;
+                            Capabilities.UndervoltBlockReason = reason;
+                            failCount++;
+                        }
+                    }
+                    else
+                    {
+                        _logging?.Warn($"  ✗ Undervolt probe timed out (5s)");
+                        Capabilities.UndervoltRuntimeReady = false;
+                        Capabilities.UndervoltBlockReason = "Undervolt probe timed out";
+                        failCount++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logging?.Warn($"  ✗ Undervolt probe failed: {ex.Message}");
+                    Capabilities.UndervoltRuntimeReady = false;
+                    Capabilities.UndervoltBlockReason = ex.Message;
+                    failCount++;
+                }
+            }
+            
+            // Test 5: Check if model-specific features match reality
+            if (Capabilities.ModelConfig != null)
+            {
+                var model = Capabilities.ModelConfig;
+                
+                // Verify fan zone count
+                if (model.FanZoneCount == 1 && Capabilities.FanCount > 1)
+                {
+                    _logging?.Info($"  Note: Model database says 1 fan, but detected {Capabilities.FanCount}");
+                }
+                else if (model.FanZoneCount == 2 && Capabilities.FanCount == 1)
+                {
+                    _logging?.Info($"  Note: Model database says 2 fans, but only detected 1");
+                }
+            }
+            
+            Capabilities.RuntimeProbed = true;
+            
+            _logging?.Info($"Runtime probe complete: {successCount} passed, {failCount} failed");
+            _logging?.Info("═══════════════════════════════════════════════════");
+        }
+        
+        /// <summary>
+        /// Get the recommended fan control provider based on detected capabilities.
+        /// </summary>
+        public string GetRecommendedFanProvider()
+        {
+            return Capabilities.FanControl switch
+            {
+                FanControlMethod.WmiBios => "HpWmiBios",
+                FanControlMethod.OghProxy => "OghServiceProxy",
+                FanControlMethod.EcDirect => "PawnIOEcAccess",
+                FanControlMethod.Steps => "StepFanController",
+                FanControlMethod.Percent => "PwmFanController",
+                _ => "None"
+            };
+        }
+
+        /// <summary>
+        /// Get action recommendations for the user if control is limited.
+        /// </summary>
+        public List<string> GetRecommendations()
+        {
+            var recommendations = new List<string>();
+            
+            if (Capabilities.FanControl == FanControlMethod.None || 
+                Capabilities.FanControl == FanControlMethod.MonitoringOnly)
+            {
+                if (Capabilities.OghInstalled && !Capabilities.OghRunning)
+                {
+                    recommendations.Add("Start OMEN Gaming Hub services for fan control");
+                }
+                else if (Capabilities.SecureBootEnabled)
+                {
+                    recommendations.Add("Secure Boot is blocking hardware drivers. Consider:");
+                    recommendations.Add("  - Use OmenCore with OMEN Gaming Hub services running");
+                    recommendations.Add("  - Or disable Secure Boot (may affect gaming/TPM)");
+                }
+                else
+                {
+                    recommendations.Add("Install LibreHardwareMonitor for additional control");
+                }
+            }
+            
+            if (!Capabilities.CanUndervolt)
+            {
+                if (Capabilities.SecureBootEnabled)
+                {
+                    recommendations.Add("Undervolt requires Secure Boot disabled or PawnIO driver");
+                }
+            }
+            
+            return recommendations;
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                _oghProxy?.Dispose();
+                _wmiBios?.Dispose();
+                _disposed = true;
+            }
+        }
+    }
+}

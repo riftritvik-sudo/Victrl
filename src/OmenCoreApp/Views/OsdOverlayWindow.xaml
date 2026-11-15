@@ -1,0 +1,303 @@
+<Window x:Class="OmenCore.Views.OsdOverlayWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="OmenCore OSD"
+        SizeToContent="WidthAndHeight"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ShowActivated="False"
+        ResizeMode="NoResize"
+        Focusable="False"
+        IsHitTestVisible="False"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        TextOptions.TextFormattingMode="Display"
+        TextOptions.TextRenderingMode="ClearType">
+    
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVisibility"/>
+        <LinearGradientBrush x:Key="OsdBackgroundBrush" StartPoint="0,0" EndPoint="1,1">
+            <GradientStop Color="#F0141416" Offset="0"/>
+            <GradientStop Color="#F01A1A20" Offset="1"/>
+        </LinearGradientBrush>
+        <Style x:Key="MetricRowGridStyle" TargetType="Grid">
+            <Setter Property="Margin" Value="{Binding MetricRowMargin}"/>
+        </Style>
+    </Window.Resources>
+    
+    <!-- Improved contrast and sizing for high-DPI (1440p+) displays -->
+        <Border x:Name="RootBorder"
+            Background="{StaticResource OsdBackgroundBrush}"
+            BorderBrush="#BBFF005C"
+            BorderThickness="1.5"
+            CornerRadius="10"
+            Padding="{Binding OverlayPadding}"
+            Margin="8"
+            MinWidth="220"
+            MaxWidth="900"
+            MaxHeight="900">
+        <Border.Effect>
+            <DropShadowEffect Color="Black" Opacity="0.65" BlurRadius="24" ShadowDepth="4" Direction="270"/>
+        </Border.Effect>
+        
+        <StackPanel x:Name="MainPanel" Grid.IsSharedSizeScope="True">
+            <StackPanel.LayoutTransform>
+                <ScaleTransform ScaleX="{Binding OverlayScale}" ScaleY="{Binding OverlayScale}"/>
+            </StackPanel.LayoutTransform>
+            <!-- Clock Time -->
+            <TextBlock Text="{Binding ClockTime}" 
+                       FontSize="13" 
+                       FontWeight="SemiBold" 
+                       Foreground="#CCCCCC" 
+                       HorizontalAlignment="Center"
+                       Margin="0,0,0,6"
+                       FontFamily="{StaticResource AppFontFamily}"
+                       Visibility="{Binding ShowClockTimeRow, Converter={StaticResource BoolToVisibility}}"/>
+            
+            <!-- Current Mode Header (if enabled) -->
+            <Border Background="#33FF005C" CornerRadius="4" Padding="8,4" Margin="0,0,0,8"
+                    Visibility="{Binding ShowCurrentModeRow, Converter={StaticResource BoolToVisibility}}">
+                <TextBlock Text="{Binding CurrentMode}" 
+                           FontSize="12" 
+                           FontWeight="Bold" 
+                           Foreground="#FF3377" 
+                           HorizontalAlignment="Center"/>
+            </Border>
+            
+            <!-- Performance Mode -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowPerformanceModeRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="MODE" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <TextBlock Grid.Column="2" Text="{Binding PerformanceMode}" FontSize="12" Foreground="#FFD700" FontFamily="{StaticResource AppFontFamily}" FontWeight="SemiBold" HorizontalAlignment="Right"/>
+            </Grid>
+            
+            <!-- Fan Mode -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowFanModeRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="FANS" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <TextBlock Grid.Column="2" Text="{Binding FanMode}" FontSize="12" Foreground="#00BFFF" FontFamily="{StaticResource AppFontFamily}" FontWeight="SemiBold" HorizontalAlignment="Right"/>
+            </Grid>
+            
+            <!-- Separator -->
+                <Border Height="1" Background="#44FFFFFF" Margin="{Binding SeparatorMargin}" 
+                    Visibility="{Binding ShowSeparator1, Converter={StaticResource BoolToVisibility}}"/>
+            
+            <!-- CPU Stats -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowCpuTempRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="CPU" FontSize="12" Foreground="#999999" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
+                    <TextBlock Text="{Binding CpuTemp, StringFormat={}{0:F0}°}" FontSize="13" Foreground="{Binding CpuTempColor}" FontFamily="{StaticResource AppFontFamily}" FontWeight="SemiBold"/>
+                    <TextBlock Text="~" FontSize="13" Foreground="{StaticResource WarningBrush}" FontFamily="{StaticResource AppFontFamily}" FontWeight="Bold" Margin="1,0,0,0"
+                               Visibility="{Binding IsCpuTempSourceFallback, Converter={StaticResource BoolToVisibility}}"/>
+                    <TextBlock Text="  " FontSize="12" Visibility="{Binding ShowCpuLoad, Converter={StaticResource BoolToVisibility}}"/>
+                    <TextBlock Text="{Binding CpuLoad, StringFormat={}{0:F0}%}" FontSize="12" Foreground="#FF3366" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"
+                               Visibility="{Binding ShowCpuLoad, Converter={StaticResource BoolToVisibility}}"/>
+                    <TextBlock Text="  " FontSize="12" Visibility="{Binding ShowCpuPower, Converter={StaticResource BoolToVisibility}}"/>
+                    <TextBlock Text="{Binding CpuPower}" FontSize="12" Foreground="#FFA500" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"
+                               Visibility="{Binding ShowCpuPower, Converter={StaticResource BoolToVisibility}}"/>
+                </StackPanel>
+            </Grid>
+            
+            <!-- CPU Clock Speed -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowCpuClockRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="CPU CLK" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <TextBlock Grid.Column="2" Text="{Binding CpuClockSpeed}" FontSize="12" Foreground="#42A5F5" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium" HorizontalAlignment="Right"/>
+            </Grid>
+            
+            <!-- GPU Stats -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowGpuTempRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="GPU" FontSize="12" Foreground="#999999" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
+                    <TextBlock Text="{Binding GpuTemp, StringFormat={}{0:F0}°}" FontSize="13" Foreground="{Binding GpuTempColor}" FontFamily="{StaticResource AppFontFamily}" FontWeight="SemiBold"/>
+                    <TextBlock Text="  " FontSize="12" Visibility="{Binding ShowGpuLoad, Converter={StaticResource BoolToVisibility}}"/>
+                    <TextBlock Text="{Binding GpuLoad, StringFormat={}{0:F0}%}" FontSize="12" Foreground="#00D4FF" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"
+                               Visibility="{Binding ShowGpuLoad, Converter={StaticResource BoolToVisibility}}"/>
+                    <TextBlock Text="  " FontSize="12" Visibility="{Binding ShowGpuPower, Converter={StaticResource BoolToVisibility}}"/>
+                    <TextBlock Text="{Binding GpuPower}" FontSize="12" Foreground="#FFA500" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"
+                               Visibility="{Binding ShowGpuPower, Converter={StaticResource BoolToVisibility}}"/>
+                </StackPanel>
+            </Grid>
+            
+            <!-- GPU Clock Speed -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowGpuClockRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="GPU CLK" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <TextBlock Grid.Column="2" Text="{Binding GpuClockSpeed}" FontSize="12" Foreground="#00D4FF" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium" HorizontalAlignment="Right"/>
+            </Grid>
+            
+            <!-- GPU Hotspot Temperature -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowGpuHotspotRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="TJUNC" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <TextBlock Grid.Column="2" Text="{Binding GpuHotspotTemp, StringFormat={}{0:F0}°}" FontSize="13" Foreground="{Binding GpuHotspotTempColor}" FontFamily="{StaticResource AppFontFamily}" FontWeight="SemiBold" HorizontalAlignment="Right"/>
+            </Grid>
+            
+            <!-- VRAM Usage -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowVramUsageRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="VRAM" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <TextBlock Grid.Column="2" Text="{Binding VramUsage}" FontSize="12" Foreground="#AB47BC" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium" HorizontalAlignment="Right"/>
+            </Grid>
+            
+            <!-- Package Power (CPU+GPU) -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowPackagePowerRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="PKG" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <TextBlock Grid.Column="2" Text="{Binding PackagePower}" FontSize="12" Foreground="#FFA726" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium" HorizontalAlignment="Right"/>
+            </Grid>
+            
+            <!-- Fan Speed -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowFanSpeedRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="FAN" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <TextBlock Grid.Column="2" Text="{Binding FanSpeed}" FontSize="12" Foreground="#AAAAAA" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium" HorizontalAlignment="Right"/>
+            </Grid>
+            
+            <!-- RAM Usage -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowRamUsageRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="RAM" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <TextBlock Grid.Column="2" Text="{Binding RamUsage}" FontSize="12" Foreground="#AAAAAA" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium" HorizontalAlignment="Right"/>
+            </Grid>
+            
+            <!-- Battery -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowBatteryRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="BAT" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <TextBlock Grid.Column="2" Text="{Binding BatteryPercent}" FontSize="12" Foreground="{Binding BatteryColor}" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium" HorizontalAlignment="Right"/>
+            </Grid>
+            
+            <!-- Separator -->
+                <Border Height="1" Background="#44FFFFFF" Margin="{Binding SeparatorMargin}" 
+                    Visibility="{Binding ShowSeparator2, Converter={StaticResource BoolToVisibility}}"/>
+            
+            <!-- FPS/GPU Activity (prominent display) -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowFpsRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="{Binding FpsLabel}" FontSize="14" Foreground="{Binding FpsAccentBrush}" FontFamily="{StaticResource AppFontFamily}" FontWeight="Bold" ToolTip="FPS via RTSS"/>
+                <StackPanel Grid.Column="2" HorizontalAlignment="Right">
+                    <TextBlock Text="{Binding FpsDisplay}" FontSize="18" Foreground="{Binding FpsAccentBrush}" FontFamily="{StaticResource AppFontFamily}" FontWeight="Bold" HorizontalAlignment="Right"/>
+                    <TextBlock Text="{Binding FpsDetailDisplay}" FontSize="10" Foreground="#AAAAAA" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium" HorizontalAlignment="Right"
+                               Visibility="{Binding ShowFpsDetail, Converter={StaticResource BoolToVisibility}}"/>
+                </StackPanel>
+            </Grid>
+            
+            <!-- Frametime -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowFrametimeRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="FT" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <TextBlock Grid.Column="2" Text="{Binding FrametimeDisplay}" FontSize="12" Foreground="#66BB6A" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium" HorizontalAlignment="Right"/>
+            </Grid>
+            
+            <!-- Network Latency -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowNetworkLatencyRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="PING" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <TextBlock Grid.Column="2" Text="{Binding NetworkLatency}" FontSize="12" Foreground="{Binding NetworkLatencyColor}" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium" HorizontalAlignment="Right"/>
+            </Grid>
+            
+            <!-- Network Upload Speed -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowNetworkUploadRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="↑ UP" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
+                    <TextBlock Text="{Binding NetworkUpload}" FontSize="12" Foreground="#42A5F5" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                    <TextBlock Text=" Mbps" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                </StackPanel>
+            </Grid>
+            
+            <!-- Network Download Speed -->
+            <Grid Style="{StaticResource MetricRowGridStyle}" Visibility="{Binding ShowNetworkDownloadRow, Converter={StaticResource BoolToVisibility}}">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" SharedSizeGroup="MetricLabel"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*" SharedSizeGroup="MetricValue"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="↓ DN" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
+                    <TextBlock Text="{Binding NetworkDownload}" FontSize="12" Foreground="#66BB6A" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                    <TextBlock Text=" Mbps" FontSize="11" Foreground="#888888" FontFamily="{StaticResource AppFontFamily}" FontWeight="Medium"/>
+                </StackPanel>
+            </Grid>
+            
+            <!-- Throttling Warning -->
+            <Border Background="#44FF4444" 
+                    CornerRadius="4" 
+                    Padding="8,4" 
+                    Margin="0,6,0,0"
+                    Visibility="{Binding IsThrottling, Converter={StaticResource BoolToVisibility}}">
+                <TextBlock Text="⚠ THERMAL THROTTLE" FontSize="11" Foreground="#FF6666" FontWeight="Bold" HorizontalAlignment="Center"/>
+            </Border>
+        </StackPanel>
+    </Border>
+</Window>

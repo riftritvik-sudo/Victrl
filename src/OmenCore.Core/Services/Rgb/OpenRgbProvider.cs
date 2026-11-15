@@ -1,0 +1,546 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace OmenCore.Services.Rgb
+{
+    /// <summary>
+    /// OpenRGB provider for generic RGB device support on desktop systems.
+    /// Connects to OpenRGB SDK server (default: localhost:6742).
+    /// Requires OpenRGB to be running with SDK server enabled.
+    /// </summary>
+    public class OpenRgbProvider : IRgbProvider
+    {
+        private readonly LoggingService _logging;
+        private TcpClient? _client;
+        private NetworkStream? _stream;
+        private readonly List<OpenRgbDevice> _devices = new();
+        private bool _isConnected;
+        private readonly string _host;
+        private readonly int _port;
+        
+        // OpenRGB SDK Protocol Constants
+        private const string OPENRGB_MAGIC = "ORGB";
+        private const int PACKET_ID_REQUEST_CONTROLLER_COUNT = 0;
+        private const int PACKET_ID_REQUEST_CONTROLLER_DATA = 1;
+        private const int PACKET_ID_SET_CLIENT_NAME = 50;
+        private const int PACKET_ID_RGBCONTROLLER_UPDATELEDS = 1050;
+        private const int PACKET_ID_RGBCONTROLLER_UPDATEZONELEDS = 1051;
+        private const int PACKET_ID_RGBCONTROLLER_UPDATESINGLELED = 1052;
+        private const int PACKET_ID_RGBCONTROLLER_SETCUSTOMMODE = 1100;
+        private const int MAX_PACKET_DATA_LENGTH = 16 * 1024 * 1024;
+        private const int MAX_DISCOVERABLE_CONTROLLERS = 128;
+        private const int MAX_LED_UPDATE_COUNT = 2048;
+        private static readonly TimeSpan PacketIoTimeout = TimeSpan.FromSeconds(3);
+        
+        public string ProviderName => "OpenRGB";
+        public string ProviderId => "openrgb";
+        public bool IsAvailable => _isConnected && _devices.Count > 0;
+        public bool IsConnected => _isConnected;
+        public int DeviceCount => _devices.Count;
+        private bool _initFailed;
+        private string _initError = string.Empty;
+        private string _lastApplyError = string.Empty;
+
+        public RgbProviderConnectionStatus ConnectionStatus
+        {
+            get
+            {
+                if (_initFailed) return RgbProviderConnectionStatus.Error;
+                if (!_isConnected) return RgbProviderConnectionStatus.Disabled;
+                if (_devices.Count == 0) return RgbProviderConnectionStatus.NoDevices;
+                return RgbProviderConnectionStatus.Connected;
+            }
+        }
+
+        public string StatusDetail
+        {
+            get
+            {
+                if (_initFailed) return _initError;
+                if (!_isConnected) return $"OpenRGB server not reachable at {_host}:{_port}";
+                if (_devices.Count == 0) return "Connected, no devices found";
+                if (!string.IsNullOrWhiteSpace(_lastApplyError)) return $"{_devices.Count} device(s) connected; last write failed: {_lastApplyError}";
+                return $"{_devices.Count} device(s) connected";
+            }
+        }
+        
+        public IReadOnlyList<RgbEffectType> SupportedEffects => new[]
+        {
+            RgbEffectType.Static,
+            RgbEffectType.Off
+        };
+        
+        public IReadOnlyList<OpenRgbDevice> Devices => _devices;
+        
+        public OpenRgbProvider(LoggingService logging, string host = "127.0.0.1", int port = 6742)
+        {
+            _logging = logging;
+            _host = host;
+            _port = port;
+        }
+        
+        public async Task InitializeAsync()
+        {
+            try
+            {
+                await ConnectAsync();
+                if (_isConnected)
+                {
+                    await DiscoverDevicesAsync();
+                    _initFailed = false;
+                    _initError = string.Empty;
+                    _logging.Info($"[OpenRGB] Connected to OpenRGB server, found {_devices.Count} device(s)");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"[OpenRGB] Failed to connect to OpenRGB server: {ex.Message}");
+                _logging.Info("[OpenRGB] Make sure OpenRGB is running with SDK Server enabled (SDK Server tab → Start Server)");
+                _isConnected = false;
+                _initFailed = true;
+                _initError = ex.Message;
+            }
+        }
+        
+        private async Task ConnectAsync()
+        {
+            try
+            {
+                _client = new TcpClient();
+                _client.ReceiveTimeout = 5000;
+                _client.SendTimeout = 5000;
+                
+                // Try to connect with timeout using CancellationToken
+                using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(2));
+                try
+                {
+                    await _client.ConnectAsync(_host, _port, cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logging.Debug("[OpenRGB] Connection timeout - OpenRGB server not available");
+                    _client?.Dispose();
+                    _client = null;
+                    return;
+                }
+                
+                _stream = _client.GetStream();
+                _isConnected = true;
+                
+                // Send client name
+                await SendClientNameAsync("OmenCore");
+            }
+            catch (SocketException)
+            {
+                _logging.Debug("[OpenRGB] OpenRGB server not running or not accessible");
+                _isConnected = false;
+                _client?.Dispose();
+                _client = null;
+            }
+            catch (Exception ex)
+            {
+                _logging.Debug($"[OpenRGB] Connection failed: {ex.Message}");
+                _isConnected = false;
+                _client?.Dispose();
+                _client = null;
+            }
+        }
+        
+        private async Task SendClientNameAsync(string name)
+        {
+            var nameBytes = Encoding.ASCII.GetBytes(name + "\0");
+            await SendPacketAsync(PACKET_ID_SET_CLIENT_NAME, nameBytes);
+        }
+        
+        private async Task<int> GetControllerCountAsync()
+        {
+            await SendPacketAsync(PACKET_ID_REQUEST_CONTROLLER_COUNT, Array.Empty<byte>());
+            var response = await ReceivePacketAsync();
+            
+            if (response.Data.Length >= 4)
+            {
+                return BitConverter.ToInt32(response.Data, 0);
+            }
+            return 0;
+        }
+        
+        private async Task DiscoverDevicesAsync()
+        {
+            _devices.Clear();
+            
+            int count = Math.Clamp(await GetControllerCountAsync(), 0, MAX_DISCOVERABLE_CONTROLLERS);
+            _logging.Debug($"[OpenRGB] Found {count} controller(s)");
+            
+            for (int i = 0; i < count; i++)
+            {
+                try
+                {
+                    var device = await GetControllerDataAsync(i);
+                    if (device != null)
+                    {
+                        _devices.Add(device);
+                        _logging.Debug($"[OpenRGB] Device {i}: {device.Name} ({device.Type}) - {device.LedCount} LEDs");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"[OpenRGB] Failed to get controller {i} data: {ex.Message}");
+                }
+            }
+        }
+        
+        private async Task<OpenRgbDevice?> GetControllerDataAsync(int deviceIndex)
+        {
+            var indexBytes = BitConverter.GetBytes(deviceIndex);
+            await SendPacketAsync(PACKET_ID_REQUEST_CONTROLLER_DATA, indexBytes, deviceIndex);
+            var response = await ReceivePacketAsync();
+            
+            if (response.Data.Length < 8)
+                return null;
+            
+            return ParseControllerData(deviceIndex, response.Data);
+        }
+        
+        private OpenRgbDevice ParseControllerData(int index, byte[] data)
+        {
+            // OpenRGB controller data packet structure (simplified parsing)
+            var device = new OpenRgbDevice { Index = index };
+            
+            using var ms = new MemoryStream(data);
+            using var reader = new BinaryReader(ms);
+            
+            try
+            {
+                // Skip data size (4 bytes)
+                reader.ReadInt32();
+                
+                // Device type (4 bytes)
+                device.Type = (OpenRgbDeviceType)reader.ReadInt32();
+                
+                // Name (null-terminated string with 2-byte length prefix)
+                device.Name = ReadPrefixedString(reader, "name");
+                
+                // Vendor (null-terminated string with 2-byte length prefix)
+                device.Vendor = ReadPrefixedString(reader, "vendor");
+                
+                // Description (null-terminated string with 2-byte length prefix)
+                SkipPrefixedString(reader, "description");
+                
+                // Version (null-terminated string with 2-byte length prefix)
+                SkipPrefixedString(reader, "version");
+                
+                // Serial (null-terminated string with 2-byte length prefix)
+                SkipPrefixedString(reader, "serial");
+                
+                // Location (null-terminated string with 2-byte length prefix)
+                SkipPrefixedString(reader, "location");
+                
+                // Mode count (2 bytes)
+                int modeCount = reader.ReadUInt16();
+                
+                // Active mode (4 bytes)
+                reader.ReadInt32();
+                
+                // Skip mode data for now - we just need LED count
+                // This is a simplified parser - modes have complex variable-length data
+                // For now, we'll estimate LED count from remaining data
+                
+                // Skip to zones section - this requires proper mode parsing
+                // For simplicity, we'll use a heuristic based on device type
+                device.LedCount = EstimateLedCount(device.Type);
+            }
+            catch (Exception ex)
+            {
+                _logging.Debug($"[OpenRGB] Error parsing controller data: {ex.Message}");
+                device.LedCount = 1; // Minimum
+            }
+            
+            return device;
+        }
+
+        private static string ReadPrefixedString(BinaryReader reader, string fieldName)
+        {
+            EnsureBytesRemaining(reader, 2, fieldName);
+            var length = reader.ReadUInt16();
+            EnsureBytesRemaining(reader, length, fieldName);
+            var bytes = reader.ReadBytes(length);
+            return Encoding.ASCII.GetString(bytes).TrimEnd('\0');
+        }
+
+        private static void SkipPrefixedString(BinaryReader reader, string fieldName)
+        {
+            _ = ReadPrefixedString(reader, fieldName);
+        }
+
+        private static void EnsureBytesRemaining(BinaryReader reader, int requested, string fieldName)
+        {
+            var remaining = reader.BaseStream.Length - reader.BaseStream.Position;
+            if (requested > remaining)
+            {
+                throw new InvalidDataException($"OpenRGB {fieldName} field length exceeds remaining packet data");
+            }
+        }
+        
+        private int EstimateLedCount(OpenRgbDeviceType type)
+        {
+            return type switch
+            {
+                OpenRgbDeviceType.Keyboard => 104,
+                OpenRgbDeviceType.Mouse => 2,
+                OpenRgbDeviceType.MouseMat => 15,
+                OpenRgbDeviceType.Headset => 2,
+                OpenRgbDeviceType.HeadsetStand => 4,
+                OpenRgbDeviceType.Gamepad => 4,
+                OpenRgbDeviceType.Light => 1,
+                OpenRgbDeviceType.Speaker => 4,
+                OpenRgbDeviceType.LedStrip => 30,
+                OpenRgbDeviceType.Motherboard => 8,
+                OpenRgbDeviceType.Gpu => 1,
+                OpenRgbDeviceType.Cooler => 8,
+                OpenRgbDeviceType.Ram => 8,
+                _ => 10
+            };
+        }
+        
+        public async Task ApplyEffectAsync(string effectId)
+        {
+            if (!_isConnected) return;
+            
+            if (effectId.StartsWith("color:", StringComparison.OrdinalIgnoreCase))
+            {
+                var hex = effectId.Substring(6);
+                var color = ColorTranslator.FromHtml(hex);
+                await SetStaticColorAsync(color);
+            }
+            else if (effectId.Equals("off", StringComparison.OrdinalIgnoreCase))
+            {
+                await TurnOffAsync();
+            }
+        }
+        
+        public async Task SetStaticColorAsync(Color color)
+        {
+            if (!_isConnected) return;
+            
+            var failedDevices = 0;
+            foreach (var device in _devices)
+            {
+                try
+                {
+                    await SetDeviceColorAsync(device.Index, color, device.LedCount);
+                    device.CurrentColor = color;
+                }
+                catch (Exception ex)
+                {
+                    failedDevices++;
+                    _lastApplyError = ex.Message;
+                    _logging.Debug($"[OpenRGB] Failed to set color on device {device.Index}: {ex.Message}");
+                }
+            }
+
+            if (failedDevices == 0)
+            {
+                _lastApplyError = string.Empty;
+            }
+            else
+            {
+                _logging.Warn($"[OpenRGB] Failed to update {failedDevices}/{_devices.Count} device(s)");
+            }
+        }
+        
+        private async Task SetDeviceColorAsync(int deviceIndex, Color color, int ledCount)
+        {
+            // Set device to direct/custom mode first
+            await SendPacketAsync(PACKET_ID_RGBCONTROLLER_SETCUSTOMMODE, Array.Empty<byte>(), deviceIndex);
+            await Task.Delay(10); // Small delay for mode switch
+            ledCount = Math.Clamp(ledCount, 1, MAX_LED_UPDATE_COUNT);
+
+            // Build LED color array packet
+            // Format: data_size (4) + led_count (2) + [r,g,b,padding] * led_count
+            using var ms = new MemoryStream();
+            using var writer = new BinaryWriter(ms);
+            
+            // Data size (will be calculated)
+            int dataSize = 2 + (ledCount * 4);
+            writer.Write(dataSize);
+            
+            // LED count
+            writer.Write((ushort)ledCount);
+            
+            // LED colors (RGBX format - OpenRGB uses R, G, B, 0)
+            for (int i = 0; i < ledCount; i++)
+            {
+                writer.Write(color.R);
+                writer.Write(color.G);
+                writer.Write(color.B);
+                writer.Write((byte)0); // Padding
+            }
+            
+            await SendPacketAsync(PACKET_ID_RGBCONTROLLER_UPDATELEDS, ms.ToArray(), deviceIndex);
+        }
+        
+        public Task SetBreathingEffectAsync(Color color)
+        {
+            // OpenRGB doesn't have built-in breathing effect via SDK
+            // Just apply static color
+            return SetStaticColorAsync(color);
+        }
+        
+        public Task SetSpectrumEffectAsync()
+        {
+            // Spectrum cycling not supported via direct SDK control
+            // Would need to implement timer-based color cycling
+            return Task.CompletedTask;
+        }
+        
+        public async Task TurnOffAsync()
+        {
+            await SetStaticColorAsync(Color.Black);
+        }
+        
+        private async Task SendPacketAsync(int packetId, byte[] data, int deviceIndex = 0)
+        {
+            if (_stream == null) return;
+            if (data.Length > MAX_PACKET_DATA_LENGTH)
+                throw new InvalidDataException($"OpenRGB packet payload too large: {data.Length} bytes");
+
+            using var ms = new MemoryStream();
+            using var writer = new BinaryWriter(ms);
+            
+            // Header: "ORGB" magic
+            writer.Write(Encoding.ASCII.GetBytes(OPENRGB_MAGIC));
+            
+            // Device index (4 bytes)
+            writer.Write(deviceIndex);
+            
+            // Packet ID (4 bytes)
+            writer.Write(packetId);
+            
+            // Data length (4 bytes)
+            writer.Write(data.Length);
+            
+            // Data
+            if (data.Length > 0)
+                writer.Write(data);
+            
+            var packet = ms.ToArray();
+            await _stream.WriteAsync(packet, 0, packet.Length).WaitAsync(PacketIoTimeout);
+            await _stream.FlushAsync().WaitAsync(PacketIoTimeout);
+        }
+        
+        private async Task<OpenRgbPacket> ReceivePacketAsync()
+        {
+            if (_stream == null)
+                return new OpenRgbPacket();
+            
+            var header = new byte[16];
+            await ReadExactAsync(header, 16);
+            
+            // Parse header
+            var magic = Encoding.ASCII.GetString(header, 0, 4);
+            if (!string.Equals(magic, OPENRGB_MAGIC, StringComparison.Ordinal))
+                throw new InvalidDataException("Invalid OpenRGB packet header");
+
+            int deviceIndex = BitConverter.ToInt32(header, 4);
+            int packetId = BitConverter.ToInt32(header, 8);
+            int dataLength = BitConverter.ToInt32(header, 12);
+            if (dataLength < 0 || dataLength > MAX_PACKET_DATA_LENGTH)
+                throw new InvalidDataException($"Invalid OpenRGB packet payload length: {dataLength}");
+            
+            // Read data
+            byte[] data = Array.Empty<byte>();
+            if (dataLength > 0)
+            {
+                data = new byte[dataLength];
+                await ReadExactAsync(data, dataLength);
+            }
+            
+            return new OpenRgbPacket
+            {
+                DeviceIndex = deviceIndex,
+                PacketId = packetId,
+                Data = data
+            };
+        }
+
+        private async Task ReadExactAsync(byte[] buffer, int length)
+        {
+            if (_stream == null)
+                throw new IOException("OpenRGB stream not connected");
+
+            int bytesRead = 0;
+            while (bytesRead < length)
+            {
+                int read = await _stream
+                    .ReadAsync(buffer, bytesRead, length - bytesRead)
+                    .WaitAsync(PacketIoTimeout);
+                if (read == 0)
+                    throw new IOException("Connection closed");
+
+                bytesRead += read;
+            }
+        }
+        
+        public void Shutdown()
+        {
+            try
+            {
+                _stream?.Close();
+                _client?.Close();
+            }
+            catch (Exception ex)
+            {
+                _logging.Debug($"[OpenRGB] Shutdown cleanup failed: {ex.Message}");
+            }
+            
+            _stream = null;
+            _client = null;
+            _isConnected = false;
+            _devices.Clear();
+        }
+    }
+    
+    public class OpenRgbDevice
+    {
+        public int Index { get; set; }
+        public string Name { get; set; } = "";
+        public string Vendor { get; set; } = "";
+        public OpenRgbDeviceType Type { get; set; }
+        public int LedCount { get; set; }
+        public Color CurrentColor { get; set; } = Color.Black;
+    }
+    
+    public class OpenRgbPacket
+    {
+        public int DeviceIndex { get; set; }
+        public int PacketId { get; set; }
+        public byte[] Data { get; set; } = Array.Empty<byte>();
+    }
+    
+    public enum OpenRgbDeviceType
+    {
+        Motherboard = 0,
+        Ram = 1,
+        Gpu = 2,
+        Cooler = 3,
+        LedStrip = 4,
+        Keyboard = 5,
+        Mouse = 6,
+        MouseMat = 7,
+        Headset = 8,
+        HeadsetStand = 9,
+        Gamepad = 10,
+        Light = 11,
+        Speaker = 12,
+        Virtual = 13,
+        Storage = 14,
+        Case = 15,
+        Unknown = 16
+    }
+}

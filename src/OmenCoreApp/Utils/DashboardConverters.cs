@@ -1,0 +1,157 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Windows.Data;
+using OmenCore.Models;
+
+namespace OmenCore.Utils
+{
+    /// <summary>
+    /// Extracts the total power value from a power summary string.
+    /// Input: "CPU: 25W • GPU: 31W • Total: 56W"
+    /// Output: "56W"
+    /// </summary>
+    public class PowerToTotalConverter : IValueConverter
+    {
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (value is not string summary || string.IsNullOrEmpty(summary))
+                return "--W";
+            
+            // Look for "Total: XXW" pattern
+            var totalIndex = summary.IndexOf("Total:", StringComparison.OrdinalIgnoreCase);
+            if (totalIndex >= 0)
+            {
+                var afterTotal = summary.Substring(totalIndex + 6).Trim();
+                var endIndex = afterTotal.IndexOf('W');
+                if (endIndex > 0)
+                {
+                    return afterTotal.Substring(0, endIndex + 1);
+                }
+            }
+            
+            // Fallback: try to extract any number followed by W
+            var parts = summary.Split(' ');
+            foreach (var part in parts)
+            {
+                if (part.EndsWith("W") && double.TryParse(part.TrimEnd('W'), out _))
+                {
+                    return part;
+                }
+            }
+            
+            return "--W";
+        }
+
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            return Binding.DoNothing;
+        }
+    }
+    
+    /// <summary>
+    /// Extracts fan RPM info from a fan summary string.
+    /// Input: "45°C → CPU: 2500 RPM • GPU: 2800 RPM"
+    /// Output: "2500/2800"
+    /// </summary>
+    public class FanSpeedConverter : IValueConverter
+    {
+        // Bound to a dashboard summary string updated on every telemetry tick - static/compiled
+        // instances avoid re-resolving the pattern from Regex's internal static cache on every
+        // conversion, in a hot binding path.
+        private static readonly System.Text.RegularExpressions.Regex CpuRpmPattern = new(
+            @"CPU:\s*(\d+)\s*RPM",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+        private static readonly System.Text.RegularExpressions.Regex GpuRpmPattern = new(
+            @"GPU:\s*(\d+)\s*RPM",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (value is not string summary || string.IsNullOrEmpty(summary))
+                return "-- RPM";
+
+            // Extract CPU and GPU RPM values
+            int cpuRpm = 0, gpuRpm = 0;
+
+            var cpuMatch = CpuRpmPattern.Match(summary);
+            if (cpuMatch.Success)
+                int.TryParse(cpuMatch.Groups[1].Value, out cpuRpm);
+
+            var gpuMatch = GpuRpmPattern.Match(summary);
+            if (gpuMatch.Success)
+                int.TryParse(gpuMatch.Groups[1].Value, out gpuRpm);
+            
+            if (cpuRpm > 0 || gpuRpm > 0)
+            {
+                return $"{cpuRpm}/{gpuRpm}";
+            }
+            
+            return "-- RPM";
+        }
+
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            return Binding.DoNothing;
+        }
+    }
+    
+    /// <summary>
+    /// Extracts the latest fan speed from FanCurvePoints collection.
+    /// ConverterParameter: "cpu" or "gpu"
+    /// </summary>
+    public class LatestFanSpeedConverter : IValueConverter
+    {
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (value is not IEnumerable<FanCurvePoint> points)
+                return "-- RPM";
+            
+            var pointsList = points.ToList();
+            if (pointsList.Count == 0)
+                return "-- RPM";
+            
+            // Get the most recent point
+            var latest = pointsList.LastOrDefault();
+            if (latest == null)
+                return "-- RPM";
+            
+            // For now, return the fan speed - in a real implementation,
+            // you might want to track CPU/GPU fans separately
+            var rpm = (int)latest.FanSpeedRpm;
+            return rpm > 0 ? $"{rpm} RPM" : "-- RPM";
+        }
+
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            return Binding.DoNothing;
+        }
+    }
+
+    /// <summary>
+    /// Converts a double value of 0 (or negative) to a placeholder dash string.
+    /// Used for sensor values that are unavailable (CPU/GPU temp, power watts).
+    /// ConverterParameter: optional suffix e.g. "°" or "W" — defaults to "°C"
+    /// </summary>
+    public class ZeroDoubleToPlaceholderConverter : IValueConverter
+    {
+        public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            var rawSuffix = parameter as string ?? "°C";
+            var suffix = string.Equals(rawSuffix, "w", StringComparison.OrdinalIgnoreCase)
+                ? "W"
+                : rawSuffix;
+
+            if (value is double d && d > 0)
+                return $"{d:F0}{suffix}";
+            if (value is float f && f > 0)
+                return $"{f:F0}{suffix}";
+
+            return $"--{suffix}";
+        }
+
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+            => Binding.DoNothing;
+    }
+}

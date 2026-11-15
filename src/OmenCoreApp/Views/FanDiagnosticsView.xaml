@@ -1,0 +1,121 @@
+<UserControl x:Class="OmenCore.Views.FanDiagnosticsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             mc:Ignorable="d" d:DesignHeight="400" d:DesignWidth="700">
+    <Border Style="{StaticResource SurfaceCard}" Padding="16">
+        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel>
+            <TextBlock Text="Fan Diagnostics" Style="{StaticResource Heading2}" />
+            <WrapPanel Orientation="Horizontal" Margin="0,8,0,12">
+                <StackPanel MinWidth="200" MaxWidth="280" Margin="0,0,16,8">
+                    <TextBlock Text="Selected Fan" Style="{StaticResource Caption}" />
+                    <ComboBox SelectedIndex="{Binding SelectedFanIndex, Mode=TwoWay}" Margin="0,6,0,0">
+                        <ComboBoxItem Content="CPU Fan" />
+                        <ComboBoxItem Content="GPU Fan" />
+                    </ComboBox>
+
+                    <TextBlock Text="Target Percent" Style="{StaticResource Caption}" Margin="0,10,0,0" />
+                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                        <Slider Width="160" Minimum="0" Maximum="100" Value="{Binding TargetPercent, Mode=TwoWay}" />
+                        <TextBlock Text="{Binding TargetPercent}" Margin="8,0,0,0" VerticalAlignment="Center" />
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                        <Button Content="Apply &amp; Verify" Command="{Binding ApplyAndVerifyCommand}" Style="{StaticResource ModernButton}" />
+                        <Button Content="Refresh" Command="{Binding RefreshStateCommand}" Margin="8,0,0,0" />
+                    </StackPanel>
+                </StackPanel>
+
+                <Border Background="{StaticResource SurfaceDarkBrush}" CornerRadius="6" Padding="12" Margin="0,0,16,8" VerticalAlignment="Top">
+                    <StackPanel>
+                        <TextBlock Text="Current State" FontWeight="SemiBold" />
+                        <TextBlock Text="RPM:" Style="{StaticResource Caption}" Margin="0,6,0,0" />
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding CurrentRpm}" FontSize="18" FontWeight="Bold" Foreground="{StaticResource AccentBrush}" />
+                            <Border Background="{StaticResource SurfaceMediumBrush}" CornerRadius="4" Padding="6,2" Margin="8,0,0,0" VerticalAlignment="Center"
+                                    ToolTip="Source of RPM data: EC=Direct EC read, HWMon=LibreHardwareMonitor, MAB=MSI Afterburner, Est=Estimated">
+                                <TextBlock Text="{Binding RpmSourceDisplay}" FontSize="10" Foreground="{StaticResource TextSecondaryBrush}" />
+                            </Border>
+                        </StackPanel>
+                        <TextBlock Text="Level:" Style="{StaticResource Caption}" Margin="0,8,0,0" />
+                        <TextBlock Text="{Binding CurrentLevel}" FontSize="18" FontWeight="Bold" Foreground="{StaticResource AccentBrush}" />
+                    </StackPanel>
+                </Border>
+                
+                <!-- Guided Diagnostic (v2.7.0) -->
+                <Border Background="{StaticResource SurfaceDarkBrush}" CornerRadius="6" Padding="12" Margin="0,0,16,8" VerticalAlignment="Top">
+                    <StackPanel MinWidth="200" MaxWidth="320">
+                        <TextBlock Text="Guided Fan Verification" FontWeight="SemiBold" />
+                        <TextBlock Text="Tests: 30% → 60% → 100%" Style="{StaticResource Caption}" Margin="0,4,0,0" TextWrapping="Wrap"/>
+                        <Button Content="Run Guided Fan Verification" Command="{Binding RunGuidedDiagnosticCommand}" 
+                                Style="{StaticResource ModernButton}" Margin="0,8,0,0" 
+                                IsEnabled="{Binding IsGuidedTestRunning, Converter={StaticResource InverseBooleanConverter}}"/>
+                        
+                        <!-- Progress (only visible during test) -->
+                        <ProgressBar Value="{Binding GuidedTestProgress, Mode=OneWay}" Maximum="100" Height="4" Margin="0,8,0,0"
+                                     Visibility="{Binding IsGuidedTestRunning, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                        <TextBlock Text="{Binding GuidedTestStatus}" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" 
+                                   Margin="0,4,0,0" TextWrapping="Wrap"
+                                   Visibility="{Binding GuidedTestStatus, Converter={StaticResource StringNotEmptyToVisibilityConverter}}"/>
+                        <TextBlock Text="{Binding RgbCheckStatus}" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"
+                                   Margin="0,4,0,0" TextWrapping="Wrap"
+                                   Visibility="{Binding RgbCheckStatus, Converter={StaticResource StringNotEmptyToVisibilityConverter}}"/>
+                    </StackPanel>
+                </Border>
+            </WrapPanel>
+            
+            <!-- Fan Verification Results (v2.7.0) -->
+            <Border Background="{StaticResource SurfaceDarkBrush}" CornerRadius="6" Padding="12" Margin="0,12,0,0"
+                    Visibility="{Binding GuidedTestResult, Converter={StaticResource StringNotEmptyToVisibilityConverter}}">
+                <StackPanel>
+                    <TextBlock Text="Verification Results" FontWeight="SemiBold" />
+                    <!-- A read-only TextBox, not a TextBlock: WPF TextBlock text cannot be
+                         selected, so dragging across these results did nothing and the click
+                         fell through to the surrounding panel. This keeps the same flat look
+                         while letting the text be selected and copied by hand. -->
+                    <TextBox Text="{Binding GuidedTestResult, Mode=OneWay}" FontFamily="{StaticResource MonospaceFontFamily}" FontSize="11"
+                             Foreground="{StaticResource TextSecondaryBrush}" Margin="0,8,0,0"
+                             TextWrapping="Wrap" IsReadOnly="True" IsReadOnlyCaretVisible="False"
+                             Background="Transparent" BorderThickness="0" Padding="0"
+                             HorizontalScrollBarVisibility="Disabled"/>
+                    <Button Content="Copy Results" Command="{Binding CopyGuidedResultCommand}" 
+                            Style="{StaticResource ModernButton}" Margin="0,8,0,0" 
+                            Visibility="{Binding GuidedTestResult, Converter={StaticResource StringNotEmptyToVisibilityConverter}}"/>
+                </StackPanel>
+            </Border>
+
+            <TextBlock Text="History" Style="{StaticResource Heading3}" Margin="0,8,0,8" />
+            <ListBox ItemsSource="{Binding History}" MaxHeight="180">
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <Border Background="{StaticResource SurfaceDarkBrush}" Padding="8" Margin="0,0,0,8" CornerRadius="6">
+                            <StackPanel>
+                                <TextBlock Text="{Binding FanName, Mode=OneWay}" FontWeight="SemiBold" />
+                                        <TextBlock FontSize="12" Foreground="{StaticResource TextSecondaryBrush}">
+                                            <Run Text="Requested: " />
+                                            <Run Text="{Binding RequestedPercent, Mode=OneWay}" />
+                                            <Run Text="%  , Readback: " />
+                                            <Run Text="{Binding RpmDisplay, Mode=OneWay}" />
+                                            <Run Text=" (±" />
+                                            <Run Text="{Binding DeviationPercent, StringFormat={}{0:F1}%, Mode=OneWay}" />
+                                            <Run Text=")" />
+                                        </TextBlock>
+                                        <TextBlock FontSize="11" Foreground="{StaticResource TextMutedBrush}">
+                                            <Run Text="Evidence: " />
+                                            <Run Text="{Binding VerificationEvidence, Mode=OneWay}" />
+                                        </TextBlock>
+                                        <TextBlock FontSize="11" Foreground="{StaticResource TextMutedBrush}"
+                                                   TextWrapping="Wrap">
+                                            <Run Text="{Binding ErrorMessage, Mode=OneWay}" />
+                                        </TextBlock>
+                            </StackPanel>
+                        </Border>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+        </StackPanel>
+        </ScrollViewer>
+    </Border>
+</UserControl>

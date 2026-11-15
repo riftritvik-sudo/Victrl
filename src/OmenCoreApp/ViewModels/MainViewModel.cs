@@ -1,0 +1,4848 @@
+using OmenCore.Hardware;
+using OmenCore.Models;
+using OmenCore.Services;
+using OmenCore.Services.Diagnostics;
+using OmenCore.Utils;
+using OmenCore.Views;
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Threading;
+
+namespace OmenCore.ViewModels
+{
+    public class MainViewModel : INotifyPropertyChanged, IDisposable
+    {
+        // P/Invoke for reliable window focus
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+        
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+        
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+        
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+        
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+        
+        private const int SW_RESTORE = 9;
+        private const double TelemetryTransientZeroThresholdC = 0.05;
+        
+        private readonly LoggingService _logging = App.Logging;
+        private readonly ConfigurationService _configService = App.Configuration;
+        private readonly AppConfig _config;
+        private readonly FanService _fanService = null!;
+        private readonly IFanVerificationService _fanVerificationService = null!;
+        private readonly PerformanceModeService _performanceModeService = null!;
+        private readonly KeyboardLightingService _keyboardLightingService;
+        private readonly SystemOptimizationService _systemOptimizationService;
+        private readonly GpuSwitchService _gpuSwitchService;
+        private CorsairDeviceService? _corsairDeviceService;
+        private LogitechDeviceService? _logitechDeviceService;
+        private OmenCore.Razer.RazerService? _razerService;
+        private readonly UndervoltService _undervoltService;
+        private readonly HardwareMonitoringService _hardwareMonitoringService;
+        public HardwareMonitoringService HardwareMonitoringService => _hardwareMonitoringService;
+        private readonly SystemRestoreService _systemRestoreService;
+        private readonly OmenGamingHubCleanupService _hubCleanupService;
+        private readonly QuietSafetyMonitor _quietSafetyMonitor = new();
+        private readonly SystemInfoService _systemInfoService;
+        private readonly ProcessMonitoringService _processMonitoringService;
+        private readonly ITelemetryService _telemetryService;
+        private readonly GameProfileService _gameProfileService;
+        private OmenCore.Services.Rgb.RgbManager? _rgbManager;
+        private RgbSceneService? _rgbSceneService;
+        private ScreenSamplingService? _screenSamplingService;
+        private AudioReactiveRgbService? _audioReactiveRgbService;
+        private readonly FanCleaningService _fanCleaningService;
+        private readonly HotkeyService _hotkeyService;
+        private readonly NotificationService _notificationService;
+        private readonly BiosUpdateService _biosUpdateService;
+        private readonly PowerAutomationService _powerAutomationService;
+        private readonly AutomationService _automationService;
+        private readonly ResumeRecoveryDiagnosticsService _resumeRecoveryDiagnostics = new();
+        private readonly OmenKeyService _omenKeyService;
+        private readonly NvapiService? _nvapiService;
+        private volatile AmdGpuService? _amdGpuService;
+        private OsdService? _osdService;
+        public OsdService? Osd => _osdService;
+        private ConflictDetectionService? _conflictDetectionService;
+        private readonly CancellationTokenSource _conflictMonitorCts = new();
+        private int _conflictMonitoringStarted;
+        private HpWmiBios? _wmiBios;
+        private string? _lastLoggedConflictSummary;
+        private WmiBiosMonitor? _wmiBiosMonitor;
+        private OghServiceProxy? _oghProxy;
+        private ThermalMonitoringService? _thermalMonitoringService;
+        private HardwareWatchdogService? _watchdogService;
+        private HotkeyOsdWindow? _hotkeyOsd;
+        private readonly RuntimeCommandDispatcher _trayActionDispatcher;
+        private readonly RuntimeHotkeyCoordinator _hotkeyCoordinator;
+        private RuntimePollingCoordinator? _pollingCoordinator;
+        private readonly RuntimeEcOperationCoordinator _ecOperationCoordinator;
+        private IEcAccess? _ecAccess;
+        private readonly DateTime _monitoringStartupUtc = DateTime.UtcNow;
+        private volatile bool _safeModeActive;
+        private MonitoringHealthStatus _prevHealthStatus = MonitoringHealthStatus.Unknown;
+        private System.Threading.Timer? _safeModeResetTimer;
+        private bool _hotkeysInitialized;
+        private bool _windowFocusHandlersAttached;
+        private bool _windowFocusedHotkeysMode;
+        private bool _windowHotkeysActive;
+        private readonly object _profileSyncGateLock = new();
+        private bool _profileSyncInProgress;
+        private readonly object _monitoringUpdateLock = new();
+        private MonitoringSample? _queuedMonitoringSample;
+        private bool _monitoringUiUpdateQueued;
+        // STEP-09 mitigation instrumentation — counts call-site entries and coalesced skips.
+        // Remove together with the inner lock when STEP-09 is executed.
+        private int _queueCallCount;
+        private int _queueCoalesceCount;
+        private System.Diagnostics.Stopwatch _queueInstrumentTimer = System.Diagnostics.Stopwatch.StartNew();
+        private long _dispatcherBeginInvokeCount;
+        private long _dispatcherInvokeCount;
+        private readonly System.Diagnostics.Stopwatch _dispatcherMetricsTimer = System.Diagnostics.Stopwatch.StartNew();
+        
+        // Sub-ViewModels for modular UI (Lazy Loaded)
+        private FanControlViewModel? _fanControl;
+        public bool IsFanControlLoaded => _fanControl != null;
+        public FanControlViewModel? FanControl
+        {
+            get
+            {
+                if (_fanControl == null)
+                {
+                    _fanControl = new FanControlViewModel(_fanService, _configService, _logging, _fanVerificationService);
+                    _fanControl.PropertyChanged += (s, e) =>
+                    {
+                        if (e.PropertyName == nameof(FanControlViewModel.CurrentFanModeName))
+                        {
+                            var confirmedFanMode = _fanService.GetCurrentFanMode()
+                                ?? _fanService.ActivePresetName
+                                ?? CurrentFanMode;
+                            if (_dashboard != null)
+                            {
+                                _dashboard.CurrentFanMode = confirmedFanMode;
+                            }
+                            // Keep tray/OSD on the confirmed runtime mode; selection changes are only requests.
+                            CurrentFanMode = confirmedFanMode;
+                        }
+                    };
+                    OnPropertyChanged(nameof(FanControl));
+                    OnPropertyChanged(nameof(IsFanControlLoaded));
+                }
+                return _fanControl;
+            }
+        }
+
+        public LightingViewModel? Lighting { get; private set; }
+        public bool IsLightingLoaded => Lighting != null;
+        private readonly SemaphoreSlim _lightingInitializationLock = new(1, 1);
+
+        private SystemControlViewModel? _systemControl;
+        public bool IsSystemControlLoaded => _systemControl != null;
+        public SystemControlViewModel? LoadedSystemControl => _systemControl;
+        public bool IsGpuPowerTrayLikelyAvailable => DetectedCapabilities?.ShowGpuPowerBoost ?? true;
+        public string RpmReadbackLabel => Hardware.RpmReadbackLabel.Describe(DetectedCapabilities?.ModelConfig?.SupportsRpmReadback ?? true, FanTelemetry?.Select(t => t.RpmSource));
+        public string PowerLimitReadbackLabel => Hardware.PowerLimitReadbackLabel.Describe(DetectedCapabilities?.ModelConfig?.SupportsPowerLimits ?? false, _systemControl?.CpuPowerLimitsStatus?.StartsWith("MSR package limits unavailable", StringComparison.Ordinal) == true);
+
+        public SystemControlViewModel? SystemControl
+        {
+            get
+            {
+                if (_systemControl == null)
+                {
+                    _systemControl = new SystemControlViewModel(
+                        _undervoltService,
+                        _performanceModeService,
+                        _hubCleanupService,
+                        _systemRestoreService,
+                        _gpuSwitchService,
+                        _logging,
+                        _configService,
+                        _wmiBios,
+                        _oghProxy,
+                        _systemInfoService,
+                        _nvapiService,
+                        fanService: _fanService,
+                        hardwareMonitoringService: _hardwareMonitoringService,
+                        ecAccess: _ecAccess,
+                        amdGpuService: _amdGpuService,
+                        ecOperationCoordinator: _ecOperationCoordinator,
+                        capabilities: DetectedCapabilities
+                    );
+                    _systemControl.PropertyChanged += (s, e) =>
+                    {
+                        if (e.PropertyName == nameof(SystemControlViewModel.CpuPowerLimitsStatus))
+                        {
+                            OnPropertyChanged(nameof(PowerLimitReadbackLabel));
+                        }
+                        if (e.PropertyName == nameof(SystemControlViewModel.CurrentPerformanceModeName))
+                        {
+                            var confirmedPerformanceMode = _performanceModeService.GetCurrentMode()
+                                ?? CurrentPerformanceMode;
+                            if (_dashboard != null)
+                            {
+                                _dashboard.CurrentPerformanceMode = confirmedPerformanceMode;
+                            }
+                            // Keep tray/OSD on the confirmed runtime mode; selection changes are only requests.
+                            CurrentPerformanceMode = confirmedPerformanceMode;
+                        }
+                    };
+                    _general?.SetSystemControlViewModel(_systemControl);
+                    OnPropertyChanged(nameof(SystemControl));
+                    OnPropertyChanged(nameof(IsSystemControlLoaded));
+                    OnPropertyChanged(nameof(LoadedSystemControl));
+                }
+                return _systemControl;
+            }
+        }
+
+        private DashboardViewModel? _dashboard;
+        public DashboardViewModel? Dashboard
+        {
+            get
+            {
+                if (_dashboard == null)
+                {
+                    _dashboard = new DashboardViewModel(_hardwareMonitoringService, _fanService, _pollingCoordinator);
+                    // Initialize with current values without forcing lazy sub-viewmodels to load.
+                    var confirmedPerformanceMode = _performanceModeService.GetCurrentMode()
+                        ?? CurrentPerformanceMode;
+                    var confirmedFanMode = _fanService.GetCurrentFanMode()
+                        ?? _fanService.ActivePresetName
+                        ?? CurrentFanMode;
+
+                    _dashboard.CurrentPerformanceMode = confirmedPerformanceMode;
+                    _dashboard.CurrentFanMode = confirmedFanMode;
+                    CurrentPerformanceMode = confirmedPerformanceMode;
+                    CurrentFanMode = confirmedFanMode;
+                    _dashboard.ModeLinkStatus = FanPerformanceLinkStatus;
+                    OnPropertyChanged(nameof(Dashboard));
+                }
+                return _dashboard;
+            }
+        }
+
+        private int _selectedTabIndex = 0;
+        private const int GeneralTabIndex = 0;
+        private const int OmenTabIndex = 1;
+        private const int TuningTabIndex = 2;
+        private const int DiagnosticsTabIndex = 3;
+        private const int MonitoringTabIndex = 4;
+        private const int OptimizerTabIndex = 5;
+        private const int MemoryTabIndex = 6;
+        private const int BloatwareTabIndex = 7;
+        private const int RgbTabIndex = 8;
+
+        private static readonly string[] TabIndexNames =
+        {
+            "General", "Omen", "Tuning", "Diagnostics", "Monitoring", "Optimizer", "Memory", "Bloatware", "Rgb"
+        };
+
+        private static string TabName(int index) =>
+            index >= 0 && index < TabIndexNames.Length ? TabIndexNames[index] : $"Tab{index}";
+
+        public int SelectedTabIndex
+        {
+            get => _selectedTabIndex;
+            set
+            {
+                if (_selectedTabIndex != value)
+                {
+                    // Per-tab switch cost (Pillar 2.1, docs/ROADMAP_v4.2.0.md): brackets the
+                    // synchronous cost of this setter (including any lazy ViewModel construction
+                    // it triggers) plus the render pass that follows it, by resuming at Render
+                    // priority - the standard WPF technique for "wait until pending layout/render
+                    // work is actually flushed" without needing per-view instrumentation. No-ops
+                    // cleanly in a headless test host, where Application.Current is null.
+                    var switchStopwatch = Stopwatch.StartNew();
+                    var tabName = TabName(value);
+
+                    _selectedTabIndex = value;
+                    OnPropertyChanged(nameof(SelectedTabIndex));
+                    UpdateLazyTabActivity(value);
+                    EnsureConflictMonitoringStartedForTab(value);
+
+                    var dispatcher = Application.Current?.Dispatcher;
+                    if (dispatcher != null)
+                    {
+                        dispatcher.BeginInvoke(DispatcherPriority.Render, new Action(() =>
+                        {
+                            switchStopwatch.Stop();
+                            StartupAndNavigationPerformanceTracker.RecordTabSwitch(tabName, switchStopwatch.Elapsed);
+                        }));
+                    }
+                }
+            }
+        }
+
+        private bool _showAdvancedControls = true;
+        public bool ShowAdvancedControls
+        {
+            get => _showAdvancedControls;
+            private set
+            {
+                if (_showAdvancedControls == value)
+                {
+                    return;
+                }
+
+                _showAdvancedControls = value;
+                OnPropertyChanged(nameof(ShowAdvancedControls));
+
+                if (!_showAdvancedControls && IsAdvancedTab(_selectedTabIndex))
+                {
+                    SelectedTabIndex = 0;
+                }
+            }
+        }
+
+        private SettingsViewModel? _settings;
+        public SettingsViewModel? Settings
+        {
+            get
+            {
+                if (_settings == null)
+                {
+                    // Create services required for SettingsViewModel
+                    var profileExportService = new ProfileExportService(_logging, _configService);
+                    var diagnosticsExportService = new DiagnosticExportService(
+                        _logging,
+                        _logging.LogDirectory,
+                        _resumeRecoveryDiagnostics,
+                        _hardwareMonitoringService,
+                        _fanService,
+                        _keyboardLightingService,
+                        () => _rgbManager,
+                        _ecOperationCoordinator,
+                        _performanceModeService,
+                        _hotkeyService,
+                        _omenKeyService,
+                        _wmiBios,
+                        ecAccess: _ecAccess,
+                        capabilitiesProvider: () => DetectedCapabilities,
+                        cpuThrottleReader: () => SystemControl?.ReadCpuThermStatus());
+                    
+                    _settings = new SettingsViewModel(_logging, _configService, _systemInfoService, 
+                        _fanCleaningService, _biosUpdateService, profileExportService, diagnosticsExportService,
+                        _wmiBios, _omenKeyService, _osdService, _hardwareMonitoringService, _pollingCoordinator,
+                        _powerAutomationService, _fanService, _resumeRecoveryDiagnostics, DetectedCapabilities);
+                    _settings.HotkeyFailureProvider = () => _hotkeyService.DescribeFailedHotkeys();
+
+                    // Navigate to Bloatware Manager tab when requested from Settings
+                    _settings.NavigateToBloatwareRequested += OnBloatwareNavigationRequested;
+                    
+                    // Subscribe to low overhead mode changes from Settings
+                    _settings.LowOverheadModeChanged += (s, enabled) =>
+                    {
+                        _monitoringLowOverhead = enabled;
+                        _pollingCoordinator?.SetLowOverheadMode(enabled);
+                        OnPropertyChanged(nameof(MonitoringLowOverheadMode));
+                        OnPropertyChanged(nameof(MonitoringGraphsVisible));
+                    };
+
+                    _settings.LiteModeChanged += (s, showAdvanced) =>
+                    {
+                        ShowAdvancedControls = showAdvanced;
+                    };
+                    
+                    // Subscribe to power state changes to update Settings status
+                    _powerAutomationService.PowerStateChanged += (s, e) =>
+                    {
+                        Application.Current?.Dispatcher?.BeginInvoke(() =>
+                        {
+                            _settings?.RefreshPowerStatus();
+                        });
+                    };
+                    
+                    OnPropertyChanged(nameof(Settings));
+                }
+                return _settings;
+            }
+        }
+
+        private GeneralViewModel? _general;
+        public GeneralViewModel? General
+        {
+            get
+            {
+                if (_general == null)
+                {
+                    _general = new GeneralViewModel(_fanService, _performanceModeService, _configService, _logging, _systemInfoService);
+                    // Keep FanControl lazy; wire it only if something else already loaded it.
+                    _general.SetFanControlViewModel(_fanControl);
+                    // Keep SystemControl lazy; wire it only if something else already loaded it.
+                    _general.SetSystemControlViewModel(_systemControl);
+                    // v3.7.0: Navigate to Custom tab when user clicks the Custom profile card
+                    _general.CustomTabNavigationRequested += (_, _) => SelectedTabIndex = OmenTabIndex;
+                    OnPropertyChanged(nameof(General));
+                }
+                return _general;
+            }
+        }
+
+        private SystemOptimizerViewModel? _systemOptimizer;
+        public SystemOptimizerViewModel? SystemOptimizer
+        {
+            get
+            {
+                if (_systemOptimizer == null)
+                {
+                    _systemOptimizer = new SystemOptimizerViewModel(_logging);
+                    OnPropertyChanged(nameof(SystemOptimizer));
+                }
+                return _systemOptimizer;
+            }
+        }
+
+        private MemoryOptimizerViewModel? _memoryOptimizer;
+        public MemoryOptimizerViewModel? MemoryOptimizer
+        {
+            get
+            {
+                if (_memoryOptimizer == null)
+                {
+                    _memoryOptimizer = new MemoryOptimizerViewModel(_logging, _configService, _notificationService);
+                    _memoryOptimizer.SetPageActive(_selectedTabIndex == MemoryTabIndex);
+                    OnPropertyChanged(nameof(MemoryOptimizer));
+                }
+                return _memoryOptimizer;
+            }
+        }
+        
+        private BloatwareManagerViewModel? _bloatwareManager;
+        public BloatwareManagerViewModel? BloatwareManager
+        {
+            get
+            {
+                if (_bloatwareManager == null)
+                {
+                    _bloatwareManager = new BloatwareManagerViewModel(_logging);
+                    OnPropertyChanged(nameof(BloatwareManager));
+                }
+                return _bloatwareManager;
+            }
+        }
+        
+        private GameLibraryViewModel? _gameLibrary;
+        public GameLibraryViewModel? GameLibrary
+        {
+            get
+            {
+                if (_gameLibrary == null)
+                {
+                    var libraryService = new GameLibraryService(_logging);
+                    _gameLibrary = new GameLibraryViewModel(_logging, libraryService, _gameProfileService);
+                    _gameLibrary.ProfileCreated += (_, e) => OpenGameProfileManager(e.Profile);
+                    _gameLibrary.ProfileEditRequested += (_, e) => OpenGameProfileManager(e.Profile);
+                    OnPropertyChanged(nameof(GameLibrary));
+                }
+                return _gameLibrary;
+            }
+        }
+        
+        private readonly AsyncRelayCommand _createRestorePointCommand;
+        private readonly AsyncRelayCommand _cleanupOmenHubCommand;
+        private readonly RelayCommand _openGameProfileManagerCommand;
+        private const int MaxUiLogLines = 200;
+        private readonly Queue<string> _logLines = new();
+        private readonly StringBuilder _logBufferBuilder = new();
+        private string _logBufferText = string.Empty;
+
+        private FanPreset? _selectedPreset;
+        private PerformanceMode? _selectedPerformanceMode;
+        private LightingProfile? _selectedLightingProfile;
+        private string _customPresetName = "Custom";
+        private bool _gamingModeActive;
+        private bool _logsCollapsed = true;
+        private MonitoringSample? _latestMonitoringSample;
+        private bool _monitoringLowOverhead;
+        private bool _monitoringInitialized;
+        private bool _restorePointInProgress;
+        private string _restorePointStatus = "No restore point created";
+        private bool _cleanupInProgress;
+        private string _cleanupStatus = "Status: Not checked";
+        private bool _cleanupRemoveStorePackage = true;
+        private bool _cleanupRemoveLegacyInstallers = true;
+        private bool _cleanupRemoveRegistry = true;
+        private bool _cleanupRemoveFiles = true;
+        private bool _cleanupRemoveServices = true;
+        private bool _cleanupKillProcesses = true;
+        private bool _cleanupPreserveFirewall = true;
+        private bool _cleanupDryRun;
+        private string _currentFanMode = "Auto";
+        private string _currentPerformanceMode = "Balanced";
+        private bool _isFanPerformanceLinked;
+
+        public ObservableCollection<FanPreset> FanPresets { get; } = new();
+        public ObservableCollection<FanCurvePoint> CustomFanCurve { get; } = new();
+        public ObservableCollection<PerformanceMode> PerformanceModes { get; } = new();
+        public ObservableCollection<LightingProfile> LightingProfiles { get; } = new();
+        public ObservableCollection<ServiceToggle> SystemToggles { get; } = new();
+        public ObservableCollection<string> RecentEvents { get; } = new();
+        public ObservableCollection<string> OmenCleanupSteps { get; } = new();
+        public ReadOnlyObservableCollection<GameProfile> GameProfiles => _gameProfileService.Profiles;
+        
+        public SystemInfo SystemInfo { get; private set; }
+        
+        /// <summary>
+        /// Device capabilities detected at startup.
+        /// </summary>
+        public Hardware.DeviceCapabilities? DetectedCapabilities { get; private set; }
+        
+        /// <summary>
+        /// The active fan control backend (for UI display).
+        /// </summary>
+        public string FanBackend { get; private set; } = "Detecting...";
+        
+        /// <summary>
+        /// The active EC access backend (PawnIO when direct EC access is available).
+        /// </summary>
+        public string EcBackend { get; private set; } = "None";
+        
+        /// <summary>
+        /// True if Secure Boot is enabled (legacy unsigned drivers are blocked).
+        /// </summary>
+        public bool SecureBootEnabled => DetectedCapabilities?.SecureBootEnabled ?? false;
+
+        /// <summary>
+        /// True when this machine isn't an HP OMEN/Victus system at all - OmenCore's hardware
+        /// backends were not built for this device and most features will be unavailable.
+        /// Distinct from <see cref="ShowUnverifiedModelBanner"/> (a real HP OMEN/Victus whose
+        /// specific SKU just hasn't been field-confirmed yet): previously a single banner's
+        /// visibility was gated only on this condition while its text also claimed to cover the
+        /// "unverified model" case, so a genuinely supported-but-unverified OMEN/Victus got no
+        /// banner at all despite the text implying it would.
+        /// </summary>
+        public bool ShowUnsupportedSystemBanner => !(SystemInfo?.IsHpGaming ?? false);
+
+        /// <summary>
+        /// True when this is a real HP OMEN/Victus system, but its exact model either isn't in
+        /// the capability database at all (falls back to generic defaults) or has a database
+        /// entry that hasn't been field-confirmed yet (<see cref="ModelCapabilities.UserVerified"/>
+        /// is false). Distinct from <see cref="ShowUnsupportedSystemBanner"/> - this system is
+        /// expected to work, some behavior is just inferred rather than confirmed.
+        /// </summary>
+        public bool ShowUnverifiedModelBanner =>
+            (SystemInfo?.IsHpGaming ?? false) &&
+            DetectedCapabilities != null &&
+            (!DetectedCapabilities.IsKnownModel || DetectedCapabilities.ModelConfig?.UserVerified == false);
+        
+        /// <summary>
+        /// Warning message for limited functionality.
+        /// </summary>
+        public string? CapabilityWarning { get; private set; }
+
+        /// <summary>
+        /// Monitoring diagnostics line indicating whether a model-specific CPU temperature override is active.
+        /// </summary>
+        public string CpuTempOverrideDiagnosticText => _wmiBiosMonitor?.IsModelCpuTempOverrideActive == true
+            ? $"Model override active (GitHub #78): worker CPU sensor prioritized for {_wmiBiosMonitor.ModelName}"
+            : "Model override inactive: standard WMI/ACPI CPU temperature path";
+
+        /// <summary>
+        /// Power automation service for AC/Battery profile switching.
+        /// Exposed for Settings UI binding.
+        /// </summary>
+        public PowerAutomationService PowerAutomation => _powerAutomationService;
+
+        public string CurrentFanMode
+        {
+            get => _currentFanMode;
+            set
+            {
+                if (_currentFanMode != value)
+                {
+                    _currentFanMode = value;
+                    OnPropertyChanged(nameof(CurrentFanMode));
+                    // Also raise change for ActiveCurvePresetName so tray tooltip stays in sync
+                    OnPropertyChanged(nameof(ActiveCurvePresetName));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Name of the currently active named fan curve preset (e.g. "Gaming Profile").
+        /// Shown as a tooltip on the Curve button in the Quick Access popup.
+        /// </summary>
+        public string? ActiveCurvePresetName => _fanService?.ActivePresetName;
+
+        /// <summary>True while a fan curve or hold is actively running (used by cadence wiring in App.xaml.cs).</summary>
+        public bool IsFanCurveActive => _fanService?.IsCurveOrHoldActive ?? false;
+
+        // Expose the FanService reference so App.xaml.cs cadence wiring can read IsCurveActive.
+        internal FanService? FanService => _fanService;
+
+        public string CurrentPerformanceMode
+        {
+            get => _currentPerformanceMode;
+            set
+            {
+                if (_currentPerformanceMode != value)
+                {
+                    _currentPerformanceMode = value;
+                    OnPropertyChanged(nameof(CurrentPerformanceMode));
+                }
+            }
+        }
+
+        public bool IsFanPerformanceLinked
+        {
+            get => _isFanPerformanceLinked;
+            private set
+            {
+                if (_isFanPerformanceLinked != value)
+                {
+                    _isFanPerformanceLinked = value;
+                    OnPropertyChanged(nameof(IsFanPerformanceLinked));
+                    OnPropertyChanged(nameof(FanPerformanceLinkStatus));
+                }
+            }
+        }
+
+        public string FanPerformanceLinkStatus => IsFanPerformanceLinked
+            ? "Linked: fan follows performance"
+            : "Decoupled: fan independent";
+
+        /// <summary>
+        /// Re-applies the Settings > Notifications toggles to the live NotificationService.
+        /// Needed because that service only reads AppConfig.Monitoring once, at construction —
+        /// without this, flipping a toggle had no effect until the app was restarted (GitHub #191).
+        /// </summary>
+        public void RefreshNotificationPreferences()
+        {
+            _notificationService.IsEnabled = _config.Monitoring.NotificationsEnabled;
+            _notificationService.ShowGameNotifications = _config.Monitoring.GameNotificationsEnabled;
+            _notificationService.ShowModeChangeNotifications = _config.Monitoring.ModeChangeNotificationsEnabled;
+            _notificationService.ShowTemperatureWarnings = _config.Monitoring.TemperatureWarningsEnabled;
+        }
+
+        public void RefreshLinkFanState()
+        {
+            var linked = _config.LinkFanToPerformanceMode;
+            _performanceModeService.LinkFanToPerformanceMode = linked;
+            IsFanPerformanceLinked = linked;
+            FanControl?.RefreshFanLinkState();
+            SystemControl?.RefreshFanLinkState();
+
+            if (_dashboard != null)
+            {
+                _dashboard.ModeLinkStatus = linked
+                    ? "Linked: fan follows performance"
+                    : "Decoupled: fan independent";
+            }
+        }
+        
+        // v2.7.0: GPU Power and Keyboard state for tray sync
+        private string _currentGpuPowerLevel = "Medium";
+        private int _currentKeyboardBrightness = 3;
+        
+        public string CurrentGpuPowerLevel
+        {
+            get => _currentGpuPowerLevel;
+            set
+            {
+                if (_currentGpuPowerLevel != value)
+                {
+                    _currentGpuPowerLevel = value;
+                    OnPropertyChanged(nameof(CurrentGpuPowerLevel));
+                }
+            }
+        }
+        
+        public int CurrentKeyboardBrightness
+        {
+            get => _currentKeyboardBrightness;
+            set
+            {
+                if (_currentKeyboardBrightness != value)
+                {
+                    _currentKeyboardBrightness = value;
+                    OnPropertyChanged(nameof(CurrentKeyboardBrightness));
+                }
+            }
+        }
+
+        public ReadOnlyObservableCollection<ThermalSample> ThermalSamples { get; }
+        public ReadOnlyObservableCollection<FanTelemetry> FanTelemetry { get; }
+        public ReadOnlyObservableCollection<MonitoringSample> MonitoringSamples { get; } = null!;
+        public MonitoringSample? LatestMonitoringSample
+        {
+            get => _latestMonitoringSample;
+            private set
+            {
+                var normalized = NormalizeMonitoringSample(value, _latestMonitoringSample);
+                if (_latestMonitoringSample == normalized) return;
+
+                var previous = _latestMonitoringSample;
+                var oldCpuSummary = BuildCpuSummary(previous);
+                var oldGpuSummary = BuildGpuSummary(previous);
+                var oldMemorySummary = BuildMemorySummary(previous);
+                var oldStorageSummary = BuildStorageSummary(previous);
+                var oldCpuClockSummary = BuildCpuClockSummary(previous);
+
+                _latestMonitoringSample = normalized;
+                
+                // v2.6.1: Push update to GeneralViewModel for enhanced General tab
+                _general?.UpdateFromMonitoringSample(normalized);
+
+                // GitHub #152: the Dashboard surface (including the sidebar's live temp chips) used
+                // to subscribe to the raw HardwareMonitoringService.SampleUpdated event, so it
+                // rendered un-normalized sensor output while these other surfaces rendered the
+                // normalized/stabilized sample below — producing visibly different temperatures for
+                // the same instant. Both now consume the same normalized sample. Uses the backing
+                // field, not the Dashboard property, so a dormant (never-opened) dashboard is not
+                // force-created just to receive telemetry.
+                _dashboard?.UpdateFromNormalizedSample(normalized);
+
+                // v3.7.0: Feed sample to Quiet safety monitor (no-op unless Quiet profile armed)
+                _quietSafetyMonitor.ProcessSample(normalized);
+                
+                // Notify only telemetry-bound properties whose rendered output changed.
+                OnPropertyChanged(nameof(LatestMonitoringSample));
+
+                var newCpuSummary = BuildCpuSummary(normalized);
+                if (!string.Equals(oldCpuSummary, newCpuSummary, StringComparison.Ordinal))
+                {
+                    OnPropertyChanged(nameof(CpuSummary));
+                }
+
+                var newGpuSummary = BuildGpuSummary(normalized);
+                if (!string.Equals(oldGpuSummary, newGpuSummary, StringComparison.Ordinal))
+                {
+                    OnPropertyChanged(nameof(GpuSummary));
+                }
+
+                var newMemorySummary = BuildMemorySummary(normalized);
+                if (!string.Equals(oldMemorySummary, newMemorySummary, StringComparison.Ordinal))
+                {
+                    OnPropertyChanged(nameof(MemorySummary));
+                }
+
+                var newStorageSummary = BuildStorageSummary(normalized);
+                if (!string.Equals(oldStorageSummary, newStorageSummary, StringComparison.Ordinal))
+                {
+                    OnPropertyChanged(nameof(StorageSummary));
+                }
+
+                var newCpuClockSummary = BuildCpuClockSummary(normalized);
+                if (!string.Equals(oldCpuClockSummary, newCpuClockSummary, StringComparison.Ordinal))
+                {
+                    OnPropertyChanged(nameof(CpuClockSummary));
+                }
+            }
+        }
+
+        private static MonitoringSample? NormalizeMonitoringSample(MonitoringSample? sample, MonitoringSample? previous)
+        {
+            if (sample == null)
+            {
+                return null;
+            }
+
+            // Work on an independent copy so the original sample (already dispatched to
+            // other subscribers) is not mutated by normalization (STEP-08 / REGRESSION_MATRIX T4).
+            var result = new MonitoringSample(sample);
+
+            result.CpuLoadPercent = SanitizeLoadPercent(result.CpuLoadPercent, previous?.CpuLoadPercent ?? 0);
+            result.GpuLoadPercent = SanitizeLoadPercent(result.GpuLoadPercent, previous?.GpuLoadPercent ?? 0);
+
+            bool cpuTempStateValid = result.CpuTemperatureState == TelemetryDataState.Valid ||
+                                     result.CpuTemperatureState == TelemetryDataState.Stale;
+            if (!cpuTempStateValid && previous?.CpuTemperatureC > 0)
+            {
+                result.CpuTemperatureC = previous.CpuTemperatureC;
+            }
+            result.CpuTemperatureC = SanitizeRange(result.CpuTemperatureC, previous?.CpuTemperatureC ?? 0, 0, 125);
+            result.CpuTemperatureC = StabilizeTemperatureSample(
+                result.CpuTemperatureC,
+                previous?.CpuTemperatureC ?? 0,
+                result.CpuTemperatureState,
+                previous?.CpuTemperatureState ?? TelemetryDataState.Unknown,
+                0,
+                125);
+
+            bool gpuTempStateValid = result.GpuTemperatureState == TelemetryDataState.Valid ||
+                                     result.GpuTemperatureState == TelemetryDataState.Stale ||
+                                     result.GpuTemperatureState == TelemetryDataState.Inactive;
+            if (!gpuTempStateValid && previous?.GpuTemperatureC > 0)
+            {
+                result.GpuTemperatureC = previous.GpuTemperatureC;
+            }
+            result.GpuTemperatureC = SanitizeRange(result.GpuTemperatureC, previous?.GpuTemperatureC ?? 0, 0, 125);
+            if (result.GpuTemperatureState != TelemetryDataState.Inactive)
+            {
+                result.GpuTemperatureC = StabilizeTemperatureSample(
+                    result.GpuTemperatureC,
+                    previous?.GpuTemperatureC ?? 0,
+                    result.GpuTemperatureState,
+                    previous?.GpuTemperatureState ?? TelemetryDataState.Unknown,
+                    0,
+                    125);
+            }
+
+            // When dGPU telemetry is marked inactive, avoid showing stale utilization/power/clock values.
+            if (result.GpuTemperatureState == TelemetryDataState.Inactive)
+            {
+                result.GpuLoadPercent = 0;
+                result.GpuPowerWatts = 0;
+                result.GpuClockMhz = 0;
+                result.GpuMemoryClockMhz = 0;
+            }
+
+            result.RamUsageGb = SanitizeRange(result.RamUsageGb, previous?.RamUsageGb ?? 0, 0, Math.Max(result.RamTotalGb, previous?.RamTotalGb ?? result.RamTotalGb));
+
+            return result;
+        }
+
+        private static string BuildCpuSummary(MonitoringSample? sample)
+        {
+            if (sample == null)
+            {
+                return "CPU telemetry unavailable";
+            }
+
+            return sample.CpuTemperatureState switch
+            {
+                TelemetryDataState.Unavailable => $"Unavailable • {sample.CpuLoadPercent:F0}% load",
+                TelemetryDataState.Stale => $"{(sample.CpuTemperatureC > 0 ? $"{sample.CpuTemperatureC:F0}°C (stale)" : "Stale")} • {sample.CpuLoadPercent:F0}% load",
+                TelemetryDataState.Invalid => $"Invalid • {sample.CpuLoadPercent:F0}% load",
+                _ => $"{(sample.CpuTemperatureC > 0 ? $"{sample.CpuTemperatureC:F0}°C" : "—°C")} • {sample.CpuLoadPercent:F0}% load"
+            };
+        }
+
+        private static string BuildGpuSummary(MonitoringSample? sample)
+        {
+            if (sample == null)
+            {
+                return "GPU telemetry unavailable";
+            }
+
+            return sample.GpuTemperatureState == TelemetryDataState.Inactive
+                ? $"dGPU idle • {sample.GpuLoadPercent:F0}% load{(sample.GpuVramUsageMb > 0 ? $" • {sample.GpuVramUsageMb:F0} MB VRAM" : string.Empty)}"
+                : $"{(sample.GpuTemperatureC > 0 ? $"{sample.GpuTemperatureC:F0}°C" : "—°C")} • {sample.GpuLoadPercent:F0}% load{(sample.GpuVramUsageMb > 0 ? $" • {sample.GpuVramUsageMb:F0} MB VRAM" : string.Empty)}";
+        }
+
+        private static string BuildMemorySummary(MonitoringSample? sample)
+            => sample == null ? "Memory telemetry unavailable" : $"{sample.RamUsageGb:F1} / {sample.RamTotalGb:F0} GB";
+
+        private static string BuildStorageSummary(MonitoringSample? sample)
+            => sample == null ? "Storage telemetry unavailable" : $"SSD {(sample.SsdTemperatureC > 0 ? $"{sample.SsdTemperatureC:F0}°C" : "—°C")} • {sample.DiskUsagePercent:F0}% active";
+
+        private static string BuildCpuClockSummary(MonitoringSample? sample)
+            => sample == null || sample.CpuCoreClocksMhz.Count == 0
+                ? "Per-core clocks unavailable"
+                : string.Join(", ", sample.CpuCoreClocksMhz.Select((c, i) => $"C{i + 1}:{c:F0}MHz"));
+
+        private static double SanitizeRange(double candidate, double fallback, double min, double max)
+        {
+            if (!double.IsFinite(candidate))
+            {
+                candidate = fallback;
+            }
+
+            if (!double.IsFinite(candidate))
+            {
+                candidate = min;
+            }
+
+            return Math.Max(min, Math.Min(max, candidate));
+        }
+
+        private static double StabilizeTemperatureSample(
+            double candidate,
+            double previous,
+            TelemetryDataState candidateState,
+            TelemetryDataState previousState,
+            double min,
+            double max)
+        {
+            if (previous <= 0 || !IsTemperatureStateUsable(previousState))
+            {
+                return candidate;
+            }
+
+            if (!IsTemperatureStateUsable(candidateState))
+            {
+                return previous;
+            }
+
+            // Brief one-sample zeros are common during provider handoffs; keep the last good value.
+            if (candidate <= TelemetryTransientZeroThresholdC)
+            {
+                return previous;
+            }
+
+            return Math.Clamp(candidate, min, max);
+        }
+
+        private static bool IsTemperatureStateUsable(TelemetryDataState state)
+        {
+            return state == TelemetryDataState.Valid || state == TelemetryDataState.Stale;
+        }
+
+        private static double SanitizeLoadPercent(double candidate, double fallback)
+        {
+            if (!double.IsFinite(candidate))
+            {
+                candidate = fallback;
+            }
+
+            if (!double.IsFinite(candidate))
+            {
+                return 0;
+            }
+
+            // Some providers can briefly produce tiny negative/overflow values during resume/sensor handoff.
+            if (candidate < 0)
+            {
+                return 0;
+            }
+
+            if (candidate > 100)
+            {
+                return 100;
+            }
+
+            return candidate;
+        }
+        public bool MonitoringLowOverheadMode
+        {
+            get => _monitoringLowOverhead;
+            set
+            {
+                if (_monitoringLowOverhead != value)
+                {
+                    _monitoringLowOverhead = value;
+                    _pollingCoordinator?.SetLowOverheadMode(value);
+                    OnPropertyChanged(nameof(MonitoringLowOverheadMode));
+                    OnPropertyChanged(nameof(MonitoringGraphsVisible));
+                    if (_monitoringInitialized)
+                    {
+                        PushEvent(value ? "Low overhead monitoring enabled" : "Full monitoring telemetry enabled");
+                    }
+                }
+            }
+        }
+        public bool MonitoringGraphsVisible => !MonitoringLowOverheadMode;
+
+        public void UpdateMonitoringVisibilityCadence(bool uiWindowActive, bool trayOnly)
+        {
+            var coordinator = _pollingCoordinator;
+            if (coordinator == null)
+            {
+                _logging.Warn("[PollingCoordinator] UpdateMonitoringVisibilityCadence called before coordinator initialization");
+                return;
+            }
+
+            coordinator.SetUiWindowActive(uiWindowActive);
+            coordinator.SetTrayOnlyMode(trayOnly);
+        }
+
+        public string CpuSummary => BuildCpuSummary(LatestMonitoringSample);
+        public string GpuSummary => BuildGpuSummary(LatestMonitoringSample);
+        public string MemorySummary => BuildMemorySummary(LatestMonitoringSample);
+        public string StorageSummary => BuildStorageSummary(LatestMonitoringSample);
+        public string CpuClockSummary => BuildCpuClockSummary(LatestMonitoringSample);
+
+        public FanPreset? SelectedPreset
+        {
+            get => _selectedPreset;
+            set
+            {
+                if (_selectedPreset != value)
+                {
+                    _selectedPreset = value;
+                    OnPropertyChanged(nameof(SelectedPreset));
+                    if (value != null)
+                    {
+                        LoadCurve(value);
+                    }
+                }
+            }
+        }
+
+        public PerformanceMode? SelectedPerformanceMode
+        {
+            get => _selectedPerformanceMode;
+            set
+            {
+                if (_selectedPerformanceMode != value)
+                {
+                    _selectedPerformanceMode = value;
+                    OnPropertyChanged(nameof(SelectedPerformanceMode));
+                }
+            }
+        }
+
+        public LightingProfile? SelectedLightingProfile
+        {
+            get => _selectedLightingProfile;
+            set
+            {
+                if (_selectedLightingProfile != value)
+                {
+                    _selectedLightingProfile = value;
+                    OnPropertyChanged(nameof(SelectedLightingProfile));
+                }
+            }
+        }
+
+        public string CustomPresetName
+        {
+            get => _customPresetName;
+            set
+            {
+                if (_customPresetName != value)
+                {
+                    _customPresetName = value;
+                    OnPropertyChanged(nameof(CustomPresetName));
+                }
+            }
+        }
+
+        public bool GamingModeActive
+        {
+            get => _gamingModeActive;
+            set
+            {
+                if (_gamingModeActive != value)
+                {
+                    _gamingModeActive = value;
+                    OnPropertyChanged(nameof(GamingModeActive));
+                    if (value)
+                    {
+                        _systemOptimizationService.ApplyGamingMode(SystemToggles);
+                    }
+                    else
+                    {
+                        _systemOptimizationService.RestoreDefaults();
+                    }
+                }
+            }
+        }
+
+        public string LogBuffer => _logBufferText;
+
+        public bool LogsCollapsed
+        {
+            get => _logsCollapsed;
+            set
+            {
+                if (_logsCollapsed != value)
+                {
+                    _logsCollapsed = value;
+                    OnPropertyChanged(nameof(LogsCollapsed));
+                    OnPropertyChanged(nameof(LogsToggleText));
+                }
+            }
+        }
+
+        public string LogsToggleText => LogsCollapsed ? "Show activity log" : "Hide activity log";
+
+        public bool RestorePointInProgress
+        {
+            get => _restorePointInProgress;
+            private set
+            {
+                if (_restorePointInProgress != value)
+                {
+                    _restorePointInProgress = value;
+                    OnPropertyChanged(nameof(RestorePointInProgress));
+                    _createRestorePointCommand?.RaiseCanExecuteChanged();
+                }
+            }
+        }
+
+        public string RestorePointStatus
+        {
+            get => _restorePointStatus;
+            private set
+            {
+                if (_restorePointStatus != value)
+                {
+                    _restorePointStatus = value;
+                    OnPropertyChanged(nameof(RestorePointStatus));
+                }
+            }
+        }
+
+        public bool CleanupInProgress
+        {
+            get => _cleanupInProgress;
+            private set
+            {
+                if (_cleanupInProgress != value)
+                {
+                    _cleanupInProgress = value;
+                    OnPropertyChanged(nameof(CleanupInProgress));
+                    _cleanupOmenHubCommand?.RaiseCanExecuteChanged();
+                }
+            }
+        }
+
+        public string CleanupStatus
+        {
+            get => _cleanupStatus;
+            private set
+            {
+                if (_cleanupStatus != value)
+                {
+                    _cleanupStatus = value;
+                    OnPropertyChanged(nameof(CleanupStatus));
+                }
+            }
+        }
+
+        public bool CleanupRemoveStorePackage
+        {
+            get => _cleanupRemoveStorePackage;
+            set
+            {
+                if (_cleanupRemoveStorePackage != value)
+                {
+                    _cleanupRemoveStorePackage = value;
+                    OnPropertyChanged(nameof(CleanupRemoveStorePackage));
+                }
+            }
+        }
+
+        public bool CleanupRemoveLegacyInstallers
+        {
+            get => _cleanupRemoveLegacyInstallers;
+            set
+            {
+                if (_cleanupRemoveLegacyInstallers != value)
+                {
+                    _cleanupRemoveLegacyInstallers = value;
+                    OnPropertyChanged(nameof(CleanupRemoveLegacyInstallers));
+                }
+            }
+        }
+
+        public bool CleanupRemoveRegistry
+        {
+            get => _cleanupRemoveRegistry;
+            set
+            {
+                if (_cleanupRemoveRegistry != value)
+                {
+                    _cleanupRemoveRegistry = value;
+                    OnPropertyChanged(nameof(CleanupRemoveRegistry));
+                }
+            }
+        }
+
+        public bool CleanupRemoveFiles
+        {
+            get => _cleanupRemoveFiles;
+            set
+            {
+                if (_cleanupRemoveFiles != value)
+                {
+                    _cleanupRemoveFiles = value;
+                    OnPropertyChanged(nameof(CleanupRemoveFiles));
+                }
+            }
+        }
+
+        public bool CleanupRemoveServices
+        {
+            get => _cleanupRemoveServices;
+            set
+            {
+                if (_cleanupRemoveServices != value)
+                {
+                    _cleanupRemoveServices = value;
+                    OnPropertyChanged(nameof(CleanupRemoveServices));
+                }
+            }
+        }
+
+        public bool CleanupKillProcesses
+        {
+            get => _cleanupKillProcesses;
+            set
+            {
+                if (_cleanupKillProcesses != value)
+                {
+                    _cleanupKillProcesses = value;
+                    OnPropertyChanged(nameof(CleanupKillProcesses));
+                }
+            }
+        }
+
+        public bool CleanupPreserveFirewall
+        {
+            get => _cleanupPreserveFirewall;
+            set
+            {
+                if (_cleanupPreserveFirewall != value)
+                {
+                    _cleanupPreserveFirewall = value;
+                    OnPropertyChanged(nameof(CleanupPreserveFirewall));
+                }
+            }
+        }
+
+        public bool CleanupDryRun
+        {
+            get => _cleanupDryRun;
+            set
+            {
+                if (_cleanupDryRun != value)
+                {
+                    _cleanupDryRun = value;
+                    OnPropertyChanged(nameof(CleanupDryRun));
+                }
+            }
+        }
+
+        public ICommand ApplyFanPresetCommand { get; }
+        public ICommand SaveCustomPresetCommand { get; }
+        public ICommand ApplyPerformanceModeCommand { get; }
+        public ICommand ApplyLightingProfileCommand { get; }
+        public ICommand ToggleAnimationsCommand { get; }
+        public ICommand ToggleLogsCommand { get; }
+        public ICommand GamingModeCommand { get; }
+        public ICommand RestoreDefaultsCommand { get; }
+        public ICommand SwitchGpuCommand { get; }
+        public ICommand ReloadConfigCommand { get; }
+        public ICommand OpenConfigFolderCommand { get; }
+        public ICommand OpenAboutCommand { get; }
+        public ICommand ToggleServiceCommand { get; }
+        public ICommand ToggleLowOverheadModeCommand { get; }
+        public ICommand CreateRestorePointCommand { get; }
+        public ICommand CleanupOmenHubCommand { get; }
+        public ICommand OpenGameProfileManagerCommand { get; }
+        public ICommand ExportConfigurationCommand { get; }
+        public ICommand ImportConfigurationCommand { get; }
+
+        // Diagnostics / reporting
+        public ICommand ReportModelCommand { get; }
+        public ICommand ExportTelemetryCommand { get; }
+
+        // Expose Fan Diagnostics VM
+        public FanDiagnosticsViewModel FanDiagnostics { get; private set; }
+
+        // Expose Keyboard Diagnostics VM
+        public KeyboardDiagnosticsViewModel KeyboardDiagnostics { get; private set; }
+
+        // Expose Temperature Source Diagnostics VM
+        public TemperatureSourceDiagnosticsViewModel TemperatureSourceDiagnostics { get; private set; }
+
+        // Update checking/installing — always-visible window chrome, so constructed eagerly (see UpdateViewModel).
+        public UpdateViewModel Update { get; }
+
+        // GPU power-limit / adapter power-override clamp — bound from DiagnosticsView's Power
+        // Adapter panel and touched from OS power-lifecycle handlers, so constructed eagerly
+        // rather than lazily like tab-scoped sub-VMs (see GpuClampViewModel).
+        public GpuClampViewModel GpuClamp { get; }
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        /// <param name="systemRestoreService">
+        /// Optional DI-injected instance (see App.xaml.cs ConfigureServices). Falls back to a
+        /// manually-constructed instance when omitted so every existing parameterless
+        /// `new MainViewModel()` call site (tests included) keeps working unchanged. First step
+        /// of incrementally moving MainViewModel off manual `new` construction of its ~40
+        /// service fields and onto the DI container — see ROADMAP_v4.0.0.md Phase B.
+        /// </param>
+        /// <param name="hubCleanupService">Same optional-DI-with-fallback pattern as <paramref name="systemRestoreService"/>.</param>
+        /// <param name="notificationService">Same optional-DI-with-fallback pattern as <paramref name="systemRestoreService"/>.</param>
+        /// <param name="systemInfoService">Same optional-DI-with-fallback pattern as <paramref name="systemRestoreService"/>.</param>
+        /// <param name="autoUpdateService">Same optional-DI-with-fallback pattern as <paramref name="systemRestoreService"/>.</param>
+        /// <param name="biosUpdateService">Same optional-DI-with-fallback pattern as <paramref name="systemRestoreService"/>.</param>
+        /// <param name="telemetryService">Same optional-DI-with-fallback pattern as <paramref name="systemRestoreService"/>.</param>
+        /// <param name="systemOptimizationService">Same optional-DI-with-fallback pattern as <paramref name="systemRestoreService"/>.</param>
+        /// <param name="gpuSwitchService">Same optional-DI-with-fallback pattern as <paramref name="systemRestoreService"/>.</param>
+        /// <param name="processMonitoringService">Same optional-DI-with-fallback pattern as <paramref name="systemRestoreService"/>.</param>
+        /// <param name="hotkeyService">Same optional-DI-with-fallback pattern as <paramref name="systemRestoreService"/>.</param>
+        /// <param name="omenKeyService">Same optional-DI-with-fallback pattern as <paramref name="systemRestoreService"/>.</param>
+        /// <param name="gameProfileService">
+        /// Same optional-DI-with-fallback pattern as <paramref name="systemRestoreService"/>, but
+        /// depends on <paramref name="processMonitoringService"/> — its DI factory resolves that
+        /// same singleton via the service provider rather than constructing a second instance.
+        /// </param>
+        public MainViewModel(
+            SystemRestoreService? systemRestoreService = null,
+            OmenGamingHubCleanupService? hubCleanupService = null,
+            NotificationService? notificationService = null,
+            SystemInfoService? systemInfoService = null,
+            AutoUpdateService? autoUpdateService = null,
+            BiosUpdateService? biosUpdateService = null,
+            TelemetryService? telemetryService = null,
+            SystemOptimizationService? systemOptimizationService = null,
+            GpuSwitchService? gpuSwitchService = null,
+            ProcessMonitoringService? processMonitoringService = null,
+            HotkeyService? hotkeyService = null,
+            OmenKeyService? omenKeyService = null,
+            GameProfileService? gameProfileService = null,
+            RuntimeEcOperationCoordinator? ecOperationCoordinator = null,
+            HpWmiBios? wmiBios = null,
+            OghServiceProxy? oghProxy = null,
+            ThermalMonitoringService? thermalMonitoringService = null,
+            ConflictDetectionService? conflictDetectionService = null,
+            HardwareBringup? hardwareBringup = null)
+        {
+            StartupTimeline.Mark("main_viewmodel_constructing");
+            _config = _configService.Load();
+            ShowAdvancedControls = !_config.LiteModeEnabled;
+            _trayActionDispatcher = new RuntimeCommandDispatcher(
+                contextName: "TrayAction",
+                logDebug: message => _logging.Debug(message),
+                logWarn: message => _logging.Warn(message),
+                logInfo: message => _logging.Info(message));
+            _hotkeyCoordinator = new RuntimeHotkeyCoordinator(
+                dispatcherProvider: () => Application.Current?.Dispatcher,
+                logDebug: message => _logging.Debug(message),
+                logWarn: message => _logging.Warn(message),
+                logInfo: message => _logging.Info(message),
+                onBeginInvokeScheduled: source => NoteDispatcherBeginInvoke(source));
+            _ecOperationCoordinator = ecOperationCoordinator ?? new RuntimeEcOperationCoordinator(_logging);
+            
+            // Hardware bring-up: NVAPI init, PawnIO MSR probe, WmiBiosMonitor construction,
+            // capability detection, EC access acquisition, fan controller construction.
+            // See Hardware/HardwareBringup.cs for the full sequence (extracted verbatim from
+            // this constructor — ROADMAP_v4.0.0.md Phase B, MainViewModel decomposition).
+            var bringup = hardwareBringup ?? new HardwareBringup(_logging, _config);
+
+            _nvapiService = bringup.NvapiService;
+            _wmiBiosMonitor = bringup.WmiBiosMonitor;
+            IHardwareMonitorBridge monitorBridge = bringup.WmiBiosMonitor;                DetectedCapabilities = bringup.Capabilities;
+                // If System Control was already created before detection finished, give it the
+                // capability reasons now (5.0.0, WP-44); the lazy getter passes them on creation.
+                _systemControl?.SetCapabilities(DetectedCapabilities);
+            var capabilities = bringup.Capabilities;
+            CapabilityWarning = bringup.CapabilityWarning;
+            _ecAccess = bringup.EcAccess;
+            var ec = bringup.EcAccess;
+            EcBackend = bringup.EcBackend;
+            var fanController = bringup.FanController;
+            FanBackend = bringup.FanBackend;
+
+            // Create HP WMI BIOS instance for GPU Power Boost control
+            _wmiBios = wmiBios ?? new HpWmiBios(_logging);
+
+            // Create OGH Proxy for systems where WMI BIOS commands don't work
+            // This is common on 2023+ OMEN laptops with Secure Boot enabled
+            _oghProxy = oghProxy ?? new OghServiceProxy(_logging);
+            
+            // Run OGH diagnostics on startup to help debug command issues
+            if (_oghProxy.Status.WmiAvailable && _config.EnableDiagnostics)
+            {
+                _logging.Info("Running OGH command diagnostics...");
+                _oghProxy.RunDiagnostics();
+            }
+
+            StartupTimeline.Mark("main_vm_ogh_diagnostics");
+            
+            // Create notification service early (before FanService which needs it)
+            _notificationService = notificationService ?? new NotificationService(_logging);
+
+            // Wire the Settings > Notifications toggles into the real service. These four
+            // AppConfig.Monitoring flags round-trip correctly through SettingsViewModel's
+            // load/save, but nothing ever applied them to NotificationService itself — every
+            // toggle in that Settings section (including "Temperature warnings") was a no-op,
+            // since NotificationService's properties only ever held their own hardcoded
+            // defaults (all true). See GitHub #191.
+            _notificationService.IsEnabled = _config.Monitoring.NotificationsEnabled;
+            _notificationService.ShowGameNotifications = _config.Monitoring.GameNotificationsEnabled;
+            _notificationService.ShowModeChangeNotifications = _config.Monitoring.ModeChangeNotificationsEnabled;
+            _notificationService.ShowTemperatureWarnings = _config.Monitoring.TemperatureWarningsEnabled;
+
+            // Thermal alert service — fires Windows toast notifications on CPU/GPU/SSD overtemperature
+            _thermalMonitoringService = thermalMonitoringService ?? new ThermalMonitoringService(_logging, _notificationService);
+            var ta = _config.ThermalAlerts;
+            _thermalMonitoringService.IsEnabled = ta.IsEnabled;
+            _thermalMonitoringService.CpuWarningThreshold = ta.CpuWarningC;
+            _thermalMonitoringService.CpuCriticalThreshold = ta.CpuCriticalC;
+            _thermalMonitoringService.GpuWarningThreshold = ta.GpuWarningC;
+            _thermalMonitoringService.GpuCriticalThreshold = ta.GpuCriticalC;
+            _thermalMonitoringService.SsdWarningThreshold = ta.SsdWarningC;
+            
+            _fanService = new FanService(fanController, new ThermalSensorProvider(monitorBridge), _logging, _notificationService, _config.MonitoringIntervalMs, _resumeRecoveryDiagnostics, _ecOperationCoordinator, capabilities);
+            _fanService.MaxAutoReturnOptions = () =>
+            {
+                var features = _config.Features;
+                return (Enum.TryParse<MaxAutoReturnMode>(features?.MaxAutoReturnMode, true, out var mode) ? mode : MaxAutoReturnMode.Off,
+                        features?.MaxAutoReturnTimerMinutes ?? 15);
+            };
+            _fanService.SetHysteresis(_config.FanHysteresis);
+            _fanService.ThermalProtectionEnabled = _config.FanHysteresis?.ThermalProtectionEnabled ?? true;
+            // Configure smoothing/transition settings for fan ramping
+            _fanService.SetSmoothingSettings(_config.FanTransition);
+
+            // HP's factory Performance-mode fan curve, for boards whose firmware Auto under-cools there (GitHub #189).
+            // Opt-in (Settings) and limited to Performance mode; the tables are 8D87's, so it is that board only for now.
+            if (capabilities.ModelConfig is { SupportsAutomaticFanCurve: true, ProductId: "8D87" } curveModel)
+            {
+                var wmiForIr = _wmiBios;
+                if (wmiForIr?.IsAvailable == true)
+                {
+                    var curveController = new AutomaticFanCurveController(
+                        FactoryFanCurve.Performance8D87(), FanMappingTable.Captured8D87(), curveModel.MaxFanLevel ?? 60,
+                        _fanService.ApplyAutomaticCurveLevels, _fanService.ReleaseAutomaticCurveHold,
+                        () => wmiForIr.GetIrSensorTemperature(), message => _logging.Warn(message));
+                    _fanService.SetAutomaticFanCurve(curveController, () =>
+                        _configService.Config.Features?.AutomaticFanCurveEnabled == true &&
+                        string.Equals(_performanceModeService?.GetCurrentMode(), "Performance", StringComparison.OrdinalIgnoreCase));
+                    _logging.Info("Automatic factory fan curve available for this board (off unless enabled in Settings).");
+                }
+            }
+            ThermalSamples = _fanService.ThermalSamples;
+            FanTelemetry = _fanService.FanTelemetry;
+            ((System.Collections.Specialized.INotifyCollectionChanged)FanTelemetry).CollectionChanged += (_, _) => OnPropertyChanged(nameof(RpmReadbackLabel));
+            var powerPlanService = new PowerPlanService(_logging);
+            
+            // Hardware watchdog — emergency fan-to-100% if temperature monitoring freezes
+            _watchdogService = new HardwareWatchdogService(_logging, _fanService, _resumeRecoveryDiagnostics);
+
+            // Fan verification service (closed-loop verification)
+            _fanVerificationService = new FanVerificationService(_wmiBios, _fanService, _logging);
+            FanDiagnostics = new FanDiagnosticsViewModel(_fanVerificationService, _fanService, _logging, _configService);
+            TemperatureSourceDiagnostics = new TemperatureSourceDiagnosticsViewModel(_wmiBiosMonitor, _logging);
+            
+            // Power limit controller (EC-based CPU/GPU power control)
+            PowerLimitController? powerLimitController = null;
+            if (ec != null && ec.IsAvailable)
+            {
+                try
+                {
+                    powerLimitController = new PowerLimitController(ec, useSimplifiedMode: true);
+                    _logging.Info("✓ Power limit controller initialized (simplified mode)");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"Power limit controller unavailable: {ex.Message}");
+                }
+            }
+            else
+            {
+                _logging.Info("Power limit controller skipped (EC not available)");
+            }
+            
+            // Enable experimental EC keyboard writes if user has opted in
+            if (_config.ExperimentalEcKeyboardEnabled)
+            {
+                Hardware.PawnIOEcAccess.EnableExperimentalKeyboardWrites = true;
+                _logging.Info("⚠️ Experimental EC keyboard writes ENABLED (user opted in)");
+            }
+            
+            _performanceModeService = new PerformanceModeService(fanController, powerPlanService, powerLimitController, _logging,
+                modelCapabilities: capabilities.ModelConfig,
+                ecOperationCoordinator: _ecOperationCoordinator)
+            {
+                LinkFanToPerformanceMode = _config.LinkFanToPerformanceMode
+            };
+            IsFanPerformanceLinked = _config.LinkFanToPerformanceMode;
+            
+            // Initialize SystemInfoService before KeyboardLightingService so the KB service
+            // receives a non-null reference and its DetectModelConfig() gets populated data.
+            _systemInfoService = systemInfoService ?? new SystemInfoService(_logging);
+            SystemInfo = _systemInfoService.GetSystemInfo();
+            StartupTimeline.Mark("main_vm_system_info");
+            _logging.SetDefaultTelemetryContext(SystemInfo.Model, SystemInfo.OsVersion);
+
+            _keyboardLightingService = new KeyboardLightingService(_logging, ec, _wmiBios, _configService, _systemInfoService, _ecOperationCoordinator);
+            // Created above, before this service exists. Without this the guided RGB check always skips.
+            FanDiagnostics.AttachKeyboardLightingService(_keyboardLightingService);
+            _systemOptimizationService = systemOptimizationService ?? new SystemOptimizationService(_logging);
+            _gpuSwitchService = gpuSwitchService ?? new GpuSwitchService(_logging, _wmiBios);
+            
+            // Keyboard diagnostics (must be after _keyboardLightingService is created)
+            KeyboardDiagnostics = new KeyboardDiagnosticsViewModel(_corsairDeviceService, _logitechDeviceService, _keyboardLightingService, _razerService, _logging, _wmiBios);
+
+            // NVAPI already initialized earlier for self-sustaining monitoring
+            // _nvapiService is ready for GPU OC use by SystemControlViewModel
+            
+            // Initialize AMD GPU service (ADL2) for AMD GPU overclocking
+            try
+            {
+                _amdGpuService = new AmdGpuService(_logging);
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var success = await _amdGpuService.InitializeAsync();
+                        if (!success)
+                        {
+                            _amdGpuService = null;
+                            _logging.Info("AMD GPU service: No AMD discrete GPU found or ADL not available");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _amdGpuService = null;
+                        _logging.Warn($"AMD GPU service async init failed: {ex.Message}");
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"AMD GPU service initialization failed: {ex.Message}");
+                _amdGpuService = null;
+            }
+            
+            // Auto-detect CPU vendor (Intel/AMD) and create appropriate undervolt provider
+            var undervoltProvider = CpuUndervoltProviderFactory.Create(out string undervoltBackend);
+            _logging.Info($"CPU undervolt provider: {undervoltBackend}");
+            // Owned here (constructed + started + disposed) and shared into SystemControlViewModel
+            // via the SystemControl property below — that's the ViewModel that actually exposes
+            // undervolt UI/commands today; MainViewModel used to have its own parallel Undervolt
+            // tab wiring (ApplyUndervoltCommand, RequestedCoreOffset, etc.) but that UI
+            // (Views/SystemControlView.xaml) was superseded by TuningView.xaml and never wired
+            // into the visual tree — removed as dead code rather than left to bit-rot.
+            _undervoltService = new UndervoltService(undervoltProvider, _logging, _config.Undervolt?.ProbeIntervalMs ?? 4000);
+            StartupTimeline.Mark("main_vm_undervolt_service");
+            _hardwareMonitoringService = new HardwareMonitoringService(monitorBridge, _logging, _config.Monitoring ?? new MonitoringPreferences(), _resumeRecoveryDiagnostics);
+            StartupTimeline.Mark("main_vm_monitoring_service");
+            MonitoringSamples = _hardwareMonitoringService.Samples;
+            _hardwareMonitoringService.SampleUpdated += HardwareMonitoringServiceOnSampleUpdated;
+            _hardwareMonitoringService.HealthStatusChanged += HardwareMonitoringServiceOnHealthStatusChanged;
+            _monitoringLowOverhead = _config.Monitoring?.LowOverheadMode ?? false;
+            _pollingCoordinator = new RuntimePollingCoordinator(_hardwareMonitoringService, _logging);
+            _pollingCoordinator.SetLowOverheadMode(_monitoringLowOverhead);
+            
+            // Enable WMI BIOS fallback for temperature freeze recovery (v2.7.0)
+            _hardwareMonitoringService.SetWmiBiosService(_wmiBios);
+            
+            _systemRestoreService = systemRestoreService ?? new SystemRestoreService(_logging);
+            _hubCleanupService = hubCleanupService ?? new OmenGamingHubCleanupService(_logging);
+            Update = new UpdateViewModel(_logging, _configService, _config, autoUpdateService);
+            _processMonitoringService = processMonitoringService ?? new ProcessMonitoringService(_logging);
+            _telemetryService = telemetryService ?? new TelemetryService(_logging, _configService);
+            _gameProfileService = gameProfileService ?? new GameProfileService(_logging, _processMonitoringService, _configService);
+            StartupTimeline.Mark("main_vm_game_profiles");
+            _fanCleaningService = new FanCleaningService(_logging, ec, _systemInfoService, _wmiBios, _oghProxy, _ecOperationCoordinator);
+            _biosUpdateService = biosUpdateService ?? new BiosUpdateService(_logging);
+            _hotkeyService = hotkeyService ?? new HotkeyService(_logging);
+            // _notificationService created earlier (before FanService)
+            _powerAutomationService = new PowerAutomationService(_logging, _fanService, _performanceModeService, _configService, _gpuSwitchService);
+            StartupTimeline.Mark("main_vm_power_automation");
+            GpuClamp = new GpuClampViewModel(_logging, _configService, _config, _wmiBios, _undervoltService, _notificationService, _powerAutomationService, _nvapiService, DetectedCapabilities?.ModelConfig?.ProductId);
+            StartupTimeline.Mark("main_vm_gpu_clamp");
+            _automationService = new AutomationService(
+                _logging,
+                _configService,
+                _fanService,
+                _processMonitoringService,
+                _fanService.ThermalProvider,
+                _nvapiService,
+                _undervoltService,
+                _performanceModeService);
+            _omenKeyService = omenKeyService ?? new OmenKeyService(_logging, _configService);
+
+            // Subscribe to suspend/resume early so protection works even if Settings is never opened.
+            _powerAutomationService.SystemSuspending += OnSystemSuspending;
+            _powerAutomationService.SystemResuming += OnSystemResuming;
+
+            // Initialize OSD service (will only activate if enabled in settings)
+            // Pass ThermalProvider from FanService for temperature data
+            _osdService = new OsdService(_configService, _logging, _fanService?.ThermalProvider, _fanService);
+            StartupTimeline.Mark("main_vm_osd_service");
+            _osdService.VisibilityChanged += (_, visible) =>
+            {
+                _pollingCoordinator?.SetOverlayRealtimeMode(visible);
+            };
+            _pollingCoordinator?.SetOverlayRealtimeMode(false);
+            
+            // Initialize conflict detection service for detecting conflicting software
+            _conflictDetectionService = conflictDetectionService ?? new ConflictDetectionService(_logging);
+            StartupTimeline.Mark("main_vm_conflict_detection");
+            
+            // Wire up Afterburner coexistence — WmiBiosMonitor reads GPU data from
+            // Afterburner shared memory instead of polling NVAPI (eliminates contention)
+            if (_wmiBiosMonitor != null)
+            {
+                _wmiBiosMonitor.SetAfterburnerCoexistence(_conflictDetectionService);
+            }
+            
+            _conflictDetectionService.OnConflictsDetected += (conflicts) =>
+            {
+                if (conflicts.Count > 0)
+                {
+                    // The monitor rescans every minute; say it once per change, not once per scan.
+                    var summary = _conflictDetectionService.GetConflictSummary();
+                    if (summary != _lastLoggedConflictSummary)
+                    {
+                        _lastLoggedConflictSummary = summary;
+                        _logging.Warn($"Detected {conflicts.Count} conflicting application(s): {summary}");
+                    }
+                }
+            };
+            _logging.Info("Conflict detection monitor deferred until Monitoring/OMEN/Tuning/Optimizer is opened");
+
+            // Wire up game profile notifications
+            _gameProfileService.ProfileApplyRequested += OnGameProfileApplyRequested;
+            
+            // Wire up hotkey events
+            _hotkeyService.ToggleFanModeRequested += OnHotkeyToggleFanMode;
+            _hotkeyService.ToggleMaxFanRequested += OnHotkeyToggleMaxFan;
+            _hotkeyService.TogglePerformanceModeRequested += OnHotkeyTogglePerformanceMode;
+            _hotkeyService.TogglePerformanceProfileRequested += OnHotkeyTogglePerformanceProfile;
+            _hotkeyService.ToggleBoostModeRequested += OnHotkeyToggleBoostMode;
+            _hotkeyService.ToggleQuietModeRequested += OnHotkeyToggleQuietMode;
+            _hotkeyService.ShowWindowRequested += OnHotkeyShowWindow;
+            _hotkeyService.OpenDashboardRequested += OnHotkeyOpenDashboard;
+            _hotkeyService.ToggleWindowRequested += OnHotkeyToggleWindow;
+            
+            // Wire up OMEN key events
+            _omenKeyService.ToggleOmenCoreRequested += OnOmenKeyToggleWindow;
+            _omenKeyService.CyclePerformanceRequested += OnHotkeyTogglePerformanceMode;
+            _omenKeyService.CycleFanModeRequested += OnHotkeyToggleFanMode;
+            _omenKeyService.ToggleMaxCoolingRequested += OnOmenKeyToggleMaxCooling;
+            _omenKeyService.ShowQuickPopupRequested += OnOmenKeyShowQuickPopup;
+            _omenKeyService.ToggleOsdRequested += (_, _) => _osdService?.Toggle();
+            
+            // Subscribe to service events for UI synchronization (e.g., power automation changes)
+            _fanService!.PresetApplied += OnFanPresetApplied;
+            _performanceModeService!.ModeApplied += OnPerformanceModeApplied;
+
+            // Per-mode memory (5.0.0, WP-43): a mode now owns the fan, GPU boost, refresh-rate,
+            // lighting and charge-limit choices made while it was active. Wired here, after the
+            // hardware services exist and before any mode is applied, so startup restore gets the
+            // same treatment as a manual switch.
+            _performanceModeService.EffectApplier = new OmenCoreApp.Services.PerformanceModeEffectApplier(
+                _logging,
+                _fanService,
+                new OmenCore.Services.DisplayService(_logging),
+                _wmiBios,
+                name => FanPresets.FirstOrDefault(p =>
+                    p.Name.Equals(name, StringComparison.OrdinalIgnoreCase)),
+                name => _ = ApplyNamedLightingProfileAsync(name),
+                () => SelectedLightingProfile?.Name);
+
+            // v3.7.0: Wire QuietSafetyMonitor events
+            _quietSafetyMonitor.SafetyOverrideActivated += OnQuietSafetyOverrideActivated;
+            _quietSafetyMonitor.SafetyOverrideCleared += OnQuietSafetyOverrideCleared;
+
+            // Initialize sub-ViewModels that don't depend on async services
+            // InitializeSubViewModels(); // Removed in favor of lazy loading
+
+            ApplyFanPresetCommand = new RelayCommand(_ =>
+            {
+                if (FanControl?.SelectedPreset != null)
+                    FanControl.SelectedPreset = FanControl.SelectedPreset; // Trigger setter to apply
+            }, _ => FanControl?.SelectedPreset != null);
+            SaveCustomPresetCommand = new RelayCommand(_ => SaveCustomPreset());
+            ApplyPerformanceModeCommand = new RelayCommand(_ => 
+            {
+                if (SystemControl?.SelectedPerformanceMode != null)
+                    SystemControl.ApplyPerformanceModeCommand?.Execute(null);
+            }, _ => SystemControl?.SelectedPerformanceMode != null);
+            ApplyLightingProfileCommand = new AsyncRelayCommand(_ => ApplyLightingProfile(), _ => SelectedLightingProfile != null);
+            ToggleAnimationsCommand = new RelayCommand(param => _systemOptimizationService.ApplyWindowsAnimations(param as string == "Enable"));
+            ToggleLogsCommand = new RelayCommand(_ => LogsCollapsed = !LogsCollapsed);
+            GamingModeCommand = new RelayCommand(_ => GamingModeActive = !GamingModeActive);
+            RestoreDefaultsCommand = new RelayCommand(_ => RestoreDefaults());
+            SwitchGpuCommand = new RelayCommand(mode =>
+            {
+                if (mode is GpuSwitchMode gpuMode)
+                {
+                    _gpuSwitchService.Switch(gpuMode);
+                }
+            });
+            ReloadConfigCommand = new RelayCommand(_ => ReloadConfiguration());
+            OpenConfigFolderCommand = new RelayCommand(_ => OpenConfigFolder());
+            OpenAboutCommand = new RelayCommand(_ => ShowAbout());
+            ToggleServiceCommand = new RelayCommand(param =>
+            {
+                if (param is ServiceToggle toggle)
+                {
+                    _systemOptimizationService.ApplyToggle(toggle, toggle.EnabledByDefault);
+                }
+            });
+            ToggleLowOverheadModeCommand = new RelayCommand(_ => MonitoringLowOverheadMode = !MonitoringLowOverheadMode);
+            _createRestorePointCommand = new AsyncRelayCommand(_ => CreateRestorePointAsync(), _ => !RestorePointInProgress);
+            CreateRestorePointCommand = _createRestorePointCommand;
+            _cleanupOmenHubCommand = new AsyncRelayCommand(_ => RunOmenCleanupAsync(), _ => !CleanupInProgress);
+            CleanupOmenHubCommand = _cleanupOmenHubCommand;
+            _openGameProfileManagerCommand = new RelayCommand(_ => OpenGameProfileManager());
+            OpenGameProfileManagerCommand = _openGameProfileManagerCommand;
+            ExportConfigurationCommand = new AsyncRelayCommand(_ => ExportConfigurationAsync());
+            ImportConfigurationCommand = new AsyncRelayCommand(_ => ImportConfigurationAsync());
+
+            // Diagnostics / reporting
+            ReportModelCommand = new AsyncRelayCommand(async _ => await ReportModelAsync());
+            ExportTelemetryCommand = new AsyncRelayCommand(async _ => await ExportTelemetryAsync());
+
+            _logging.LogEmitted += HandleLogLine;
+
+            HydrateCollections();
+            _fanService.Start();
+            _undervoltService.Start();
+            _ = _undervoltService.RefreshAsync();
+            _hardwareMonitoringService.Start();
+            _watchdogService.Start();
+            OnPropertyChanged(nameof(MonitoringLowOverheadMode));
+            OnPropertyChanged(nameof(MonitoringGraphsVisible));
+            _monitoringInitialized = true;
+            
+            // Restore saved settings (GPU Power Boost, TCC Offset, Fan Preset) on startup
+            _ = RestoreSettingsOnStartupAsync();
+
+            _automationService.Start();
+            
+            // Initialize game profile system
+            _ = InitializeGameProfilesAsync();
+        }
+
+        private void OnSystemSuspending(object? sender, EventArgs e)
+        {
+            _resumeRecoveryDiagnostics.BeginSuspend();
+            _watchdogService?.HandleSystemSuspend();
+            _hardwareMonitoringService?.Pause();
+            _fanService?.HandleSystemSuspend();
+        }
+
+        private void OnSystemResuming(object? sender, EventArgs e)
+        {
+            _resumeRecoveryDiagnostics.BeginResume();
+            var resumeCycleId = _resumeRecoveryDiagnostics.CurrentCycleId;
+            _watchdogService?.HandleSystemResume();
+            _hardwareMonitoringService?.Resume();
+            _fanService?.HandleSystemResume();
+            _ = Task.Run(() => PostResumeSelfCheckAsync(resumeCycleId));
+
+            // The SMU limits do not survive a suspend, and the adapter may not be the one that went
+            // to sleep. Both are reasons to look again rather than assume the state held.
+            _ = GpuClamp.RunAutomaticClampLiftAsync("resume");
+        }
+
+        private async Task PostResumeSelfCheckAsync(int resumeCycleId)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(15));
+
+            try
+            {
+                if (_resumeRecoveryDiagnostics.CurrentCycleId != resumeCycleId)
+                {
+                    return;
+                }
+
+                var latestSample = _hardwareMonitoringService?.Samples.LastOrDefault();
+                if (latestSample == null)
+                {
+                    _resumeRecoveryDiagnostics.Attention("Post-resume self-check could not confirm telemetry recovery because no fresh monitoring sample was available.");
+                    return;
+                }
+
+                bool IsTelemetryHealthy(MonitoringSample sample, out double sampleAgeSeconds)
+                {
+                    sampleAgeSeconds = (DateTime.Now - sample.Timestamp).TotalSeconds;
+                    var status = _hardwareMonitoringService?.HealthStatus ?? MonitoringHealthStatus.Unknown;
+                    return sampleAgeSeconds <= 20
+                        && status != MonitoringHealthStatus.Stale
+                        && status != MonitoringHealthStatus.Unknown;
+                }
+
+                bool IsFanTelemetryTrustworthy(MonitoringSample sample)
+                {
+                    return sample.Fan1RpmState == TelemetryDataState.Valid || sample.Fan2RpmState == TelemetryDataState.Valid;
+                }
+
+                bool IsFansPinnedUnexpectedly(MonitoringSample sample, string activeFanState)
+                {
+                    if (!IsFanTelemetryTrustworthy(sample))
+                    {
+                        return false;
+                    }
+
+                    var hottestComponent = Math.Max(sample.CpuTemperatureC, sample.GpuTemperatureC);
+                    var peakFanRpm = Math.Max(sample.Fan1Rpm, sample.Fan2Rpm);
+                    var activeFanMode = _fanService?.GetCurrentFanMode();
+                    var expectedHighFanMode = FanModeNameResolver.IsMaxAlias(activeFanMode)
+                        || FanModeNameResolver.IsPerformanceAlias(activeFanMode)
+                        || FanModeNameResolver.IsMaxAlias(activeFanState)
+                        || FanModeNameResolver.IsPerformanceAlias(activeFanState)
+                        || (_fanService?.IsCurveActive ?? false)
+                        || (_fanService?.IsThermalProtectionActive ?? false);
+
+                    return peakFanRpm >= 4500
+                        && hottestComponent < 65
+                        && sample.CpuLoadPercent < 25
+                        && sample.GpuLoadPercent < 35
+                        && !expectedHighFanMode;
+                }
+
+                var activeFanState = _fanService?.FanControlStateDescription
+                    ?? _fanService?.ActivePresetName
+                    ?? _fanService?.GetCurrentFanMode()
+                    ?? "unknown";
+                var telemetryHealthy = IsTelemetryHealthy(latestSample, out var sampleAgeSeconds);
+                var fansPinnedUnexpectedly = IsFansPinnedUnexpectedly(latestSample, activeFanState);
+
+                if (fansPinnedUnexpectedly)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5));
+
+                    if (_resumeRecoveryDiagnostics.CurrentCycleId != resumeCycleId)
+                    {
+                        return;
+                    }
+
+                    latestSample = _hardwareMonitoringService?.Samples.LastOrDefault() ?? latestSample;
+                    activeFanState = _fanService?.FanControlStateDescription
+                        ?? _fanService?.ActivePresetName
+                        ?? _fanService?.GetCurrentFanMode()
+                        ?? activeFanState;
+                    telemetryHealthy = IsTelemetryHealthy(latestSample, out sampleAgeSeconds);
+                    fansPinnedUnexpectedly = IsFansPinnedUnexpectedly(latestSample, activeFanState);
+                }
+
+                var hottestComponent = Math.Max(latestSample.CpuTemperatureC, latestSample.GpuTemperatureC);
+                var peakFanRpm = Math.Max(latestSample.Fan1Rpm, latestSample.Fan2Rpm);
+
+                if (telemetryHealthy && !fansPinnedUnexpectedly)
+                {
+                    _resumeRecoveryDiagnostics.Complete($"Post-resume self-check passed. Monitoring recovered in {sampleAgeSeconds:F0}s and fan state looks normal ({activeFanState}, peak fan {peakFanRpm} RPM).");
+                }
+                else
+                {
+                    var issues = new StringBuilder();
+                    if (!telemetryHealthy)
+                    {
+                        issues.Append($"Telemetry is not fully healthy yet (sample age {sampleAgeSeconds:F0}s, monitoring state {_hardwareMonitoringService?.HealthStatus}). ");
+                    }
+
+                    if (fansPinnedUnexpectedly)
+                    {
+                        issues.Append($"Fans still look elevated for the current thermal load ({peakFanRpm} RPM at {hottestComponent:F0}C while fan state is {activeFanState}).");
+                    }
+
+                    _resumeRecoveryDiagnostics.Attention($"Post-resume self-check flagged follow-up: {issues.ToString().Trim()}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _resumeRecoveryDiagnostics.Attention($"Post-resume self-check failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Restore saved settings (GPU Power Boost, fan preset) on startup.
+        /// Runs after hardware initialization with retry logic for WMI readiness.
+        /// </summary>
+        private async Task RestoreSettingsOnStartupAsync()
+        {
+            try
+            {
+                // Brief delay to let hardware stabilize after boot
+                await Task.Delay(2000);
+
+                // The adapter clamp, if it has been turned on. Deliberately first: the dGPU is at
+                // its most reliably parked right after boot, before anything has had a reason to
+                // wake it, and that is the one window where the GPU half can act on its own. Not
+                // awaited - a WMI call that hangs must not take the rest of the startup restore
+                // with it.
+                _ = GpuClamp.RunAutomaticClampLiftAsync("startup");
+
+                var startupPerformanceRestoreEnabled = ShouldRunStartupHardwareRestore(StartupRestoreCategory.Performance);
+                var startupFanRestoreEnabled = ShouldRunStartupHardwareRestore(StartupRestoreCategory.Fans);
+                
+                // Restore GPU Power Boost level
+                var savedGpuPb = _config.LastGpuPowerBoostLevel;
+                if (!string.IsNullOrEmpty(savedGpuPb) && _wmiBios != null)
+                {
+                    if (!startupPerformanceRestoreEnabled)
+                    {
+                        _logging.Warn("Startup performance restore is disabled - skipping automatic GPU Power Boost reapply");
+                    }
+                    else
+                    {
+                    for (int attempt = 1; attempt <= 3; attempt++)
+                    {
+                        try
+                        {
+                            var level = savedGpuPb switch
+                            {
+                                "Minimum" => HpWmiBios.GpuPowerLevel.Minimum,
+                                "Medium" => HpWmiBios.GpuPowerLevel.Medium,
+                                "Maximum" => HpWmiBios.GpuPowerLevel.Maximum,
+                                "Extended" => HpWmiBios.GpuPowerLevel.Extended3,
+                                _ => HpWmiBios.GpuPowerLevel.Medium
+                            };
+                            
+                            if (_wmiBios.SetGpuPower(level))
+                            {
+                                _logging.Info($"✓ GPU Power Boost restored on startup: {savedGpuPb}");
+                                break;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logging.Warn($"GPU Power Boost restore attempt {attempt}/3 failed: {ex.Message}");
+                            if (attempt < 3) await Task.Delay(1500);
+                        }
+                    }
+                    }
+                }
+                
+                // Restore fan preset only when the fan category is explicitly enabled.
+                var savedFanPreset = _config.LastFanPresetName;
+                var requestedFanPreset = savedFanPreset;
+                var savedModeIsMax = _config.FanPresets?.Any(p => p.Name.Equals(savedFanPreset, StringComparison.OrdinalIgnoreCase) && p.Mode == FanMode.Max) == true;
+                savedFanPreset = StartupRestorePolicy.ResolveStartupFanName(_config, savedFanPreset, savedModeIsMax);
+                if (!string.Equals(requestedFanPreset, savedFanPreset, StringComparison.OrdinalIgnoreCase))
+                    _logging.Info("Saved Fan Max requires explicit startup opt-in; Auto is selected when fan restore is enabled. Enable Restore saved Fan Max in Settings to opt in.");
+                if (!string.IsNullOrEmpty(savedFanPreset) && _fanService != null)
+                {
+                    if (!startupFanRestoreEnabled)
+                    {
+                        _logging.Warn("Startup fan restore is disabled - skipping automatic fan preset reapply");
+                    }
+                    else
+                    {
+                    try
+                    {
+                        string ResolveConfirmedFanModeLabel(string requested)
+                        {
+                            return _fanService.ActivePresetName
+                                ?? _fanService.GetCurrentFanMode()
+                                ?? requested;
+                        }
+
+                        var preset = ResolveStartupFanPreset(savedFanPreset);
+                        
+                        if (preset != null)
+                        {
+                            var applied = _fanService.ApplyPreset(preset, immediate: preset.Curve?.Count > 0);
+                            var confirmedMode = ResolveConfirmedFanModeLabel(savedFanPreset);
+                            _logging.Info($"✓ Fan preset restore {(applied ? "applied" : "failed")}: requested={savedFanPreset}, confirmed={confirmedMode} ({preset.Curve?.Count ?? 0} curve points)");
+                            
+                            // Sync UI with restored preset
+                            InvokeOnUi(() =>
+                            {
+                                FanControl?.SelectPresetByNameNoApply(savedFanPreset);
+                                CurrentFanMode = confirmedMode;
+                                if (_dashboard != null) _dashboard.CurrentFanMode = confirmedMode;
+                                _general?.SyncRuntimeState(CurrentPerformanceMode, confirmedMode);
+                            }, "RestoreSavedFanPreset");
+                        }
+                        else
+                        {
+                            // Try built-in preset
+                            var builtIn = new FanPreset
+                            {
+                                Name = savedFanPreset,
+                                Mode = FanModeNameResolver.ResolveBuiltInFanMode(savedFanPreset),
+                                IsBuiltIn = true
+                            };
+                            var applied = _fanService.ApplyPreset(builtIn);
+                            var confirmedMode = ResolveConfirmedFanModeLabel(savedFanPreset);
+                            _logging.Info($"✓ Fan preset restore {(applied ? "applied" : "failed")}: requested={savedFanPreset}, confirmed={confirmedMode} (built-in)");
+                            
+                            // Sync UI with restored preset
+                            InvokeOnUi(() =>
+                            {
+                                FanControl?.SelectPresetByNameNoApply(savedFanPreset);
+                                CurrentFanMode = confirmedMode;
+                                if (_dashboard != null) _dashboard.CurrentFanMode = confirmedMode;
+                                _general?.SyncRuntimeState(CurrentPerformanceMode, confirmedMode);
+                            }, "RestoreBuiltInFanPreset");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logging.Warn($"Fan preset restore failed: {ex.Message}");
+                    }
+                    }
+                }
+                
+                // Restore TCC offset
+                var savedTcc = _config.LastTccOffset;
+                if (savedTcc.HasValue && savedTcc.Value > 0 && _wmiBios != null)
+                {
+                    try
+                    {
+                        // TCC offset via WMI BIOS if available
+                        _logging.Info($"TCC Offset restore: {savedTcc.Value}°C (requires reapply via System Control)");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logging.Warn($"TCC offset restore failed: {ex.Message}");
+                    }
+                }
+
+                // Apply Power Automation's AC/Battery profile for the current power source, but
+                // only if a real AC<->Battery transition actually happened since the app last had
+                // control (see ApplyCurrentProfile's own doc comment for the "who owns the active
+                // profile" reasoning - this used to force-apply unconditionally on every startup,
+                // silently overriding whatever the user manually selected mid-session even when
+                // the power source never changed, which was GitHub #177's actual root cause).
+                // Runs last so a genuine transition still has final say over the generic
+                // last-manual-state restores above; a no-transition startup leaves them standing.
+                try
+                {
+                    _powerAutomationService?.ApplyCurrentProfile();
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"Power automation startup profile apply failed: {ex.Message}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.ErrorWithContext(
+                    component: "MainViewModel",
+                    operation: "RestoreSavedSettingsAsync",
+                    message: "Settings restoration failed",
+                    ex: ex);
+            }
+        }
+
+        private FanPreset? ResolveStartupFanPreset(string savedFanPreset)
+        {
+            var preset = _config.FanPresets?.FirstOrDefault(p =>
+                p.Name.Equals(savedFanPreset, StringComparison.OrdinalIgnoreCase));
+            if (preset != null)
+            {
+                return preset;
+            }
+
+            if (FanModeNameResolver.IsCustomAlias(savedFanPreset) &&
+                _config.CustomFanCurve is { Count: > 0 } customCurve)
+            {
+                return new FanPreset
+                {
+                    Name = "Custom",
+                    Mode = FanMode.Manual,
+                    Curve = customCurve.ToList(),
+                    IsBuiltIn = false
+                };
+            }
+
+            return null;
+        }
+
+        private bool ShouldRunStartupHardwareRestore(StartupRestoreCategory category)
+        {
+            if (!StartupRestorePolicy.IsEnabled(_config, category))
+            {
+                return false;
+            }
+
+            var model = SystemInfo?.Model ?? string.Empty;
+            // Was a local literal-"OMEN 16"-substring reimplementation of this same gate —
+            // that exact bug class (real WMI strings like "OMEN Gaming Laptop 16-ap0xxx" don't
+            // contain the literal substring "OMEN 16") was already found and fixed in
+            // StartupRestorePolicy.IsSensitiveModel() itself (see its own doc comment), but this
+            // duplicate here was never updated to match. Delegating to the shared, already-fixed
+            // policy instead of re-checking inline.
+            var guardedModel = StartupRestorePolicy.IsSensitiveModel(model);
+
+            if (guardedModel && !_config.AllowStartupRestoreOnOmen16OrVictus)
+            {
+                _logging.Warn($"Startup {category} restore blocked on sensitive model '{model}'. Enable AllowStartupRestoreOnOmen16OrVictus to override.");
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool IsVictusModel()
+        {
+            var model = SystemInfo?.Model ?? string.Empty;
+            return model.Contains("Victus", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool IsVictus16S0Model()
+        {
+            var model = SystemInfo?.Model ?? string.Empty;
+            if (!model.Contains("Victus", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return model.Contains("16-s0", StringComparison.OrdinalIgnoreCase) ||
+                   model.Contains("16 s0", StringComparison.OrdinalIgnoreCase) ||
+                   model.Contains("16s0", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private async Task InitializeGameProfilesAsync()
+        {
+            try
+            {
+                // Hook into profile apply events
+                _gameProfileService.ProfileApplyRequested += OnProfileApplyRequested;
+                _gameProfileService.ActiveProfileChanged += OnActiveProfileChanged;
+                
+                // Initialize and start monitoring
+                await _gameProfileService.InitializeAsync();
+                _logging.Info("Game profile system initialized");
+            }
+            catch (Exception ex)
+            {
+                _logging.ErrorWithContext(
+                    component: "MainViewModel",
+                    operation: "InitializeGameProfilesAsync",
+                    message: "Failed to initialize game profile system",
+                    ex: ex);
+            }
+        }
+
+        private void OnActiveProfileChanged(object? sender, EventArgs e)
+        {
+            var profile = _gameProfileService.ActiveProfile;
+            if (profile != null)
+            {
+                _logging.Info($"Active profile: {profile.Name}");
+                // Update dashboard if needed
+                if (Dashboard != null)
+                {
+                    // Dashboard.CurrentGameProfile = profile.Name;
+                }
+            }
+        }
+
+        private async void OnProfileApplyRequested(object? sender, ProfileApplyEventArgs e)
+        {
+            try
+            {
+                if (e.Trigger == ProfileTrigger.GameExit)
+                {
+                    if (e.ExitedProfile?.RestoreDefaultsOnExit == false)
+                    {
+                        _logging.Info($"Game profile '{e.ExitedProfile.Name}' exited - default restore skipped by profile policy");
+                    }
+                    else
+                    {
+                        _logging.Info("Game exited - restoring default settings");
+                        await RestoreDefaultSettingsAsync();
+                    }
+                }
+                else if (e.Profile != null)
+                {
+                    _logging.Info($"Applying profile '{e.Profile.Name}' (trigger: {e.Trigger})");
+                    await ApplyGameProfileAsync(e.Profile);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.ErrorWithContext(
+                    component: "MainViewModel",
+                    operation: "OnProfileApplyRequested",
+                    message: "Failed to apply game profile",
+                    ex: ex);
+            }
+        }
+
+        private async Task ApplyGameProfileAsync(GameProfile profile)
+        {
+            // Apply fan preset
+            if (!string.IsNullOrEmpty(profile.FanPresetName))
+            {
+                var preset = ResolveGameProfileFanPreset(profile.FanPresetName);
+                if (preset != null)
+                {
+                    await Task.Run(() => _fanService.ApplyPreset(preset));
+                    _logging.Info($"Applied game-profile fan preset: {preset.Name}");
+                }
+                else
+                {
+                    _logging.Warn($"Game profile fan preset not found: {profile.FanPresetName}");
+                }
+            }
+
+            // Apply performance mode
+            if (!string.IsNullOrEmpty(profile.PerformanceModeName))
+            {
+                var mode = ResolveGameProfilePerformanceMode(profile.PerformanceModeName);
+                if (mode != null)
+                {
+                    await Task.Run(() => _performanceModeService.Apply(mode));
+                    _logging.Info($"Applied game-profile performance mode: {mode.Name}");
+                }
+                else
+                {
+                    await Task.Run(() => _performanceModeService.SetPerformanceMode(profile.PerformanceModeName));
+                    _logging.Info($"Applied game-profile performance mode by fallback name: {profile.PerformanceModeName}");
+                }
+            }
+
+            // Apply CPU undervolt
+            if (profile.CpuCoreOffsetMv.HasValue && SystemControl != null)
+            {
+                SystemControl.RequestedCoreOffset = profile.CpuCoreOffsetMv.Value;
+                SystemControl.RequestedCacheOffset = profile.CpuCacheOffsetMv ?? profile.CpuCoreOffsetMv.Value;
+                // Trigger apply command
+                if (SystemControl.ApplyUndervoltCommand?.CanExecute(null) == true)
+                {
+                    SystemControl.ApplyUndervoltCommand.Execute(null);
+                }
+                _logging.Info($"Applied undervolt: Core={profile.CpuCoreOffsetMv}mV, Cache={profile.CpuCacheOffsetMv ?? profile.CpuCoreOffsetMv}mV");
+            }
+
+            // Apply GPU mode
+            if (profile.GpuMode.HasValue && SystemControl != null)
+            {
+                SystemControl.Maintenance.SelectedGpuMode = profile.GpuMode.Value;
+                // Trigger GPU switch via command
+                if (SystemControl.Maintenance.SwitchGpuModeCommand?.CanExecute(null) == true)
+                {
+                    SystemControl.Maintenance.SwitchGpuModeCommand.Execute(null);
+                }
+                _logging.Info($"Applied GPU mode: {profile.GpuMode}");
+            }
+
+            // Apply Corsair lighting
+            if (!string.IsNullOrEmpty(profile.PeripheralLightingProfileName) && Lighting != null)
+            {
+                var preset = Lighting.CorsairLightingPresets.FirstOrDefault(p => p.Name == profile.PeripheralLightingProfileName);
+                if (preset != null && Lighting.CorsairDevices.Any())
+                {
+                    Lighting.SelectedCorsairPreset = preset;
+                    // Apply to all Corsair devices
+                    foreach (var device in Lighting.CorsairDevices)
+                    {
+                        Lighting.SelectedCorsairDevice = device;
+                        if (Lighting.ApplyCorsairLightingCommand?.CanExecute(null) == true)
+                        {
+                            Lighting.ApplyCorsairLightingCommand.Execute(null);
+                        }
+                    }
+                    _logging.Info($"Applied Corsair lighting: {preset.Name}");
+                }
+            }
+
+            // Clean memory on launch, if the profile requests it
+            if (profile.CleanMemoryOnLaunch)
+            {
+                var memoryOptimizer = MemoryOptimizer;
+                if (memoryOptimizer?.CleanSafeCommand?.CanExecute(null) == true)
+                {
+                    memoryOptimizer.CleanSafeCommand.Execute(null);
+                    _logging.Info($"Triggered memory clean for game profile: {profile.Name}");
+                }
+            }
+
+            _logging.Info($"✓ Profile '{profile.Name}' applied successfully");
+
+        }
+
+        private FanPreset? ResolveGameProfileFanPreset(string presetName)
+        {
+            var configured = _config.FanPresets?.FirstOrDefault(p =>
+                p.Name.Equals(presetName, StringComparison.OrdinalIgnoreCase));
+            if (configured != null)
+            {
+                return configured;
+            }
+
+            if (_fanControl != null)
+            {
+                var loadedPreset = _fanControl.FanPresets.FirstOrDefault(p =>
+                    p.Name.Equals(presetName, StringComparison.OrdinalIgnoreCase));
+                if (loadedPreset != null)
+                {
+                    return loadedPreset;
+                }
+            }
+
+            var mode = FanModeNameResolver.ResolveBuiltInFanMode(presetName);
+            return new FanPreset
+            {
+                Name = presetName,
+                Mode = mode,
+                IsBuiltIn = true,
+                Curve = FanModeNameResolver.BuildBuiltInCurve(presetName, mode)
+            };
+        }
+
+        private PerformanceMode? ResolveGameProfilePerformanceMode(string modeName)
+        {
+            if (_systemControl != null)
+            {
+                var loadedMode = _systemControl.PerformanceModes.FirstOrDefault(m =>
+                    m.Name.Equals(modeName, StringComparison.OrdinalIgnoreCase));
+                if (loadedMode != null)
+                {
+                    return loadedMode;
+                }
+            }
+
+            return _config.PerformanceModes?.FirstOrDefault(m =>
+                m.Name.Equals(modeName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private async Task RestoreDefaultSettingsAsync()
+        {
+            // GitHub #206 (diagnosed and validated on a v4.3.1 build by the reporter, board 8BD4):
+            // this used to set FanControl.SelectedPreset / SystemControl.SelectedPerformanceMode
+            // directly. That runs on the game-profile monitor's thread, so touching those
+            // WPF-bound properties could throw InvalidOperationException mid-restore - and even
+            // when it didn't, selecting them is not the full Balanced restore (power mode, Auto
+            // cooling, runtime sync, persistence), so a game exit could leave Performance mode
+            // active with fans back on Auto. GeneralViewModel.ApplyBalancedProfile() already does
+            // the complete restore; run it on the UI thread.
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null)
+            {
+                _logging.Warn("Cannot restore game-profile defaults: UI dispatcher unavailable");
+                return;
+            }
+
+            if (General == null)
+            {
+                _logging.Warn("Cannot restore game-profile defaults: General view model unavailable");
+                return;
+            }
+
+            if (dispatcher.CheckAccess())
+            {
+                General.ApplyBalancedProfile();
+            }
+            else
+            {
+                await dispatcher.InvokeAsync(() => General.ApplyBalancedProfile());
+            }
+
+            _logging.Info("✓ Restored default settings via Balanced profile");
+        }
+
+        private void OpenGameProfileManager(GameProfile? initialProfile = null)
+        {
+            try
+            {
+                var window = new GameProfileManagerView
+                {
+                    Owner = Application.Current.MainWindow,
+                    DataContext = new GameProfileManagerViewModel(_gameProfileService, _logging, initialProfile)
+                };
+                window.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                _logging.ErrorWithContext(
+                    component: "MainViewModel",
+                    operation: "OpenGameProfileManager",
+                    message: "Failed to open game profile manager",
+                    ex: ex);
+                MessageBox.Show($"Failed to open profile manager: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void HydrateCollections()
+        {
+            SyncCollection(FanPresets, _config.FanPresets);
+            SelectedPreset = FanPresets.FirstOrDefault();
+
+            SyncCollection(PerformanceModes, _config.PerformanceModes);
+            SelectedPerformanceMode = ResolveInitialPerformanceModeForDisplay(PerformanceModes, _config.LastPerformanceModeName);
+            var model = SystemInfo?.Model ?? string.Empty;
+            var startupRestoreWillApply =
+                StartupRestorePolicy.IsEnabled(_config, StartupRestoreCategory.Performance) &&
+                (!StartupRestorePolicy.IsSensitiveModel(model) || _config.AllowStartupRestoreOnOmen16OrVictus);
+            CurrentPerformanceMode = ResolveInitialCurrentPerformanceModeLabel(
+                _performanceModeService?.GetCurrentMode(),
+                SelectedPerformanceMode?.Name,
+                startupRestoreWillApply) ?? CurrentPerformanceMode;
+
+            SyncCollection(LightingProfiles, _config.LightingProfiles);
+            SelectedLightingProfile = LightingProfiles.FirstOrDefault();
+
+            SyncCollection(SystemToggles, _config.SystemToggles);
+        }
+
+        /// <summary>
+        /// Label for the mode that is actually active, not merely pre-selected. A mode applied at
+        /// runtime always wins; otherwise the saved mode is only reported as active when startup
+        /// restore is going to apply it. With restore disabled firmware stays on its own default,
+        /// and showing the saved name here disagreed with the dashboard (GitHub #199).
+        /// </summary>
+        internal static string? ResolveInitialCurrentPerformanceModeLabel(
+            string? runtimeAppliedMode,
+            string? savedSelectedMode,
+            bool startupRestoreWillApply)
+        {
+            if (!string.IsNullOrWhiteSpace(runtimeAppliedMode))
+            {
+                return runtimeAppliedMode;
+            }
+
+            return startupRestoreWillApply ? savedSelectedMode : "Default";
+        }
+
+        public static PerformanceMode? ResolveInitialPerformanceModeForDisplay(
+            IEnumerable<PerformanceMode> modes,
+            string? savedModeName)
+        {
+            var modeList = modes as IList<PerformanceMode> ?? modes.ToList();
+            if (!string.IsNullOrWhiteSpace(savedModeName))
+            {
+                var saved = modeList.FirstOrDefault(mode =>
+                    mode.Name.Equals(savedModeName, StringComparison.OrdinalIgnoreCase));
+                if (saved != null)
+                {
+                    return saved;
+                }
+            }
+
+            return modeList.FirstOrDefault(mode =>
+                       mode.Name.Equals("Balanced", StringComparison.OrdinalIgnoreCase))
+                   ?? modeList.FirstOrDefault();
+        }
+
+        private void LoadCurve(FanPreset preset)
+        {
+            var incoming = preset.Curve.Select(point => new FanCurvePoint
+            {
+                TemperatureC = point.TemperatureC,
+                FanPercent = point.FanPercent
+            });
+            SyncCollection(CustomFanCurve, incoming);
+        }
+
+        private static void SyncCollection<T>(ObservableCollection<T> target, IEnumerable<T> source)
+        {
+            var sourceList = source as IList<T> ?? source.ToList();
+
+            if (target.Count == sourceList.Count)
+            {
+                var equal = true;
+                for (var i = 0; i < target.Count; i++)
+                {
+                    if (!EqualityComparer<T>.Default.Equals(target[i], sourceList[i]))
+                    {
+                        equal = false;
+                        break;
+                    }
+                }
+
+                if (equal)
+                {
+                    return;
+                }
+            }
+
+            target.Clear();
+            foreach (var item in sourceList)
+            {
+                target.Add(item);
+            }
+        }
+
+        private void SaveCustomPreset()
+        {
+            var preset = new FanPreset
+            {
+                Name = string.IsNullOrWhiteSpace(CustomPresetName) ? "Custom" : CustomPresetName,
+                Curve = CustomFanCurve.Select(p => new FanCurvePoint { TemperatureC = p.TemperatureC, FanPercent = p.FanPercent }).ToList(),
+                IsBuiltIn = false
+            };
+            FanPresets.Add(preset);
+            _config.FanPresets.Add(preset);
+            _configService.Save(_config);
+            PushEvent($"Custom preset '{preset.Name}' saved");
+        }
+
+        private async Task ApplyLightingProfile()
+        {
+            if (SelectedLightingProfile == null)
+            {
+                return;
+            }
+
+            await EnsureLightingInitializedAsync();
+
+            await _keyboardLightingService.ApplyProfile(SelectedLightingProfile);
+            if (_corsairDeviceService != null)
+            {
+                await _corsairDeviceService.SyncWithThemeAsync(SelectedLightingProfile);
+            }
+            PushEvent($"Lighting profile '{SelectedLightingProfile.Name}' pushed");
+        }
+
+        /// <summary>
+        /// Applies a lighting profile by name, for performance modes that remember one
+        /// (5.0.0, WP-43). Fire-and-forget by design: the effect applier is synchronous and
+        /// records the request, while the lighting page remains the place that confirms a paint.
+        /// </summary>
+        private async Task ApplyNamedLightingProfileAsync(string profileName)
+        {
+            if (string.IsNullOrWhiteSpace(profileName))
+            {
+                return;
+            }
+
+            var profile = LightingProfiles.FirstOrDefault(p =>
+                p.Name.Equals(profileName, StringComparison.OrdinalIgnoreCase));
+
+            if (profile == null)
+            {
+                _logging.Warn($"Performance mode asked for lighting profile '{profileName}' but no such profile exists");
+                return;
+            }
+
+            await EnsureLightingInitializedAsync();
+            await _keyboardLightingService.ApplyProfile(profile);
+            if (_corsairDeviceService != null)
+            {
+                await _corsairDeviceService.SyncWithThemeAsync(profile);
+            }
+
+            PushEvent($"Lighting profile '{profile.Name}' pushed by a performance mode");
+        }
+
+        private void RestoreDefaults()
+        {
+            _systemOptimizationService.RestoreDefaults();
+            _keyboardLightingService.RestoreDefaults();
+            _fanService.ApplyPreset(FanPresets.First());
+            GamingModeActive = false;
+            PushEvent("Defaults restored");
+        }
+
+        private void ReloadConfiguration()
+        {
+            // Load() merges disk changes onto the same shared Config object _config already
+            // points at (see ConfigurationService), so no manual field-by-field copy is needed.
+            _configService.Load();
+            HydrateCollections();
+            PushEvent("Configuration reloaded");
+        }
+
+        private void OpenConfigFolder()
+        {
+            var folder = _configService.GetConfigFolder();
+            if (Directory.Exists(folder))
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = folder,
+                    UseShellExecute = true
+                });
+            }
+        }
+
+        private OmenCleanupOptions BuildCleanupOptions() => new()
+        {
+            RemoveStorePackage = CleanupRemoveStorePackage,
+            RemoveLegacyInstallers = CleanupRemoveLegacyInstallers,
+            RemoveRegistryTraces = CleanupRemoveRegistry,
+            RemoveResidualFiles = CleanupRemoveFiles,
+            RemoveServicesAndTasks = CleanupRemoveServices,
+            KillRunningProcesses = CleanupKillProcesses,
+            PreserveFirewallRules = CleanupPreserveFirewall,
+            DryRun = CleanupDryRun
+        };
+
+        private async Task CreateRestorePointAsync()
+        {
+            RestorePointInProgress = true;
+            var label = $"OmenCore safeguard {DateTime.Now:yyyy-MM-dd HH:mm}";
+            RestorePointStatus = "Creating restore point...";
+            try
+            {
+                var result = await _systemRestoreService.CreateRestorePointAsync(label);
+                if (result.Success)
+                {
+                    RestorePointStatus = $"Restore point #{result.SequenceNumber} created";
+                    PushEvent("System restore point created");
+                }
+                else
+                {
+                    RestorePointStatus = $"Restore point failed: {result.Message}";
+                    PushEvent("Restore point creation failed");
+                }
+            }
+            catch (Exception ex)
+            {
+                RestorePointStatus = $"Restore point failed: {ex.Message}";
+                _logging.ErrorWithContext(
+                    component: "MainViewModel",
+                    operation: "CreateRestorePointAsync",
+                    message: "Unhandled restore point failure",
+                    ex: ex);
+                PushEvent("Restore point creation failed");
+            }
+            finally
+            {
+                RestorePointInProgress = false;
+            }
+        }
+
+        private async Task RunOmenCleanupAsync()
+        {
+            CleanupInProgress = true;
+            CleanupStatus = CleanupDryRun ? "Running cleanup dry run..." : "Removing OMEN Gaming Hub...";
+            OmenCleanupSteps.Clear();
+            
+            // Skip restore point for dry run
+            if (!CleanupDryRun)
+            {
+                // Automatically attempt to create restore point before cleanup
+                _logging.Info("Attempting to create restore point before OGH cleanup...");
+                CleanupStatus = "Creating restore point...";
+                OmenCleanupSteps.Add("Creating system restore point...");
+                
+                var restoreResult = await _systemRestoreService.CreateRestorePointAsync("OmenCore - Before OGH Cleanup");
+                
+                if (!restoreResult.Success)
+                {
+                    _logging.Warn($"Restore point creation failed: {restoreResult.Message}");
+                    OmenCleanupSteps.Add($"⚠ Restore point failed: {restoreResult.Message}");
+                    
+                    // Ask user if they want to continue anyway
+                    var continueAnyway = System.Windows.MessageBox.Show(
+                        $"System Restore point creation failed:\n{restoreResult.Message}\n\n" +
+                        "This is often because System Restore is disabled on your system.\n\n" +
+                        "Do you want to continue with the cleanup anyway?\n\n" +
+                        "Note: Without a restore point, you cannot easily undo the cleanup.",
+                        "Restore Point Failed - OmenCore",
+                        System.Windows.MessageBoxButton.YesNo,
+                        System.Windows.MessageBoxImage.Warning);
+                    
+                    if (continueAnyway != System.Windows.MessageBoxResult.Yes)
+                    {
+                        CleanupStatus = "⚠ Cleanup cancelled - no restore point";
+                        OmenCleanupSteps.Add("Cleanup cancelled by user");
+                        _logging.Info("OGH cleanup cancelled by user due to restore point failure");
+                        PushEvent("OGH cleanup cancelled");
+                        CleanupInProgress = false;
+                        return;
+                    }
+                    
+                    _logging.Info("User chose to continue cleanup without restore point");
+                    OmenCleanupSteps.Add("Continuing without restore point (user confirmed)");
+                }
+                else
+                {
+                    _logging.Info($"✓ Restore point created (sequence: {restoreResult.SequenceNumber})");
+                    OmenCleanupSteps.Add($"✓ Restore point created (#{restoreResult.SequenceNumber})");
+                }
+                
+                CleanupStatus = "Removing OMEN Gaming Hub...";
+            }
+            
+            // Subscribe to real-time progress updates
+            void OnStepCompleted(string step)
+            {
+                Application.Current?.Dispatcher?.BeginInvoke(() =>
+                {
+                    OmenCleanupSteps.Add(step);
+                    CleanupStatus = step;
+                });
+            }
+            
+            _hubCleanupService.StepCompleted += OnStepCompleted;
+            
+            try
+            {
+                var options = BuildCleanupOptions();
+                var result = await _hubCleanupService.CleanupAsync(options);
+                
+                // Add any warnings/errors that weren't reported via events
+                foreach (var warning in result.Warnings)
+                {
+                    if (!OmenCleanupSteps.Contains($"Warning: {warning}"))
+                        OmenCleanupSteps.Add($"Warning: {warning}");
+                }
+                foreach (var error in result.Errors)
+                {
+                    if (!OmenCleanupSteps.Contains($"Error: {error}"))
+                        OmenCleanupSteps.Add($"Error: {error}");
+                }
+
+                if (result.Success)
+                {
+                    CleanupStatus = CleanupDryRun ? "✓ Dry run completed" : "✓ OMEN Gaming Hub removed";
+                    PushEvent(CleanupDryRun ? "OMEN cleanup dry run completed" : "OMEN Gaming Hub cleanup complete");
+                }
+                else
+                {
+                    CleanupStatus = "⚠ Cleanup finished with errors";
+                    PushEvent("OMEN cleanup completed with errors");
+                }
+            }
+            catch (Exception ex)
+            {
+                CleanupStatus = $"✗ Cleanup failed: {ex.Message}";
+                _logging.ErrorWithContext(
+                    component: "MainViewModel",
+                    operation: "RunOmenCleanupAsync",
+                    message: "OMEN cleanup failed",
+                    ex: ex);
+                PushEvent("OMEN cleanup failed");
+            }
+            finally
+            {
+                _hubCleanupService.StepCompleted -= OnStepCompleted;
+                CleanupInProgress = false;
+            }
+        }
+
+        private void HardwareMonitoringServiceOnSampleUpdated(object? sender, MonitoringSample sample)
+        {
+            // Feed sample to thermal alert service and hardware watchdog (background — no UI dispatch needed)
+            _thermalMonitoringService?.ProcessSample(sample);
+            _watchdogService?.UpdateTemperature(sample.CpuTemperatureC, sample.GpuTemperatureC);
+
+            QueueMonitoringUiSample(sample);
+        }
+
+        private void QueueMonitoringUiSample(MonitoringSample sample)
+        {
+            RuntimeUiPerformanceCounters.RecordMainMonitoringSampleQueued();
+
+            // STEP-09 mitigation: count calls and coalesces; log rate every 30 calls.
+            var callCount = System.Threading.Interlocked.Increment(ref _queueCallCount);
+            if (callCount % 30 == 0)
+            {
+                var elapsedSec = _queueInstrumentTimer.Elapsed.TotalSeconds;
+                var coalesceCount = System.Threading.Interlocked.Exchange(ref _queueCoalesceCount, 0);
+                System.Threading.Interlocked.Exchange(ref _queueCallCount, 0);
+                _queueInstrumentTimer.Restart();
+                App.Logging.Debug(
+                    $"[STEP09-DIAG] QueueMonitoringUiSample: 30 calls in {elapsedSec:F1}s " +
+                    $"({30.0 / elapsedSec:F2} calls/s) | coalesced (skipped dispatch): {coalesceCount} " +
+                    $"| dispatched: {30 - coalesceCount}");
+            }
+
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null)
+            {
+                LatestMonitoringSample = sample;
+                return;
+            }
+
+            lock (_monitoringUpdateLock)
+            {
+                _queuedMonitoringSample = sample;
+                if (_monitoringUiUpdateQueued)
+                {
+                    System.Threading.Interlocked.Increment(ref _queueCoalesceCount);
+                    RuntimeUiPerformanceCounters.RecordMainMonitoringSampleCoalesced();
+                    return;
+                }
+
+                _monitoringUiUpdateQueued = true;
+            }
+
+            NoteDispatcherBeginInvoke("MonitoringSampleUpdate");
+            dispatcher.BeginInvoke(new Action(() =>
+            {
+                MonitoringSample? latest;
+                lock (_monitoringUpdateLock)
+                {
+                    latest = _queuedMonitoringSample;
+                    _queuedMonitoringSample = null;
+                    _monitoringUiUpdateQueued = false;
+                }
+
+                if (latest != null)
+                {
+                    RuntimeUiPerformanceCounters.RecordMainMonitoringSampleProjected();
+                    LatestMonitoringSample = latest;
+                }
+            }));
+        }
+
+        private void ShowAbout()
+        {
+            var about = new AboutWindow
+            {
+                Owner = Application.Current.MainWindow
+            };
+            about.ShowDialog();
+        }
+
+        private void PushEvent(string message)
+        {
+            Application.Current?.Dispatcher?.BeginInvoke(() =>
+            {
+                RecentEvents.Insert(0, $"{DateTime.Now:HH:mm:ss} {message}");
+                while (RecentEvents.Count > 30)
+                {
+                    RecentEvents.RemoveAt(RecentEvents.Count - 1);
+                }
+            });
+        }
+
+        private void HandleLogLine(string entry)
+        {
+            // Skip empty entries to reduce log clutter
+            if (string.IsNullOrWhiteSpace(entry)) return;
+
+            var line = entry.TrimEnd();
+            Application.Current?.Dispatcher?.BeginInvoke(() =>
+            {
+                _logBufferText = AppendLogLineAndRebuildBuffer(line, _logLines, _logBufferBuilder, MaxUiLogLines);
+                OnPropertyChanged(nameof(LogBuffer));
+            });
+        }
+
+        /// <summary>
+        /// Appends one line to the capped log-line queue and returns the buffer text to display,
+        /// mutating <paramref name="lines"/> and <paramref name="builder"/> in place. Pure aside
+        /// from those two mutations, so it's testable without a WPF <c>Dispatcher</c> - the caller
+        /// (<see cref="HandleLogLine"/>) is the only place that needs one, to marshal the resulting
+        /// property-changed notification onto the UI thread.
+        ///
+        /// PR #147 (picked up standalone - its other two changes had real bugs and were not
+        /// merged). Rebuilding the whole buffer with <c>string.Join</c> on every single log line is
+        /// O(n) per line for a queue capped at <paramref name="maxLines"/> - fine individually,
+        /// wasteful under a burst of rapid logging. Append incrementally instead, and only pay for
+        /// a full rebuild on the (much rarer) tick where the cap is actually exceeded and the
+        /// oldest line needs to be dropped.
+        /// </summary>
+        internal static string AppendLogLineAndRebuildBuffer(string line, Queue<string> lines, StringBuilder builder, int maxLines)
+        {
+            lines.Enqueue(line);
+            builder.Append(line).Append('\n');
+
+            if (lines.Count > maxLines)
+            {
+                while (lines.Count > maxLines)
+                {
+                    lines.Dequeue();
+                }
+
+                builder.Clear();
+                foreach (var bufferedLine in lines)
+                {
+                    builder.Append(bufferedLine).Append('\n');
+                }
+            }
+
+            return builder.Length > 0 ? builder.ToString(0, builder.Length - 1) : string.Empty;
+        }
+
+        public async Task<LightingViewModel?> EnsureLightingInitializedAsync()
+        {
+            if (Lighting != null)
+            {
+                return Lighting;
+            }
+
+            await _lightingInitializationLock.WaitAsync();
+            try
+            {
+                if (Lighting != null)
+                {
+                    return Lighting;
+                }
+
+                await InitializeLightingServicesAsync();
+                return Lighting;
+            }
+            finally
+            {
+                _lightingInitializationLock.Release();
+            }
+        }
+
+        private async Task InitializeLightingServicesAsync()
+        {
+            try
+            {
+                _corsairDeviceService = await CorsairDeviceService.CreateAsync(_logging);
+                _logitechDeviceService = await LogitechDeviceService.CreateAsync(_logging);
+                _razerService = new OmenCore.Razer.RazerService(_logging);
+
+                // Discover devices so LightingViewModel's CorsairDevices/LogitechDevices
+                // (live pass-throughs of these same service instances) aren't empty the first
+                // time the Lighting tab opens.
+                if (_corsairDeviceService != null)
+                {
+                    await _corsairDeviceService.DiscoverAsync();
+                }
+                if (_logitechDeviceService != null)
+                {
+                    await _logitechDeviceService.DiscoverAsync();
+                    PushEvent($"Discovered {_logitechDeviceService.Devices.Count} Logitech device(s)");
+                }
+
+                // Initialize Lighting sub-ViewModel after async services are ready.
+                // This is intentionally first-use for v3.6 lightweight startup: peripheral SDK,
+                // Razer process, OpenRGB, screen-sampling, and audio-reactive paths stay cold
+                // until the RGB page or an explicit lighting action asks for them.
+                if (_corsairDeviceService != null && _logitechDeviceService != null)
+                {
+                    bool hasPeripherals = _corsairDeviceService.Devices.Any() || _logitechDeviceService.Devices.Any();
+                    bool hasKeyboardLighting = _keyboardLightingService?.IsAvailable ?? false;
+
+                    // Register RGB providers with priority: Corsair -> Logitech -> Razer -> OpenRGB -> SystemGeneric.
+                    // Provider initialization remains lazy inside RgbManager until the RGB page applies/syncs.
+                    var rgbManager = new OmenCore.Services.Rgb.RgbManager(_logging);
+                    _rgbManager = rgbManager;
+                    var corsairProvider = new OmenCore.Services.Rgb.CorsairRgbProvider(_logging, _configService, _corsairDeviceService);
+                    var logitechProvider = new OmenCore.Services.Rgb.LogitechRgbProvider(_logging, _logitechDeviceService);
+                    var openRgbProvider = new OmenCore.Services.Rgb.OpenRgbProvider(_logging);
+                    rgbManager.RegisterProvider(corsairProvider);
+                    rgbManager.RegisterProvider(logitechProvider);
+
+                    if (_razerService != null)
+                    {
+                        var razerProvider = new OmenCore.Services.Rgb.RazerRgbProvider(_logging, _razerService);
+                        rgbManager.RegisterProvider(razerProvider);
+                    }
+
+                    rgbManager.RegisterProvider(openRgbProvider);
+
+                    var systemProvider = new OmenCore.Services.Rgb.SystemRgbProvider(rgbManager, _logging);
+                    rgbManager.RegisterProvider(systemProvider);
+
+                    _screenSamplingService = new ScreenSamplingService(_logging, rgbManager, _keyboardLightingService);
+                    _audioReactiveRgbService = new AudioReactiveRgbService(_logging, _keyboardLightingService);
+
+                    foreach (var provider in rgbManager.Providers.Where(p => p.ProviderId != "system"))
+                    {
+                        _audioReactiveRgbService.RegisterProvider(provider);
+                    }
+
+                    _rgbSceneService = new RgbSceneService(
+                        _logging,
+                        rgbManager,
+                        _keyboardLightingService,
+                        _configService,
+                        _screenSamplingService,
+                        _audioReactiveRgbService);
+
+                    Lighting = new LightingViewModel(
+                        _corsairDeviceService,
+                        _logitechDeviceService,
+                        _logging,
+                        _keyboardLightingService,
+                        _configService,
+                        _razerService,
+                        rgbManager,
+                        // Without these two the reactive lighting features are inert: the
+                        // view-model subscribes to SampleUpdated and ModeApplied in its
+                        // constructor, so a null service means the toggles turn on a feature
+                        // that is never told a temperature or a mode change.
+                        hardwareMonitoringService: _hardwareMonitoringService,
+                        performanceModeService: _performanceModeService,
+                        sceneService: _rgbSceneService,
+                        screenSamplingService: _screenSamplingService,
+                        audioReactiveRgbService: _audioReactiveRgbService);
+                    OnPropertyChanged(nameof(Lighting));
+                    OnPropertyChanged(nameof(IsLightingLoaded));
+
+                    if (hasKeyboardLighting)
+                    {
+                        _ = Lighting.ApplySavedKeyboardColorsAsync();
+                    }
+
+                    if (hasKeyboardLighting && !hasPeripherals)
+                    {
+                        _logging.Info("Lighting sub-ViewModel initialized on first use (keyboard lighting available)");
+                    }
+                    else if (hasPeripherals)
+                    {
+                        _logging.Info("Lighting sub-ViewModel initialized on first use (devices found)");
+                    }
+                    else
+                    {
+                        _logging.Info("Lighting sub-ViewModel initialized on first use (no RGB devices detected yet)");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.ErrorWithContext(
+                    component: "MainViewModel",
+                    operation: "InitializeLightingServicesAsync",
+                    message: "Failed to initialize peripheral services",
+                    ex: ex);
+            }
+        }
+        
+        /* InitializeSubViewModels removed in favor of lazy loading */
+
+        private void ReloadRecentBuffer()
+        {
+            _logLines.Clear();
+            _logBufferBuilder.Clear();
+            _logBufferText = string.Empty;
+            OnPropertyChanged(nameof(LogBuffer));
+        }
+
+        private void OnPropertyChanged(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+
+        private async Task ExportConfigurationAsync()
+        {
+            var dialog = new Microsoft.Win32.SaveFileDialog
+            {
+                Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*",
+                DefaultExt = "json",
+                FileName = $"OmenCore_Config_{DateTime.Now:yyyyMMdd_HHmmss}.json"
+            };
+
+            if (dialog.ShowDialog() == true)
+            {
+                try
+                {
+                    _configService.ExportConfiguration(dialog.FileName, _config);
+                    _logging.Info($"Configuration exported to: {dialog.FileName}");
+                    PushEvent($"✓ Configuration exported successfully");
+                }
+                catch (Exception ex)
+                {
+                    _logging.ErrorWithContext(
+                        component: "MainViewModel",
+                        operation: "ExportConfigurationAsync",
+                        message: "Failed to export configuration",
+                        ex: ex);
+                    PushEvent($"✗ Export failed: {ex.Message}");
+                }
+            }
+            await Task.CompletedTask;
+        }
+
+        private async Task ImportConfigurationAsync()
+        {
+            var dialog = new Microsoft.Win32.OpenFileDialog
+            {
+                Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*",
+                DefaultExt = "json"
+            };
+
+            if (dialog.ShowDialog() == true)
+            {
+                try
+                {
+                    // Validate before importing
+                    if (!_configService.ValidateConfiguration(dialog.FileName))
+                    {
+                        _logging.Warn("Invalid configuration file format");
+                        PushEvent($"✗ Import failed: Invalid file format");
+                        return;
+                    }
+
+                    var importedConfig = _configService.ImportConfiguration(dialog.FileName);
+                    if (importedConfig != null)
+                    {
+                        _configService.Save(importedConfig);
+                        _logging.Info($"Configuration imported from: {dialog.FileName}");
+                        PushEvent($"✓ Configuration imported - Restart recommended");
+                        
+                        // Notify user to restart
+                        MessageBox.Show(
+                            "Configuration imported successfully!\n\nPlease restart OmenCore for all changes to take effect.",
+                            "Import Complete",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Information);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logging.ErrorWithContext(
+                        component: "MainViewModel",
+                        operation: "ImportConfigurationAsync",
+                        message: "Failed to import configuration",
+                        ex: ex);
+                    PushEvent($"✗ Import failed: {ex.Message}");
+                }
+            }
+            await Task.CompletedTask;
+        }
+
+        private async Task ReportModelAsync()
+        {
+            try
+            {
+                var exportedPath = await ModelReportService.CreateModelDiagnosticBundleAsync(
+                    _systemInfoService,
+                    new DiagnosticExportService(
+                        _logging,
+                        _logging.LogDirectory,
+                        hardwareMonitoringService: _hardwareMonitoringService,
+                        fanService: _fanService,
+                        ecOperationCoordinator: _ecOperationCoordinator,
+                        hotkeyService: _hotkeyService,
+                        omenKeyService: _omenKeyService,
+                        wmiController: _wmiBios,
+                        ecAccess: _ecAccess,
+                        capabilitiesProvider: () => DetectedCapabilities,
+                        cpuThrottleReader: () => SystemControl?.ReadCpuThermStatus()),
+                    Update.AutoUpdateService?.GetCurrentVersion()?.ToString() ?? "unknown");
+
+                if (!string.IsNullOrEmpty(exportedPath) && File.Exists(exportedPath))
+                {
+                    var sysInfo = _systemInfoService.GetSystemInfo();
+                    var model = !string.IsNullOrEmpty(sysInfo.Model) ? sysInfo.Model : (sysInfo.ProductName ?? "Unknown");
+                    var productName = sysInfo.ProductName ?? string.Empty;
+                    var sku = sysInfo.SystemSku ?? string.Empty;
+
+                    var clipboardText = $"Model: {model}\nProductName: {productName}\nSystemSku: {sku}\nDiagnostics: {exportedPath}";
+                    try { Clipboard.SetText(clipboardText); } catch { _logging.Warn("Clipboard unavailable for ReportModel"); }
+
+                    _logging.Info($"ReportModel: diagnostics exported to {exportedPath} and model info copied to clipboard (Model={model})");
+                    PushEvent("✓ Diagnostics bundle created and model info copied to clipboard");
+
+                    if (Application.Current != null)
+                    {
+                        MessageBox.Show(
+                            $"Diagnostics bundle created and model info copied to clipboard.\n\nModel: {model}\nPath: {exportedPath}",
+                            "Report Model",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Information);
+                    }
+                }
+                else
+                {
+                    _logging.Warn("ReportModel: diagnostics export returned no path");
+                    PushEvent("✗ Report model failed: export error");
+                    if (Application.Current != null)
+                        MessageBox.Show("Failed to create diagnostics bundle.", "Report Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.ErrorWithContext(
+                    component: "MainViewModel",
+                    operation: "ReportModelAsync",
+                    message: "ReportModel failed",
+                    ex: ex);
+                PushEvent($"✗ Report model failed: {ex.Message}");
+                if (Application.Current != null)
+                    MessageBox.Show($"Failed to create diagnostics bundle: {ex.Message}", "Report Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+
+            await Task.CompletedTask;
+        }
+
+        private async Task ExportTelemetryAsync()
+        {
+            var path = _telemetryService.ExportTelemetry();
+            if (!string.IsNullOrEmpty(path) && File.Exists(path))
+            {
+                try { Clipboard.SetText(path); } catch { _logging.Warn("Clipboard unavailable for telemetry export"); }
+                _logging.Info($"Telemetry exported to: {path}");
+                PushEvent("✓ Telemetry exported");
+            }
+            else
+            {
+                _logging.Warn("Telemetry export failed");
+                PushEvent("✗ Telemetry export failed");
+            }
+            await Task.CompletedTask;
+        }
+
+        #region Tray Quick Actions
+
+        private void EnqueueTrayActionLatest(string actionName, Func<Task> action, bool skipWhenSafeMode = true)
+        {
+            _trayActionDispatcher.EnqueueLatest(actionName, async () =>
+            {
+                if (skipWhenSafeMode && _safeModeActive)
+                {
+                    _logging.Warn($"Tray action '{actionName}' blocked: Startup Safe Mode active");
+                    Application.Current?.Dispatcher?.BeginInvoke(() => PushEvent($"🛡 Safe Mode blocked tray write: {actionName}"));
+                    return;
+                }
+
+                await action();
+            });
+        }
+
+        private void HardwareMonitoringServiceOnHealthStatusChanged(object? sender, MonitoringHealthStatus status)
+        {
+            var features = _configService.Config.Features;
+            var prevStatus = _prevHealthStatus;
+            _prevHealthStatus = status;
+
+            // Reassert active fan preset when monitoring recovers from a degraded/stale state.
+            // Without this, BIOS thermal protection may hold fans at 100% after the OS wakes from
+            // sleep (causing the sensor stack to stall temporarily), and no preset is reapplied
+            // when the monitor self-recovers — leaving fans stuck at 100% indefinitely.
+            if (!_safeModeActive &&
+                status == MonitoringHealthStatus.Healthy &&
+                (prevStatus == MonitoringHealthStatus.Degraded || prevStatus == MonitoringHealthStatus.Stale))
+            {
+                _logging.Info($"[HealthRecovery] Monitoring recovered {prevStatus} → Healthy — reasserting active fan preset");
+                _ = Task.Run(async () =>
+                {
+                    // Brief settle delay so fan service sees stable sensor data before reapplying curves
+                    await Task.Delay(2000);
+                    _fanService?.HandleSystemResume();
+                });
+            }
+
+            // Reset safe mode when monitoring recovers to Healthy
+            if (_safeModeActive && status == MonitoringHealthStatus.Healthy)
+            {
+                _safeModeActive = false;
+                _safeModeResetTimer?.Dispose();
+                _safeModeResetTimer = null;
+                _logging.Info("🛡 Startup Safe Mode deactivated — monitoring recovered to Healthy");
+                Application.Current?.Dispatcher?.BeginInvoke(() => PushEvent("🛡 Safe Mode lifted — monitoring healthy"));
+                return;
+            }
+
+            if (_safeModeActive)
+            {
+                return;
+            }
+
+            if (features?.StartupSafeModeGuardEnabled != true)
+            {
+                return;
+            }
+
+            var elapsed = DateTime.UtcNow - _monitoringStartupUtc;
+            var windowSeconds = Math.Max(30, features.StartupSafeModeWindowSeconds);
+            var withinWindow = elapsed.TotalSeconds <= windowSeconds;
+            if (!withinWindow)
+            {
+                return;
+            }
+
+            var threshold = Math.Max(1, features.StartupSafeModeTimeoutThreshold);
+            if ((status == MonitoringHealthStatus.Degraded || status == MonitoringHealthStatus.Stale) &&
+                _hardwareMonitoringService.ConsecutiveTimeouts >= threshold)
+            {
+                _safeModeActive = true;
+                _logging.Warn($"🛡 Startup Safe Mode activated (status={status}, timeouts={_hardwareMonitoringService.ConsecutiveTimeouts})");
+                Application.Current?.Dispatcher?.BeginInvoke(() => PushEvent("🛡 Startup Safe Mode active — hardware write actions are temporarily restricted"));
+
+                // Schedule automatic reset after the remaining startup window elapses
+                var remainingMs = Math.Max(5000, (windowSeconds - elapsed.TotalSeconds) * 1000);
+                _safeModeResetTimer = new System.Threading.Timer(_ =>
+                {
+                    if (_safeModeActive)
+                    {
+                        _safeModeActive = false;
+                        _logging.Info($"🛡 Startup Safe Mode auto-expired after startup window ({windowSeconds}s)");
+                        Application.Current?.Dispatcher?.BeginInvoke(() => PushEvent("🛡 Safe Mode expired — startup window complete"));
+                    }
+                }, null, (int)remainingMs, System.Threading.Timeout.Infinite);
+            }
+        }
+
+        public void SetFanModeFromTray(string mode)
+        {
+            _logging.Info($"Fan mode change requested from tray: {mode}");
+            EnqueueTrayActionLatest($"Fan:{mode}", async () =>
+            {
+                var dispatcher = Application.Current?.Dispatcher;
+                FanPreset? targetPreset = null;
+                if (dispatcher != null)
+                {
+                    await dispatcher.InvokeAsync(() =>
+                    {
+                        targetPreset = ResolveTrayFanPreset(mode);
+                    });
+                }
+
+                if (targetPreset != null)
+                {
+                    var applied = await Task.Run(() => _fanService.ApplyPreset(targetPreset, immediate: true));
+                    if (!applied)
+                    {
+                        if (dispatcher != null)
+                        {
+                            await dispatcher.InvokeAsync(() =>
+                            {
+                                var failedModeName = targetPreset.IsBuiltIn ? mode : targetPreset.Name;
+                                PushEvent($"Fan mode failed: {failedModeName}");
+                                var warningMessage = $"Could not apply {failedModeName}. Check Diagnostics for backend state.";
+                                if (IsVictus16S0Model())
+                                {
+                                    warningMessage = $"Could not apply {failedModeName}. Victus 16-s0 models may require firmware-path validation; run Diagnostics and share report + WMI logs in guide format.";
+                                }
+                                else if (IsVictusModel())
+                                {
+                                    warningMessage = $"Could not apply {failedModeName}. On Victus models, share Diagnostics output in guide format so backend mapping can be verified.";
+                                }
+
+                                _notificationService.ShowWarning("Fan Mode", warningMessage);
+                            });
+                        }
+                        return;
+                    }
+                    var confirmedModeName = ResolveQuickAccessConfirmedMode(
+                        mode,
+                        targetPreset,
+                        _fanService.GetCurrentFanMode(),
+                        _fanService.ActivePresetName);
+                    if (dispatcher != null)
+                    {
+                        await dispatcher.InvokeAsync(() =>
+                        {
+                            SelectedPreset = targetPreset;
+                            // Persist the choice (same root cause as GitHub #145, fan side): a
+                            // tray-driven fan mode change applies directly through FanService and
+                            // previously never wrote LastFanPresetName, so it silently reverted on
+                            // relaunch.
+                            FanControl?.SelectPresetByNameNoApplyAndSave(confirmedModeName);
+                            CurrentFanMode = confirmedModeName;
+                            PushEvent($"🌀 Fan mode: {confirmedModeName}");
+                            _notificationService.ShowFanModeChanged(confirmedModeName, "Quick Access");
+                        });
+                    }
+                }
+                else
+                {
+                    if (dispatcher != null)
+                    {
+                        await dispatcher.InvokeAsync(() =>
+                        {
+                            PushEvent($"⚠ Fan mode request ignored: preset not found for {mode}");
+                            _notificationService.ShowWarning("Fan Mode", $"Could not resolve preset for {mode}.");
+                        });
+                    }
+                }
+            });
+        }
+
+        private FanPreset? ResolveTrayFanPreset(string mode)
+        {
+            if (FanModeNameResolver.IsCustomAlias(mode))
+            {
+                return ResolveQuickAccessCurvePreset();
+            }
+
+            if (FanModeNameResolver.IsMaxAlias(mode))
+            {
+                return FanPresets.FirstOrDefault(p => p.Name.Equals("Max", StringComparison.OrdinalIgnoreCase))
+                    ?? FanPresets.FirstOrDefault(p => FanModeNameResolver.IsMaxAlias(p.Name))
+                    ?? FanPresets.FirstOrDefault(p => p.Mode == FanMode.Max);
+            }
+
+            if (FanModeNameResolver.IsQuietAlias(mode))
+            {
+                return FanPresets.FirstOrDefault(p => p.Name.Equals("Quiet", StringComparison.OrdinalIgnoreCase))
+                    ?? FanPresets.FirstOrDefault(p => p.Mode == FanMode.Quiet && !FanModeNameResolver.IsAutoAlias(p.Name))
+                    ?? FanPresets.FirstOrDefault(p =>
+                        FanModeNameResolver.IsQuietAlias(p.Name) &&
+                        !FanModeNameResolver.IsAutoAlias(p.Name));
+            }
+
+            if (FanModeNameResolver.IsPerformanceAlias(mode))
+            {
+                return FanPresets.FirstOrDefault(p => p.Name.Contains("Extreme", StringComparison.OrdinalIgnoreCase))
+                    ?? FanPresets.FirstOrDefault(p => p.Name.Contains("Gaming", StringComparison.OrdinalIgnoreCase))
+                    ?? FanPresets.FirstOrDefault(p => p.Name.Contains("Performance", StringComparison.OrdinalIgnoreCase))
+                    ?? FanPresets.FirstOrDefault(p => p.Name.Contains("Turbo", StringComparison.OrdinalIgnoreCase))
+                    ?? FanPresets.FirstOrDefault(p => p.Mode == FanMode.Performance)
+                    ?? FanPresets.FirstOrDefault(p => FanModeNameResolver.IsPerformanceAlias(p.Name));
+            }
+
+            return FanPresets.FirstOrDefault(p => p.Name.Equals("Auto", StringComparison.OrdinalIgnoreCase))
+                ?? FanPresets.FirstOrDefault(p => p.Mode == FanMode.Auto)
+                ?? FanPresets.FirstOrDefault(p =>
+                    FanModeNameResolver.IsAutoAlias(p.Name) &&
+                    !FanModeNameResolver.IsQuietAlias(p.Name));
+        }
+
+        private static string ResolveQuickAccessConfirmedMode(
+            string requestedMode,
+            FanPreset targetPreset,
+            string? runtimeFanMode,
+            string? activePresetName)
+        {
+            var confirmed = runtimeFanMode;
+            if (string.IsNullOrWhiteSpace(confirmed))
+            {
+                confirmed = activePresetName;
+            }
+
+            if (string.IsNullOrWhiteSpace(confirmed))
+            {
+                confirmed = targetPreset.Name;
+            }
+
+            // On some decoupled WMI paths, the immediate runtime fan-mode readback can still
+            // report Auto even though the requested non-Auto preset was accepted and is active.
+            // Prefer the requested preset identity for Quick Access confirmation in this case.
+            if (!FanModeNameResolver.IsAutoAlias(requestedMode) &&
+                FanModeNameResolver.IsAutoAlias(confirmed) &&
+                !FanModeNameResolver.IsAutoAlias(targetPreset.Name))
+            {
+                return targetPreset.Name;
+            }
+
+            return confirmed;
+        }
+
+        private FanPreset? ResolveQuickAccessCurvePreset()
+        {
+            if (SelectedPreset is { IsBuiltIn: false } activeCustom)
+            {
+                return activeCustom;
+            }
+
+            if (_fanControl?.SelectedPreset is { IsBuiltIn: false } activeFanControlCustom)
+            {
+                return activeFanControlCustom;
+            }
+
+            var activeName = _fanService?.ActivePresetName;
+            if (!string.IsNullOrWhiteSpace(activeName))
+            {
+                var namedPreset = FindQuickAccessCurvePreset(activeName);
+                if (namedPreset != null)
+                {
+                    return namedPreset;
+                }
+            }
+
+            var savedName = _configService.Config.LastFanPresetName;
+            if (!string.IsNullOrWhiteSpace(savedName))
+            {
+                var savedPreset = FindQuickAccessCurvePreset(savedName);
+                if (savedPreset != null)
+                {
+                    return savedPreset;
+                }
+            }
+
+            return EnumerateQuickAccessFanPresetCandidates()
+                .FirstOrDefault(p => !p.IsBuiltIn && p.Curve.Count > 0);
+        }
+
+        private FanPreset? FindQuickAccessCurvePreset(string presetName)
+        {
+            return EnumerateQuickAccessFanPresetCandidates()
+                .FirstOrDefault(p =>
+                    !p.IsBuiltIn &&
+                    p.Curve.Count > 0 &&
+                    p.Name.Equals(presetName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private IEnumerable<FanPreset> EnumerateQuickAccessFanPresetCandidates()
+        {
+            foreach (var preset in FanPresets)
+            {
+                yield return preset;
+            }
+
+            if (_fanControl != null)
+            {
+                foreach (var preset in _fanControl.FanPresets)
+                {
+                    yield return preset;
+                }
+            }
+
+            foreach (var preset in _configService.Config.FanPresets)
+            {
+                yield return preset;
+            }
+        }
+
+        public void SetPerformanceModeFromTray(string mode)
+        {
+            _logging.Info($"Performance mode change requested from tray: {mode}");
+            EnqueueTrayActionLatest($"Performance:{mode}", async () =>
+            {
+                var dispatcher = Application.Current?.Dispatcher;
+                await Task.Run(() => _performanceModeService.SetPerformanceMode(mode));
+
+                if (dispatcher != null)
+                {
+                    await dispatcher.InvokeAsync(() =>
+                    {
+                        if (_systemControl != null)
+                        {
+                            // Persist the choice (GitHub #145): a tray-driven mode change applies
+                            // directly through PerformanceModeService and previously never wrote
+                            // LastPerformanceModeName, so the mode silently reverted on relaunch.
+                            _systemControl.SelectModeByNameNoApplyAndSave(mode);
+                        }
+
+                        var confirmedMode = _performanceModeService.GetCurrentMode() ?? mode;
+                        CurrentPerformanceMode = confirmedMode;
+                        General?.SyncRuntimeState(confirmedMode, CurrentFanMode);
+                        PushEvent($"⚡ Performance: {confirmedMode}");
+                    });
+                }
+            });
+        }
+        
+        /// <summary>
+        /// Apply a combined quick profile (Performance + Fan) from the system tray
+        /// </summary>
+        public void ApplyQuickProfileFromTray(string profile)
+        {
+            _logging.Info($"Quick profile change requested from tray: {profile}");
+            EnqueueTrayActionLatest($"QuickProfile:{profile}", async () =>
+            {
+                var dispatcher = Application.Current?.Dispatcher;
+                string performanceMode;
+                string fanMode;
+
+                string? gpuBoostLevel = null;
+                switch (profile.ToLowerInvariant())
+                {
+                    case "performance":
+                        await Task.Run(() =>
+                        {
+                            _performanceModeService.SetPerformanceMode("Performance");
+                            _fanService.ApplyPreset(CreatePerformanceQuickProfileFanPreset(), immediate: true);
+                        });
+                        performanceMode = "Performance";
+                        fanMode = "Performance";
+                        gpuBoostLevel = "Maximum";
+                        DisarmQuietSafetyMonitor();
+                        break;
+
+                    case "balanced":
+                        await Task.Run(() =>
+                        {
+                            _performanceModeService.SetPerformanceMode("Balanced");
+                            _fanService.ApplyAutoMode();
+                        });
+                        performanceMode = "Balanced";
+                        fanMode = "Auto";
+                        gpuBoostLevel = "Medium";
+                        DisarmQuietSafetyMonitor();
+                        break;
+
+                    case "quiet":
+                        await Task.Run(() =>
+                        {
+                            _performanceModeService.SetPerformanceMode("Quiet");
+                            _fanService.ApplyQuietMode();
+                        });
+                        performanceMode = "Quiet";
+                        fanMode = "Quiet";
+                        gpuBoostLevel = "Minimum";
+                        ArmQuietSafetyMonitor();
+                        break;
+
+                    case "custom":
+                        DisarmQuietSafetyMonitor();
+                        var customApplied = ApplyCustomQuickProfileFromHotkey();
+                        if (!customApplied)
+                        {
+                            // No saved custom preset — navigate to the Custom tab so the user can configure one
+                            var d = Application.Current?.Dispatcher;
+                            if (d != null)
+                                await d.InvokeAsync(() => { SelectedTabIndex = OmenTabIndex; });
+                        }
+                        return;
+
+                    default:
+                        _logging.Warn($"Unknown profile: {profile}");
+                        return;
+                }
+
+                if (dispatcher != null)
+                {
+                    await dispatcher.InvokeAsync(() =>
+                    {
+                        var confirmedFanMode = _fanService.GetCurrentFanMode()
+                            ?? _fanService.ActivePresetName
+                            ?? fanMode;
+                        var confirmedPerformanceMode = _performanceModeService.GetCurrentMode()
+                            ?? performanceMode;
+
+                        CurrentPerformanceMode = confirmedPerformanceMode;
+                        CurrentFanMode = confirmedFanMode;
+                        General?.SetSystemControlViewModel(_systemControl);
+                        General?.SyncRuntimeState(confirmedPerformanceMode, confirmedFanMode);
+                        // Persist both sides of this combined quick profile (GitHub #145 and its
+                        // analogous fan-preset gap).
+                        _systemControl?.SelectModeByNameNoApplyAndSave(confirmedPerformanceMode);
+                        FanControl?.SelectPresetByNameNoApplyAndSave(confirmedFanMode);
+                        // Sync GPU Power Boost level on UI thread (setter calls OnPropertyChanged)
+                        if (gpuBoostLevel != null && _systemControl?.GpuPowerBoostAvailable == true)
+                            _systemControl.GpuPowerBoostLevel = gpuBoostLevel;
+                        ShowHotkeyOsd("Profile", profile, "Tray");
+                        PushEvent($"🎮 Profile: {profile} (fan: {confirmedFanMode})");
+                    });
+                }
+            });
+        }
+
+        private static FanPreset CreatePerformanceQuickProfileFanPreset()
+        {
+            return new FanPreset
+            {
+                Name = "Performance",
+                Mode = FanMode.Performance,
+                IsBuiltIn = true,
+                Curve = new()
+                {
+                    new FanCurvePoint { TemperatureC = 40, FanPercent = 38 },
+                    new FanCurvePoint { TemperatureC = 50, FanPercent = 52 },
+                    new FanCurvePoint { TemperatureC = 60, FanPercent = 72 },
+                    new FanCurvePoint { TemperatureC = 70, FanPercent = 100 }
+                }
+            };
+        }
+        
+        /// <summary>
+        /// Runs a safe memory clean triggered from the tray Quick Access popup.
+        /// </summary>
+        public void CleanMemoryFromTray()
+        {
+            var memoryOptimizer = MemoryOptimizer;
+            if (memoryOptimizer?.CleanSafeCommand?.CanExecute(null) == true)
+            {
+                memoryOptimizer.CleanSafeCommand.Execute(null);
+                _logging.Info("Triggered memory clean from tray Quick Access");
+            }
+        }
+
+        /// <summary>
+        /// Set GPU power level from system tray (v2.7.0)
+        /// </summary>
+        public void SetGpuPowerFromTray(string level)
+        {
+            _logging.Info($"GPU power level change requested from tray: {level}");
+            EnqueueTrayActionLatest($"GpuPower:{level}", async () =>
+            {
+                var dispatcher = Application.Current?.Dispatcher;
+                if (dispatcher != null)
+                {
+                    await dispatcher.InvokeAsync(() =>
+                    {
+                        if (SystemControl != null)
+                        {
+                            SystemControl.GpuPowerBoostLevel = level;
+                            SystemControl.ApplyGpuPowerBoostCommand?.Execute(null);
+                            CurrentGpuPowerLevel = level;
+                            PushEvent($"⚡ GPU Power: {level}");
+                            _notificationService.ShowInfo("GPU Power", $"Set to {level}");
+                        }
+                    });
+                }
+            });
+        }
+        
+        /// <summary>
+        /// Set keyboard backlight level from system tray (v2.7.0)
+        /// </summary>
+        public void SetKeyboardBacklightFromTray(int level)
+        {
+            _logging.Info($"Keyboard backlight change requested from tray: level {level}");
+            EnqueueTrayActionLatest($"Backlight:{level}", async () =>
+            {
+                var dispatcher = Application.Current?.Dispatcher;
+                if (dispatcher != null)
+                {
+                    if (dispatcher.CheckAccess())
+                    {
+                        if (_keyboardLightingService?.IsAvailable == true)
+                        {
+                            int brightness = level switch
+                            {
+                                0 => 0,
+                                1 => 33,
+                                2 => 66,
+                                _ => 100
+                            };
+                            await _keyboardLightingService.SetBrightness(brightness);
+                            CurrentKeyboardBrightness = level;
+                            string levelName = level switch { 0 => "Off", 1 => "Low", 2 => "Medium", _ => "High" };
+                            PushEvent($"💡 Keyboard: {levelName}");
+                        }
+                    }
+                    else
+                    {
+                        await dispatcher.InvokeAsync(async () =>
+                        {
+                            if (_keyboardLightingService?.IsAvailable == true)
+                            {
+                                int brightness = level switch
+                                {
+                                    0 => 0,
+                                    1 => 33,
+                                    2 => 66,
+                                    _ => 100
+                                };
+                                await _keyboardLightingService.SetBrightness(brightness);
+                                CurrentKeyboardBrightness = level;
+                                string levelName = level switch { 0 => "Off", 1 => "Low", 2 => "Medium", _ => "High" };
+                                PushEvent($"💡 Keyboard: {levelName}");
+                            }
+                        }).Task.Unwrap();
+                    }
+                }
+            });
+        }
+        
+        /// <summary>
+        /// Toggle keyboard backlight from system tray (v2.7.0)
+        /// </summary>
+        public void ToggleKeyboardBacklightFromTray()
+        {
+            _logging.Info("Keyboard backlight toggle requested from tray");
+            try
+            {
+                // Cycle through levels: Off -> Low -> Medium -> High -> Off
+                int newLevel = (CurrentKeyboardBrightness + 1) % 4;
+                SetKeyboardBacklightFromTray(newLevel);
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to toggle keyboard backlight from tray: {ex.Message}");
+            }
+        }
+
+        #endregion
+
+        #region Hotkey & Notification Handlers
+
+        private void OnGameProfileApplyRequested(object? sender, ProfileApplyEventArgs e)
+        {
+            Application.Current?.Dispatcher?.BeginInvoke(() =>
+            {
+                if (e.Profile != null)
+                {
+                    // Game profile activated
+                    _notificationService.ShowGameProfileActivated(e.Profile.ExecutableName, e.Profile.Name);
+                    PushEvent($"🎮 Profile: {e.Profile.Name} for {e.Profile.ExecutableName}");
+                }
+                else if (e.Trigger == ProfileTrigger.GameExit)
+                {
+                    // Game exited, defaults restored
+                    _notificationService.ShowGameProfileDeactivated("Game");
+                    PushEvent("🎮 Restored default settings");
+                }
+            });
+        }
+
+        private void OnHotkeyToggleFanMode(object? sender, EventArgs e)
+        {
+            _hotkeyCoordinator.EnqueueUiAction("ToggleFanMode", async () =>
+            {
+                if (FanControl == null) return;
+
+                var currentCycleMode = ResolveHotkeyFanCycleMode();
+                var nextMode = ResolveNextHotkeyFanMode(currentCycleMode, out var targetMode);
+
+                try
+                {
+                    // Awaited, not fire-and-forget (GitHub #199): ApplyFanMode's underlying write
+                    // runs on a background Task, so reading _fanService.GetCurrentFanMode()
+                    // immediately after it returned a stale mode - the OSD showed the mode the
+                    // fans were leaving, one hotkey press behind the one actually requested.
+                    var confirmedFanMode = await FanControl.ApplyFanModeAsync(targetMode)
+                        ?? _fanService.GetCurrentFanMode()
+                        ?? _fanService.ActivePresetName
+                        ?? nextMode;
+
+                    CurrentFanMode = confirmedFanMode;
+                    General?.SyncRuntimeState(CurrentPerformanceMode, confirmedFanMode);
+
+                    // Show what actually got applied, not only what we requested.
+                    ShowHotkeyOsd("Fan Mode", confirmedFanMode, "Ctrl+Shift+F");
+                    PushEvent($"🌀 Fan: {confirmedFanMode} (hotkey)");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"Hotkey fan mode change failed: {ex.Message}");
+                }
+            });
+        }
+
+        private void OnHotkeyToggleMaxFan(object? sender, EventArgs e)
+        {
+            _hotkeyCoordinator.EnqueueUiAction("ToggleMaxFan", () =>
+            {
+                try
+                {
+                    if (!_fanService.FanWritesAvailable)
+                    {
+                        if (IsVictusModel())
+                        {
+                            _notificationService.ShowWarning(
+                                "Fan Mode",
+                                "Victus fan backend is unavailable, so Max fan was not applied. Run Diagnostics and share the report using the guide format.");
+                        }
+                        else
+                        {
+                            _notificationService.ShowWarning("Fan Mode", "Fan control backend is unavailable. Max fan hotkey was not applied.");
+                        }
+
+                        _logging.Warn("Hotkey max fan toggle skipped: fan writes unavailable");
+                        return;
+                    }
+
+                    _fanService.ApplyMaxCooling();
+                    FanControl?.SelectPresetByNameNoApplyAndSave("Max");
+                    ShowHotkeyOsd("Fan Mode", "Maximum Cooling", "Ctrl+Shift+M");
+                    PushEvent("🌀 Fan: Maximum Cooling (hotkey)");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"Hotkey max fan toggle failed: {ex.Message}");
+                }
+            });
+        }
+
+        private void OnHotkeyTogglePerformanceMode(object? sender, EventArgs e)
+        {
+            _hotkeyCoordinator.EnqueueUiAction("TogglePerformanceMode", () =>
+            {
+                if (SystemControl == null) return;
+                
+                // Cycle through performance modes
+                var modes = new[] { "Balanced", "Performance", "Quiet" };
+                var authoritativeMode = _performanceModeService.GetCurrentMode() ?? CurrentPerformanceMode;
+                var canonicalMode = PerformanceModeNameResolver.Normalize(authoritativeMode);
+                var currentIndex = Array.IndexOf(modes, canonicalMode);
+                var nextIndex = (currentIndex + 1) % modes.Length;
+                var nextMode = modes[nextIndex];
+                
+                try
+                {
+                    _performanceModeService.SetPerformanceMode(nextMode);
+                    ShowHotkeyOsd("Performance", nextMode, "Ctrl+Shift+P");
+                    PushEvent($"⚡ Performance: {nextMode} (hotkey)");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"Hotkey performance mode change failed: {ex.Message}");
+                }
+            });
+        }
+
+        private void OnHotkeyToggleBoostMode(object? sender, EventArgs e)
+        {
+            _hotkeyCoordinator.EnqueueUiAction("ToggleBoostMode", () =>
+            {
+                try
+                {
+                    FanControl?.ApplyFanMode("Performance");
+                    _performanceModeService.SetPerformanceMode("Performance");
+                    ShowHotkeyOsd("Boost", "Performance", "Ctrl+Shift+B");
+                    PushEvent("🔥 Boost mode activated (hotkey)");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"Hotkey boost mode failed: {ex.Message}");
+                }
+            });
+        }
+
+        private void OnHotkeyToggleQuietMode(object? sender, EventArgs e)
+        {
+            _hotkeyCoordinator.EnqueueUiAction("ToggleQuietMode", () =>
+            {
+                try
+                {
+                    FanControl?.ApplyFanMode("Quiet");
+                    _performanceModeService.SetPerformanceMode("Quiet");
+                    ShowHotkeyOsd("Quiet Mode", "Quiet", "Ctrl+Shift+Q");
+                    PushEvent("🤫 Quiet mode activated (hotkey)");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"Hotkey quiet mode failed: {ex.Message}");
+                }
+            });
+        }
+
+        private void OnHotkeyToggleWindow(object? sender, EventArgs e)
+        {
+            _hotkeyCoordinator.EnqueueUiAction("ToggleWindow", () =>
+            {
+                var mainWindow = Application.Current.MainWindow;
+                if (mainWindow == null)
+                {
+                    _logging.Warn("Toggle window: MainWindow is null");
+                    return;
+                }
+                
+                _logging.Info($"Toggle window: IsVisible={mainWindow.IsVisible}, WindowState={mainWindow.WindowState}, ShowInTaskbar={mainWindow.ShowInTaskbar}");
+                
+                // Check if window is currently shown and not minimized
+                bool isWindowShown = mainWindow.IsVisible && mainWindow.WindowState != WindowState.Minimized;
+                
+                if (isWindowShown)
+                {
+                    // Hide the window
+                    mainWindow.Hide();
+                    mainWindow.ShowInTaskbar = false;
+                    _logging.Info("Window hidden to tray");
+                }
+                else
+                {
+                    // Show the window - ensure it's properly restored
+                    mainWindow.Show();
+                    mainWindow.ShowInTaskbar = true;
+                    mainWindow.WindowState = WindowState.Normal;
+                    
+                    // Use Windows API for reliable foreground focus
+                    // This bypasses Windows' focus-stealing prevention for background apps
+                    var handle = new WindowInteropHelper(mainWindow).Handle;
+                    if (handle != IntPtr.Zero)
+                    {
+                        // Get the current foreground window's thread
+                        var foregroundWindow = GetForegroundWindow();
+                        GetWindowThreadProcessId(foregroundWindow, out _);
+                        var foregroundThread = GetWindowThreadProcessId(foregroundWindow, out _);
+                        var currentThread = GetCurrentThreadId();
+                        
+                        // Attach threads to share input queue (allows SetForegroundWindow to work)
+                        if (foregroundThread != currentThread)
+                        {
+                            AttachThreadInput(foregroundThread, currentThread, true);
+                        }
+                        
+                        ShowWindow(handle, SW_RESTORE);
+                        SetForegroundWindow(handle);
+                        
+                        // Detach threads
+                        if (foregroundThread != currentThread)
+                        {
+                            AttachThreadInput(foregroundThread, currentThread, false);
+                        }
+                    }
+                    
+                    // WPF activation as fallback
+                    mainWindow.Activate();
+                    mainWindow.Focus();
+                    
+                    _logging.Info("Window shown and activated");
+                }
+            });
+        }
+
+        private void OnHotkeyTogglePerformanceProfile(object? sender, EventArgs e)
+        {
+            _hotkeyCoordinator.EnqueueUiAction("TogglePerformanceProfile", () =>
+            {
+                if (General == null) return;
+
+                var current = string.IsNullOrWhiteSpace(General.SelectedProfile)
+                    ? "Balanced"
+                    : General.SelectedProfile;
+                var nextProfile = ResolveNextHotkeyPerformanceProfile(current);
+
+                try
+                {
+                    switch (nextProfile)
+                    {
+                        case "Performance":
+                            General.ApplyPerformanceProfile();
+                            DisarmQuietSafetyMonitor();
+                            break;
+                        case "Quiet":
+                            General.ApplyQuietProfile();
+                            ArmQuietSafetyMonitor();
+                            break;
+                        case "Custom":
+                            if (!ApplyCustomQuickProfileFromHotkey())
+                            {
+                                _logging.Warn("Hotkey profile cycle skipped Custom because no saved custom curve could be applied");
+                                return;
+                            }
+                            DisarmQuietSafetyMonitor();
+                            break;
+                        default:
+                            General.ApplyBalancedProfile();
+                            DisarmQuietSafetyMonitor();
+                            break;
+                    }
+
+                    ShowHotkeyOsd("Profile", nextProfile, "Ctrl+Shift+E");
+                    PushEvent($"Profile: {nextProfile} (hotkey)");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"Hotkey performance profile change failed: {ex.Message}");
+                }
+            });
+        }
+
+        private string ResolveNextHotkeyPerformanceProfile(string currentProfile)
+        {
+            return ProfileCycleService.ResolveNextPerformanceProfile(
+                currentProfile,
+                ResolveQuickAccessCurvePreset() != null);
+        }
+
+        private bool ApplyCustomQuickProfileFromHotkey()
+        {
+            var customPreset = ResolveQuickAccessCurvePreset();
+            if (customPreset == null)
+            {
+                return false;
+            }
+
+            var applied = _fanService.ApplyPreset(customPreset, immediate: true);
+            if (!applied)
+            {
+                PushEvent($"Custom profile failed: {customPreset.Name}");
+                _notificationService.ShowWarning(
+                    "Profile",
+                    $"Could not apply custom fan preset '{customPreset.Name}'. Check Diagnostics for backend state.");
+                return false;
+            }
+
+            var confirmedPerformanceMode = _performanceModeService.GetCurrentMode()
+                ?? General?.CurrentPerformanceMode
+                ?? CurrentPerformanceMode;
+            var confirmedFanMode = _fanService.GetCurrentFanMode()
+                ?? _fanService.ActivePresetName
+                ?? customPreset.Name;
+
+            _fanControl?.SelectPresetByNameNoApplyAndSave(customPreset.Name);
+            General?.SyncRuntimeState(confirmedPerformanceMode, confirmedFanMode);
+            if (General != null)
+            {
+                General.SelectedProfile = "Custom";
+            }
+
+            CurrentPerformanceMode = confirmedPerformanceMode;
+            CurrentFanMode = confirmedFanMode;
+            SelectedPreset = customPreset;
+            return true;
+        }
+
+        // ─── v3.7.0: Quiet Safety Monitor helpers ─────────────────────────────
+
+        private void ArmQuietSafetyMonitor()
+        {
+            var settings = _config.QuietSafety;
+            if (!settings.Enabled) return;
+            _quietSafetyMonitor.Arm(settings.SafetyOnTempC, settings.SafetyOffTempC);
+            _logging.Debug($"[QuietSafety] Armed (on={settings.SafetyOnTempC}°C off={settings.SafetyOffTempC}°C)");
+        }
+
+        private void DisarmQuietSafetyMonitor()
+        {
+            _quietSafetyMonitor.ClearAndDisarm();
+            // Clear UI indicator on the UI thread; may be called from any thread
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher != null && !dispatcher.CheckAccess())
+                dispatcher.InvokeAsync(() => General?.SetQuietSafetyOverride(false));
+            else
+                General?.SetQuietSafetyOverride(false);
+        }
+
+        private void OnQuietSafetyOverrideActivated(object? sender, EventArgs e)
+        {
+            _logging.Info("[QuietSafety] Temperature critical — switching to Max cooling (Quiet power mode retained)");
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null) return;
+            dispatcher.InvokeAsync(() =>
+            {
+                try
+                {
+                    // suppressLinkedProfileSync: this override exists specifically to force
+                    // cooling while leaving the user's performance profile on Quiet - see
+                    // GitHub #181 and FanPresetAppliedEventArgs for why this must not cascade
+                    // into a linked performance-mode switch the way a user-initiated Max Fan
+                    // click legitimately should.
+                    _fanService.ApplyMaxCooling(suppressLinkedProfileSync: true);
+                    var confirmedFanMode = _fanService.GetCurrentFanMode() ?? "Max";
+                    CurrentFanMode = confirmedFanMode;
+                    General?.SetQuietSafetyOverride(true);
+                    General?.SyncRuntimeState(CurrentPerformanceMode, confirmedFanMode);
+                    if (string.Equals(confirmedFanMode, "Max", StringComparison.OrdinalIgnoreCase))
+                    {
+                        PushEvent("🌡️ Quiet safety: fans → Max (temp critical)");
+                    }
+                    else
+                    {
+                        _logging.Warn($"[QuietSafety] Max cooling did not confirm (mode is '{confirmedFanMode}') — temp is critical and fans may not have responded");
+                        PushEvent("⚠️ Quiet safety: temp critical, but Max cooling failed to apply — check fan control");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"[QuietSafety] Failed to apply Max cooling: {ex.Message}");
+                }
+            });
+        }
+
+        private void OnQuietSafetyOverrideCleared(object? sender, EventArgs e)
+        {
+            _logging.Info("[QuietSafety] Temperature recovered — restoring Quiet fan curve");
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null) return;
+            dispatcher.InvokeAsync(() =>
+            {
+                try
+                {
+                    _fanService.ApplyQuietMode();
+                    var confirmedFanMode = _fanService.GetCurrentFanMode() ?? "Quiet";
+                    CurrentFanMode = confirmedFanMode;
+                    General?.SetQuietSafetyOverride(false);
+                    General?.SyncRuntimeState(CurrentPerformanceMode, confirmedFanMode);
+                    PushEvent("✅ Quiet safety: fans → Quiet (temp recovered)");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"[QuietSafety] Failed to restore Quiet fans: {ex.Message}");
+                }
+            });
+        }
+
+        private void OnHotkeyShowWindow(object? sender, EventArgs e)
+        {
+            _hotkeyCoordinator.EnqueueUiAction("ShowWindow", () =>
+            {
+                var mainWindow = Application.Current.MainWindow;
+                if (mainWindow == null)
+                {
+                    _logging.Warn("Show/toggle window: MainWindow is null");
+                    return;
+                }
+
+                bool isWindowShown = mainWindow.IsVisible && mainWindow.WindowState != WindowState.Minimized;
+                if (isWindowShown)
+                {
+                    mainWindow.Hide();
+                    mainWindow.ShowInTaskbar = false;
+                    _logging.Info("Window hidden from ShowWindow hotkey");
+                    return;
+                }
+
+                ShowMainWindowFromHotkey(navigateToMonitoring: false);
+            });
+        }
+
+        private void OnHotkeyOpenDashboard(object? sender, EventArgs e)
+        {
+            _hotkeyCoordinator.EnqueueUiAction("OpenDashboard", () =>
+            {
+                ShowMainWindowFromHotkey(navigateToMonitoring: true);
+            });
+        }
+
+        private void ShowMainWindowFromHotkey(bool navigateToMonitoring)
+        {
+            var mainWindow = Application.Current.MainWindow;
+            if (mainWindow == null)
+            {
+                _logging.Warn("Show window: MainWindow is null");
+                return;
+            }
+
+            mainWindow.Show();
+            mainWindow.ShowInTaskbar = true;
+            mainWindow.WindowState = WindowState.Normal;
+
+            var handle = new WindowInteropHelper(mainWindow).Handle;
+            if (handle != IntPtr.Zero)
+            {
+                ShowWindow(handle, SW_RESTORE);
+                SetForegroundWindow(handle);
+            }
+
+            mainWindow.Activate();
+            mainWindow.Focus();
+
+            if (navigateToMonitoring)
+            {
+                SelectedTabIndex = MonitoringTabIndex;
+            }
+
+            _logging.Info(navigateToMonitoring
+                ? "Dashboard window shown from hotkey"
+                : "Window shown from hotkey");
+        }
+        
+        private void OnOmenKeyToggleWindow(object? sender, EventArgs e)
+        {
+            // Same as hotkey toggle but may include OSD feedback
+            OnHotkeyToggleWindow(sender, e);
+        }
+
+        private void OnOmenKeyShowQuickPopup(object? sender, EventArgs e)
+        {
+            App.TrayIcon?.ShowQuickPopup();
+        }
+        
+        private void OnOmenKeyToggleMaxCooling(object? sender, EventArgs e)
+        {
+            Application.Current?.Dispatcher?.BeginInvoke(() =>
+            {
+                try
+                {
+                    // Toggle between Max and Auto
+                    var currentPreset = FanControl?.SelectedPreset;
+                    if (currentPreset?.Name == "Max")
+                    {
+                        _fanService.ApplyAutoMode();
+                        FanControl?.SelectPresetByNameNoApplyAndSave("Auto");
+                        ShowHotkeyOsd("Fan Mode", "Auto (BIOS Control)", "OMEN Key");
+                    }
+                    else
+                    {
+                        _fanService.ApplyMaxCooling();
+                        FanControl?.SelectPresetByNameNoApplyAndSave("Max");
+                        ShowHotkeyOsd("Fan Mode", "Maximum Cooling", "OMEN Key");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"OMEN key max cooling toggle failed: {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>
+        /// Navigate to the Bloatware Manager tab when requested from Settings view.
+        /// </summary>
+        private void OnBloatwareNavigationRequested()
+        {
+            if (!ShowAdvancedControls)
+            {
+                ShowAdvancedControls = true;
+            }
+
+            SelectedTabIndex = BloatwareTabIndex;
+        }
+
+        private static bool IsAdvancedTab(int tabIndex) =>
+            tabIndex == OmenTabIndex ||
+            tabIndex == TuningTabIndex ||
+            tabIndex == DiagnosticsTabIndex ||
+            tabIndex == OptimizerTabIndex ||
+            tabIndex == MemoryTabIndex ||
+            tabIndex == BloatwareTabIndex ||
+            tabIndex == RgbTabIndex;
+
+        private static bool ShouldStartConflictMonitoringForTab(int tabIndex) =>
+            tabIndex == OmenTabIndex ||
+            tabIndex == TuningTabIndex ||
+            tabIndex == MonitoringTabIndex ||
+            tabIndex == OptimizerTabIndex;
+
+        private void UpdateLazyTabActivity(int tabIndex)
+        {
+            _memoryOptimizer?.SetPageActive(tabIndex == MemoryTabIndex);
+        }
+
+        private void EnsureConflictMonitoringStartedForTab(int tabIndex)
+        {
+            if (!ShouldStartConflictMonitoringForTab(tabIndex))
+            {
+                return;
+            }
+
+            EnsureConflictMonitoringStarted($"tab-index-{tabIndex}");
+        }
+
+        private void EnsureConflictMonitoringStarted(string reason)
+        {
+            if (_conflictDetectionService == null)
+            {
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref _conflictMonitoringStarted, 1, 0) != 0)
+            {
+                return;
+            }
+
+            _logging.Info($"Starting conflict detection monitor ({reason})");
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _conflictDetectionService.ScanForConflictsAsync();
+                    await _conflictDetectionService.MonitorConflictsAsync(TimeSpan.FromSeconds(60), _conflictMonitorCts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logging.Debug("Conflict detection monitor stopped");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"Conflict detection failed: {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>
+        /// Handle fan preset changes from FanService (e.g., power automation).
+        /// Updates all UI indicators: sidebar, tray, dashboard.
+        /// </summary>
+        private void OnFanPresetApplied(object? sender, FanPresetAppliedEventArgs e)
+        {
+            var presetName = e.PresetName;
+            Application.Current?.Dispatcher?.BeginInvoke(() =>
+            {
+                try
+                {
+                    RefreshLinkFanState();
+
+                    var confirmedModeName = _fanService.GetCurrentFanMode()
+                        ?? _fanService.ActivePresetName
+                        ?? presetName;
+
+                    // Update MainViewModel's CurrentFanMode for tray/sidebar sync
+                    CurrentFanMode = confirmedModeName;
+
+                    // Update Dashboard if loaded
+                    if (_dashboard != null)
+                    {
+                        _dashboard.CurrentFanMode = confirmedModeName;
+                    }
+
+                    // Update FanControlViewModel's selected preset if loaded
+                    FanControl?.SelectPresetByNameNoApply(presetName);
+                    _general?.SyncRuntimeState(CurrentPerformanceMode, confirmedModeName);
+
+                    // When fan/performance linking is enabled, fan mode changes become
+                    // authoritative and update performance mode through one guarded path -
+                    // unless this change came from a safety-driven override (e.g. the Quiet
+                    // Safety Monitor) that explicitly intends to force cooling while leaving
+                    // the performance profile alone. GitHub #181: without this check, a
+                    // transient thermal spike on Quiet + linking silently switched the user to
+                    // Performance, contradicting the safety monitor's own "power mode retained"
+                    // guarantee.
+                    if (IsFanPerformanceLinked && !e.SuppressLinkedProfileSync && TryEnterProfileSync())
+                    {
+                        try
+                        {
+                            var mappedPerformanceMode = MapFanModeToPerformanceMode(confirmedModeName);
+                            var currentPerformanceMode = _performanceModeService.GetCurrentMode() ?? CurrentPerformanceMode;
+                            if (!string.Equals(currentPerformanceMode, mappedPerformanceMode, StringComparison.OrdinalIgnoreCase))
+                            {
+                                _logging.Info($"Link sync: Fan '{confirmedModeName}' -> Performance '{mappedPerformanceMode}'");
+                                _performanceModeService.SetPerformanceMode(mappedPerformanceMode);
+                            }
+                        }
+                        finally
+                        {
+                            ExitProfileSync();
+                        }
+                    }
+                    else if (e.SuppressLinkedProfileSync)
+                    {
+                        _logging.Info($"Link sync skipped for fan preset '{presetName}': safety-driven change, performance profile left as-is");
+                    }
+
+                    _logging.Info($"UI synced: Fan preset '{presetName}' applied as runtime mode '{confirmedModeName}'");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"UI sync failed for fan preset '{presetName}': {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>
+        /// Handle performance mode changes from PerformanceModeService (e.g., power automation).
+        /// Updates all UI indicators: sidebar, tray, dashboard, OSD.
+        /// </summary>
+        private void OnPerformanceModeApplied(object? sender, string modeName)
+        {
+            Application.Current?.Dispatcher?.BeginInvoke(() =>
+            {
+                try
+                {
+                    RefreshLinkFanState();
+
+                    // Update MainViewModel's CurrentPerformanceMode for tray/sidebar sync
+                    CurrentPerformanceMode = modeName;
+                    
+                    // Update Dashboard if loaded
+                    if (_dashboard != null)
+                    {
+                        _dashboard.CurrentPerformanceMode = modeName;
+                    }
+                    
+                    // Update SystemControlViewModel's selected mode (without re-applying)
+                    SystemControl?.SelectModeByNameNoApply(modeName);
+                    _general?.SyncRuntimeState(modeName, CurrentFanMode);
+
+                    if (IsFanPerformanceLinked && TryEnterProfileSync())
+                    {
+                        try
+                        {
+                            var mappedFanMode = MapPerformanceModeToFanMode(modeName);
+                            var currentFanMode = _fanService.GetCurrentFanMode() ?? _fanService.ActivePresetName ?? CurrentFanMode;
+                            if (!string.Equals(currentFanMode, mappedFanMode, StringComparison.OrdinalIgnoreCase))
+                            {
+                                _logging.Info($"Link sync: Performance '{modeName}' -> Fan '{mappedFanMode}'");
+                                FanControl?.ApplyFanMode(mappedFanMode);
+                            }
+                        }
+                        finally
+                        {
+                            ExitProfileSync();
+                        }
+                    }
+                    
+                    _logging.Info($"UI synced: Performance mode '{modeName}' applied");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Warn($"UI sync failed for performance mode '{modeName}': {ex.Message}");
+                }
+            });
+        }
+
+        /// <summary>
+        /// Initialize the OSD overlay independently from the rest of hotkey setup.
+        /// Startup-minimized launches still need this service ready even if another
+        /// global hotkey is already reserved by Windows or another app.
+        /// </summary>
+        public void EnsureOsdInitialized()
+        {
+            try
+            {
+                _osdService?.SetMonitoringSampleSource(() => LatestMonitoringSample);
+                _osdService?.Initialize();
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to initialize OSD: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Initialize hotkeys after window handle is available
+        /// </summary>
+        public void InitializeHotkeys(IntPtr windowHandle)
+        {
+            if (_hotkeysInitialized)
+            {
+                _logging.Debug("InitializeHotkeys called after initialization - skipping duplicate setup");
+                return;
+            }
+
+            try
+            {
+                // Only register hotkeys if enabled in settings
+                var hotkeysEnabled = _config.Monitoring?.HotkeysEnabled ?? true;
+                var windowFocused = _config.Monitoring?.WindowFocusedHotkeys ?? true;
+                _windowFocusedHotkeysMode = windowFocused;
+                
+                _hotkeyService.Initialize(windowHandle);
+                
+                if (hotkeysEnabled)
+                {
+                    if (windowFocused)
+                    {
+                        // ToggleWindow (Ctrl+Shift+O) must ALWAYS be registered globally.
+                        // Its entire purpose is to bring the window back from tray — it must
+                        // fire even when the window is hidden/deactivated.
+                        _hotkeyService.RegisterHotkey(HotkeyAction.ToggleWindow, ModifierKeys.Control | ModifierKeys.Shift, Key.O);
+                        _hotkeyService.RegisterHotkey(HotkeyAction.ShowWindow, ModifierKeys.Windows, Key.F12);
+                        _logging.Info("Window restore hotkeys registered globally (window-focus mode)");
+
+                        // Attach to main window activation events so that the remaining hotkeys
+                        // are only active when the app has focus. This avoids conflicts with
+                        // other applications using the same shortcuts (e.g. games, editors).
+                        var wnd = Application.Current?.MainWindow;
+                        if (wnd != null)
+                        {
+                            if (!_windowFocusHandlersAttached)
+                            {
+                                wnd.Activated += OnMainWindowActivated;
+                                wnd.Deactivated += OnMainWindowDeactivated;
+                                _windowFocusHandlersAttached = true;
+                                _logging.Info("Window-focused hotkey behaviour enabled");
+                            }
+                            // If window already active, register immediately
+                            if (wnd.IsActive && !_windowHotkeysActive)
+                            {
+                                _hotkeyService.RegisterDefaultHotkeys();
+                                _windowHotkeysActive = true;
+                                _logging.Info("Hotkeys registered (window already active)");
+                                PushEvent("⌨️ Hotkeys active (window focus)");
+                            }
+                        }
+                        else
+                        {
+                            // Fallback: no window handle, just register normally
+                            _hotkeyService.RegisterDefaultHotkeys();
+                            _logging.Info("Global hotkeys registered (no window handle)");
+                            PushEvent("⌨️ Global hotkeys enabled");
+                        }
+                    }
+                    else
+                    {
+                        _hotkeyService.RegisterDefaultHotkeys();
+                        _windowHotkeysActive = true;
+                        _logging.Info("Global hotkeys registered");
+                        PushEvent("⌨️ Global hotkeys enabled");
+                    }
+                }
+                else
+                {
+                    _logging.Info("Global hotkeys disabled by user setting");
+                }
+                
+                // Start OMEN key interception if enabled
+                var omenKeyEnabled = _config.Features?.OmenKeyInterceptionEnabled ?? _config.OmenKeyEnabled;
+                if (omenKeyEnabled)
+                {
+                    _omenKeyService.StartInterception();
+                    _logging.Info("OMEN key interception started");
+                }
+                
+                EnsureOsdInitialized();
+
+                _hotkeysInitialized = true;
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to register hotkeys: {ex.Message}");
+            }
+        }
+        
+        /// <summary>
+        /// Get the OMEN key service for settings UI
+        /// </summary>
+        public OmenKeyService OmenKey => _omenKeyService;
+
+        /// <summary>
+        /// Get the notification service for external use
+        /// </summary>
+        public NotificationService Notifications => _notificationService;
+
+        /// <summary>
+        /// Get the hotkey service for external use
+        /// </summary>
+        public HotkeyService Hotkeys => _hotkeyService;
+
+        /// <summary>
+        /// Show the hotkey OSD popup with mode information
+        /// </summary>
+        private void ShowHotkeyOsd(string category, string modeName, string hotkeyText)
+        {
+            try
+            {
+                // Respect user preference for mode-change notifications.
+                if (_configService?.Config?.Osd?.ShowModeChangeNotifications == false)
+                {
+                    return;
+                }
+
+                // Create OSD window if it doesn't exist
+                if (_hotkeyOsd == null)
+                {
+                    _hotkeyOsd = new HotkeyOsdWindow();
+                    _logging.Info("HotkeyOsdWindow created");
+                }
+
+                _hotkeyOsd.ApplySettings(_configService?.Config?.Osd);
+                
+                _hotkeyOsd.ShowMode(category, modeName, $"via Hotkey ({hotkeyText})");
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to show hotkey OSD: {ex.Message}");
+            }
+        }
+
+        #region Hotkey focus handlers
+
+        private void OnMainWindowActivated(object? sender, EventArgs e)
+        {
+            _hotkeyService.RetryFailedHotkeys();
+
+            if (!_windowFocusedHotkeysMode || _windowHotkeysActive)
+            {
+                return;
+            }
+
+            try
+            {
+                _hotkeyService.RegisterDefaultHotkeys();
+                _windowHotkeysActive = true;
+                _logging.Info("Hotkeys registered (window activated)");
+                PushEvent("⌨️ Hotkeys active (window focused)");
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to register hotkeys on activate: {ex.Message}");
+            }
+        }
+
+        private void OnMainWindowDeactivated(object? sender, EventArgs e)
+        {
+            if (!_windowFocusedHotkeysMode || !_windowHotkeysActive)
+            {
+                return;
+            }
+
+            try
+            {
+                // Unregister all window-focused hotkeys EXCEPT ToggleWindow (Ctrl+Shift+O).
+                // ToggleWindow must stay registered so the app can be brought back from tray
+                // even when the window is hidden/deactivated.
+                _hotkeyService.UnregisterAllExcept(HotkeyAction.ToggleWindow, HotkeyAction.ShowWindow);
+                _windowHotkeysActive = false;
+                _logging.Info("Hotkeys unregistered (window deactivated; window restore hotkeys preserved)");
+                PushEvent("⌨️ Hotkeys inactive (window lost focus)");
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to unregister hotkeys on deactivate: {ex.Message}");
+            }
+        }
+        #endregion
+
+        #endregion
+
+        public void Dispose()
+        {
+            // First, while the NVAPI and undervolt services are still alive: an overclock or
+            // undervolt still in its Test Apply window was never kept and must not outlive the app.
+            try { _systemControl?.RevertPendingTuningTestsForShutdown(); }
+            catch (Exception ex) { _logging.Warn($"Reverting pending tuning tests on exit failed: {ex.Message}"); }
+
+            _trayActionDispatcher.Dispose();
+            _hotkeyCoordinator.Dispose();
+
+            _conflictMonitorCts.Cancel();
+            _conflictMonitorCts.Dispose();
+            
+            _safeModeResetTimer?.Dispose();
+            _safeModeResetTimer = null;
+            
+            // Unsubscribe from Settings events before disposing
+            if (_settings != null)
+            {
+                _settings.NavigateToBloatwareRequested -= OnBloatwareNavigationRequested;
+            }
+            
+            // Unsubscribe fan/performance service events before disposing
+            _fanService.PresetApplied -= OnFanPresetApplied;
+            _performanceModeService.ModeApplied -= OnPerformanceModeApplied;
+            _fanService.Dispose();
+
+            // Unsubscribe power-lifecycle events before disposing (GitHub #191-adjacent fix: these
+            // were never unsubscribed before, a pre-existing leak found while extracting GpuClamp).
+            _powerAutomationService.SystemSuspending -= OnSystemSuspending;
+            _powerAutomationService.SystemResuming -= OnSystemResuming;
+
+            // Before the undervolt service, which owns the SMU transport GpuClamp's APU clamp
+            // writes through. Releasing stops OmenCore putting the limits back; it does not restore
+            // the clamp.
+            GpuClamp.Dispose();
+            _undervoltService.Dispose();
+            _hardwareMonitoringService.SampleUpdated -= HardwareMonitoringServiceOnSampleUpdated;
+            _hardwareMonitoringService.HealthStatusChanged -= HardwareMonitoringServiceOnHealthStatusChanged;
+            _hardwareMonitoringService.Dispose();
+            _logging.LogEmitted -= HandleLogLine;
+
+            Update.Dispose();
+
+            // Unsubscribe game profile events
+            if (_gameProfileService != null)
+            {
+                _gameProfileService.ProfileApplyRequested -= OnGameProfileApplyRequested;
+                _gameProfileService.ProfileApplyRequested -= OnProfileApplyRequested;
+                _gameProfileService.ActiveProfileChanged -= OnActiveProfileChanged;
+            }
+            
+            // Unsubscribe hotkey events
+            if (_hotkeyService != null)
+            {
+                _hotkeyService.ToggleFanModeRequested -= OnHotkeyToggleFanMode;
+                _hotkeyService.ToggleMaxFanRequested -= OnHotkeyToggleMaxFan;
+                _hotkeyService.TogglePerformanceModeRequested -= OnHotkeyTogglePerformanceMode;
+                _hotkeyService.TogglePerformanceProfileRequested -= OnHotkeyTogglePerformanceProfile;
+                _hotkeyService.ToggleBoostModeRequested -= OnHotkeyToggleBoostMode;
+                _hotkeyService.ToggleQuietModeRequested -= OnHotkeyToggleQuietMode;
+                _hotkeyService.ShowWindowRequested -= OnHotkeyShowWindow;
+                _hotkeyService.OpenDashboardRequested -= OnHotkeyOpenDashboard;
+                _hotkeyService.ToggleWindowRequested -= OnHotkeyToggleWindow;
+            }
+            // Unsubscribe window focus handlers if attached
+            var wnd = Application.Current?.MainWindow;
+            if (wnd != null && _windowFocusHandlersAttached)
+            {
+                wnd.Activated -= OnMainWindowActivated;
+                wnd.Deactivated -= OnMainWindowDeactivated;
+                _windowFocusHandlersAttached = false;
+            }
+
+            // Dispose process monitoring and game profile services
+            _processMonitoringService?.Dispose();
+            _gameProfileService?.Dispose();
+
+            // Dispose hotkey and notification services
+            _hotkeyService?.Dispose();
+            _notificationService?.Dispose();
+            
+            // Unsubscribe OMEN key events before disposing the service
+            if (_omenKeyService != null)
+            {
+                _omenKeyService.ToggleOmenCoreRequested -= OnOmenKeyToggleWindow;
+                _omenKeyService.CyclePerformanceRequested -= OnHotkeyTogglePerformanceMode;
+                _omenKeyService.CycleFanModeRequested -= OnHotkeyToggleFanMode;
+                _omenKeyService.ToggleMaxCoolingRequested -= OnOmenKeyToggleMaxCooling;
+                _omenKeyService.ShowQuickPopupRequested -= OnOmenKeyShowQuickPopup;
+            }
+            // Dispose OMEN key service
+            _omenKeyService?.Dispose();
+            
+            // Dispose power automation service
+            _automationService?.Dispose();
+            _powerAutomationService?.Dispose();
+
+            // Dispose OSD services
+            _osdService?.Dispose();
+            _hotkeyOsd?.Close();
+
+            // Dispose device services
+            _corsairDeviceService?.Dispose();
+            _logitechDeviceService?.Dispose();
+            _screenSamplingService?.Dispose();
+            _audioReactiveRgbService?.Dispose();
+            _rgbSceneService?.Dispose();
+            _conflictDetectionService?.Dispose();
+
+            // Dispose thermal monitoring and hardware watchdog
+            _thermalMonitoringService = null;
+            _watchdogService?.Dispose();
+
+            // Clean up lazily-created child ViewModels that hold service event subscriptions
+            Lighting?.Cleanup();
+            _systemControl?.Cleanup();
+            _settings?.Dispose();
+            
+            // Dispose memory optimizer
+            _memoryOptimizer?.Dispose();
+            _lightingInitializationLock.Dispose();
+
+            // Release the hardware handles HardwareBringup acquired at startup (EC/PawnIO handle,
+            // WMI BIOS session, NVAPI driver context). None of these were disposed anywhere before -
+            // harmless while the process is exiting anyway (the OS reclaims the handles regardless),
+            // but releasing them explicitly is the documented-correct shutdown for NVAPI specifically
+            // (NvAPI_Unload) and avoids relying on finalizers for the WMI/PawnIO native handles. Placed
+            // last, after every other service that might still touch EC/WMI/NVAPI during its own
+            // disposal (fan restore, etc.) has already run.
+            try { _ecAccess?.Dispose(); }
+            catch (Exception ex) { _logging.Warn($"EC access dispose failed: {ex.Message}"); }
+            try { _wmiBiosMonitor?.Dispose(); }
+            catch (Exception ex) { _logging.Warn($"WmiBiosMonitor dispose failed: {ex.Message}"); }
+            try { _nvapiService?.Dispose(); }
+            catch (Exception ex) { _logging.Warn($"NvapiService dispose failed: {ex.Message}"); }
+        }
+
+        private void NoteDispatcherBeginInvoke(string source)
+        {
+            RuntimeUiPerformanceCounters.RecordDispatcherBeginInvokePost();
+            var beginCount = Interlocked.Increment(ref _dispatcherBeginInvokeCount);
+            if (beginCount % 200 == 0)
+            {
+                var elapsedSec = _dispatcherMetricsTimer.Elapsed.TotalSeconds;
+                var invokeCount = Interlocked.Read(ref _dispatcherInvokeCount);
+                _dispatcherMetricsTimer.Restart();
+                _logging.Debug($"[DispatcherMetrics] BeginInvoke={beginCount} Invoke={invokeCount} in {elapsedSec:F1}s (source={source})");
+            }
+        }
+
+        private void NoteDispatcherInvoke(string source)
+        {
+            RuntimeUiPerformanceCounters.RecordDispatcherInvoke();
+            var invokeCount = Interlocked.Increment(ref _dispatcherInvokeCount);
+            if (invokeCount % 50 == 0)
+            {
+                var beginCount = Interlocked.Read(ref _dispatcherBeginInvokeCount);
+                _logging.Debug($"[DispatcherMetrics] Invoke={invokeCount} BeginInvoke={beginCount} (source={source})");
+            }
+        }
+
+        private void InvokeOnUi(Action action, string source)
+        {
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher == null)
+            {
+                action();
+                return;
+            }
+
+            NoteDispatcherInvoke(source);
+            dispatcher.Invoke(action);
+        }
+
+        private bool TryEnterProfileSync()
+        {
+            lock (_profileSyncGateLock)
+            {
+                if (_profileSyncInProgress)
+                {
+                    return false;
+                }
+
+                _profileSyncInProgress = true;
+                return true;
+            }
+        }
+
+        private void ExitProfileSync()
+        {
+            lock (_profileSyncGateLock)
+            {
+                _profileSyncInProgress = false;
+            }
+        }
+
+        private string ResolveHotkeyFanCycleMode()
+        {
+            var current = _fanService.GetCurrentFanMode() ?? _fanService.ActivePresetName ?? CurrentFanMode;
+
+            if (string.IsNullOrWhiteSpace(current) || FanModeNameResolver.IsAutoAlias(current))
+            {
+                return "Auto";
+            }
+
+            if (FanModeNameResolver.IsQuietAlias(current))
+            {
+                return "Quiet";
+            }
+
+            if (current.Contains("Gaming", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Gaming";
+            }
+
+            if (current.Contains("Extreme", StringComparison.OrdinalIgnoreCase) ||
+                (FanModeNameResolver.IsPerformanceAlias(current) && !current.Contains("Gaming", StringComparison.OrdinalIgnoreCase)))
+            {
+                return "Extreme";
+            }
+
+            if (FanModeNameResolver.IsCustomAlias(current) || current.Contains("Manual", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Custom";
+            }
+
+            var customPreset = ResolveQuickAccessCurvePreset();
+            if (customPreset != null && string.Equals(current, customPreset.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                return "Custom";
+            }
+
+            return "Auto";
+        }
+
+        private string ResolveNextHotkeyFanMode(string currentCycleMode, out string targetMode)
+        {
+            var customPreset = ResolveQuickAccessCurvePreset();
+            return ProfileCycleService.ResolveNextFanMode(
+                currentCycleMode,
+                customPreset != null,
+                customPreset?.Name,
+                out targetMode);
+        }
+
+        private static string MapFanModeToPerformanceMode(string fanMode)
+            => FanPerformanceLinkMapper.MapFanModeToPerformanceMode(fanMode);
+
+        private static string MapPerformanceModeToFanMode(string performanceMode)
+            => FanPerformanceLinkMapper.MapPerformanceModeToFanMode(performanceMode);
+
+    }
+}

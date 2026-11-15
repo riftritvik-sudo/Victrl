@@ -1,0 +1,3449 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Drawing;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Media;
+using OmenCore.Corsair;
+using OmenCore.Logitech;
+using OmenCore.Models;
+using OmenCore.Razer;
+using OmenCore.Services;
+using OmenCore.Utils;
+using OmenCore.Views;
+
+namespace OmenCore.ViewModels
+{
+    public class LightingViewModel : ViewModelBase
+    {
+        private readonly CorsairDeviceService? _corsairService;
+        private readonly LogitechDeviceService? _logitechService;
+        private readonly RazerService? _razerService;
+        private readonly OmenCore.Services.Rgb.OpenRgbProvider? _openRgbProvider;
+        private readonly KeyboardLightingService? _keyboardLightingService;
+        private readonly ConfigurationService? _configService;
+        private readonly LoggingService _logging;
+        private readonly OmenCore.Services.Rgb.RgbManager? _rgbManager;
+        private readonly HardwareMonitoringService? _hardwareMonitoringService;
+        private readonly PerformanceModeService? _performanceModeService;
+        private readonly RgbSceneService? _sceneService;
+        private readonly ScreenSamplingService? _screenSamplingService;
+        private readonly AudioReactiveRgbService? _audioReactiveRgbService;
+        
+        private CorsairDevice? _selectedCorsairDevice;
+        private CorsairLightingPreset? _selectedCorsairPreset;
+        private LogitechDevice? _selectedLogitechDevice;
+        private string _logitechColorHex = "#E6002E";
+        private int _logitechBrightness = 80;
+        private string _corsairColorHex = "#FF0000";
+        private int _logitechRedValue = 230;
+        private int _logitechGreenValue = 0;
+        private int _logitechBlueValue = 46;
+        private MacroProfile? _selectedMacroProfile;
+        
+        // Scene-related fields
+        private RgbScene? _selectedScene;
+        private bool _isAmbientModeActive;
+        private bool _isAudioReactiveModeActive;
+        private AudioVisualizationMode _selectedAudioVisualizationMode = AudioVisualizationMode.Pulse;
+
+        // RGB tab card visibility toggles (user-controlled directly from RGB tab).
+        private bool _sceneQuickSelectCardEnabled = true;
+        private bool _corsairCardEnabled = true;
+        private bool _logitechCardEnabled = true;
+        private bool _razerCardEnabled = true;
+        private bool _hpOmenKeyboardCardEnabled = true;
+        
+        // 4-Zone Keyboard colors
+        private string _zone1ColorHex = "#E6002E"; // OMEN Red
+        private string _zone2ColorHex = "#0096FF"; // Blue
+        private string _zone3ColorHex = "#9B30FF"; // Purple
+        private string _zone4ColorHex = "#00FFFF"; // Cyan
+        private string _selectedPerKeyColorHex = "#E6002E";
+        private KeyboardPreset? _selectedKeyboardPreset;
+        private bool _colorsLoadedFromConfig; // Track if colors were loaded from saved config
+        private bool _applyKeyboardColorsOnStartup = true;
+        
+        // Temperature-responsive lighting
+        private bool _temperatureResponsiveLightingEnabled;
+        private bool _performanceModeSyncedLightingEnabled;
+        private bool _throttlingIndicatorLightingEnabled;
+        private double _cpuTempThresholdLow = 40;
+        private double _cpuTempThresholdMedium = 70;
+        private double _cpuTempThresholdHigh = 85;
+        private double _gpuTempThresholdLow = 35;
+        private double _gpuTempThresholdMedium = 65;
+        private double _gpuTempThresholdHigh = 80;
+        private string _tempLowColorHex = "#00FF00"; // Green
+        private string _tempMediumColorHex = "#FFFF00"; // Yellow
+        private string _tempHighColorHex = "#FF0000"; // Red
+        private string _throttlingColorHex = "#FF4500"; // Orange-Red
+        private DateTime _lastTemperatureLightingApplyUtc = DateTime.MinValue;
+        private DateTime _lastThrottlingLightingApplyUtc = DateTime.MinValue;
+        private string? _lastTemperatureLightingColorHex;
+        private bool _temperatureLightingApplyInFlight;
+        private bool _throttlingLightingApplyInFlight;
+        private const int TemperatureLightingMinIntervalSeconds = 5;
+        private const int TemperatureLightingSameColorRefreshSeconds = 30;
+        private const int ThrottlingLightingMinIntervalSeconds = 10;
+
+        // RGB sync trust signals
+        private string _lastRgbSyncSummary = "Ready to sync";
+        private string _lastRgbSyncDetail = "No sync has run this session.";
+        private System.Windows.Media.SolidColorBrush _lastRgbSyncBrush =
+            new(System.Windows.Media.Color.FromRgb(0x75, 0x75, 0x75));
+        private string _keyboardRestoreStatusText = "Ready to restore saved keyboard colors.";
+        
+        // Performance mode colors
+        private string _balancedModeColorHex = "#0096FF"; // Blue
+        private string _performanceModeColorHex = "#FF0000"; // Red
+        private string _quietModeColorHex = "#800080"; // Purple
+        private string _customModeColorHex = "#00FFFF"; // Cyan
+        
+        // Empty collections for when services are not available
+        private static readonly ReadOnlyObservableCollection<CorsairDevice> _emptyCorsairDevices = 
+            new(new ObservableCollection<CorsairDevice>());
+        private static readonly ReadOnlyObservableCollection<LogitechDevice> _emptyLogitechDevices = 
+            new(new ObservableCollection<LogitechDevice>());
+        private const string RgbObservationNotRecorded = "Not recorded";
+        private const string RgbObservationProbeColorHex = "#00FF66";
+        private string _selectedObservedRgbSurface = RgbObservationNotRecorded;
+        private string _rgbSurfaceObservationStatusText = "No RGB surface observation recorded.";
+
+        public ReadOnlyObservableCollection<CorsairDevice> CorsairDevices => _corsairService?.Devices ?? _emptyCorsairDevices;
+        public ReadOnlyObservableCollection<LogitechDevice> LogitechDevices => _logitechService?.Devices ?? _emptyLogitechDevices;
+        public ObservableCollection<CorsairLightingPreset> CorsairLightingPresets { get; } = new();
+        public ObservableCollection<KeyboardPreset> KeyboardPresets { get; } = new();
+        public ObservableCollection<string> RgbObservedSurfaceOptions { get; } = new()
+        {
+            RgbObservationNotRecorded,
+            "Keyboard zones changed",
+            "Per-key keys changed",
+            "Light bar changed",
+            "Single backlight changed",
+            "Nothing changed",
+            "Different or unknown surface changed"
+        };
+        public ICommand ApplyCorsairPresetToSystemCommand { get; }
+        public ICommand SyncAllRgbCommand { get; }
+        public ICommand OpenDynamicLightingSettingsCommand { get; }
+
+        /// <summary>
+        /// Banner for four-zone keyboards when Windows Dynamic Lighting owns HP's virtual lamp
+        /// device. Windows keeps repainting it, so colours applied here can revert or never show.
+        /// Reported, never changed: the toggle is Windows' and the user's.
+        /// </summary>
+        public string KeyboardDynamicLightingWarning =>
+            BuildKeyboardDynamicLightingWarning(_keyboardLightingService?.GetDynamicLightingState(),
+                                                _keyboardLightingService?.IsPerKey ?? false);
+
+        public bool HasKeyboardDynamicLightingWarning => KeyboardDynamicLightingWarning.Length > 0;
+
+        internal static string BuildKeyboardDynamicLightingWarning(
+            OmenCore.Services.KeyboardLighting.DynamicLightingState? state, bool isPerKey)
+        {
+            // Per-key keyboards get their own, differently-worded banner in the key map editor.
+            if (isPerKey || state == null || !state.DeviceFound || !state.WillRepaintWhenReleased)
+                return string.Empty;
+
+            return "Windows Dynamic Lighting is controlling this keyboard. Windows repaints it on its own " +
+                   "schedule, so colours set here may not appear or may revert. Turn Dynamic Lighting off " +
+                   "for the HP keyboard (or \"Use Dynamic Lighting on my devices\") to let OmenCore keep them.";
+        }
+
+        private void OpenDynamicLightingSettings()
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "ms-settings:personalization-lighting",
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"[Lighting] Could not open the Dynamic Lighting settings page: {ex.Message}");
+            }
+        }
+
+        /// <summary>Re-read the Dynamic Lighting banner, e.g. when the page comes back into view.</summary>
+        public void RefreshKeyboardDynamicLighting()
+        {
+            OnPropertyChanged(nameof(KeyboardDynamicLightingWarning));
+            OnPropertyChanged(nameof(HasKeyboardDynamicLightingWarning));
+        }
+        
+        #region Scene Properties
+        
+        /// <summary>
+        /// All available RGB scenes.
+        /// </summary>
+        public ObservableCollection<RgbScene> Scenes { get; } = new();
+        
+        /// <summary>
+        /// Currently selected scene.
+        /// </summary>
+        public RgbScene? SelectedScene
+        {
+            get => _selectedScene;
+            set
+            {
+                if (_selectedScene != value)
+                {
+                    _selectedScene = value;
+                    OnPropertyChanged();
+                    if (value != null && _sceneService != null)
+                    {
+                        _ = ApplySelectedSceneAsync();
+                    }
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Whether ambient/screen sampling mode is active.
+        /// </summary>
+        public bool IsAmbientModeActive
+        {
+            get => _isAmbientModeActive;
+            set
+            {
+                if (_isAmbientModeActive != value)
+                {
+                    _isAmbientModeActive = value;
+                    OnPropertyChanged();
+                    ToggleAmbientMode(value);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Whether audio-reactive (WASAPI loopback) mode is active.
+        /// </summary>
+        public bool IsAudioReactiveModeActive
+        {
+            get => _isAudioReactiveModeActive;
+            set
+            {
+                if (_isAudioReactiveModeActive != value)
+                {
+                    _isAudioReactiveModeActive = value;
+                    OnPropertyChanged();
+                    _ = ToggleAudioReactiveModeAsync(value);
+                }
+            }
+        }
+
+        public bool IsAudioReactiveModeAvailable => _audioReactiveRgbService != null;
+
+        public ObservableCollection<AudioVisualizationMode> AudioVisualizationModes { get; } = new();
+
+        public AudioVisualizationMode SelectedAudioVisualizationMode
+        {
+            get => _selectedAudioVisualizationMode;
+            set
+            {
+                if (_selectedAudioVisualizationMode != value)
+                {
+                    _selectedAudioVisualizationMode = value;
+                    if (_audioReactiveRgbService != null)
+                    {
+                        _audioReactiveRgbService.Mode = value;
+                    }
+                    OnPropertyChanged();
+                }
+            }
+        }
+
+        public float AudioReactiveSensitivity
+        {
+            get => _audioReactiveRgbService?.Sensitivity ?? 0.5f;
+            set
+            {
+                if (_audioReactiveRgbService == null)
+                    return;
+
+                var clamped = Math.Clamp(value, 0.1f, 1f);
+                if (Math.Abs(_audioReactiveRgbService.Sensitivity - clamped) > 0.001f)
+                {
+                    _audioReactiveRgbService.Sensitivity = clamped;
+                    OnPropertyChanged();
+                }
+            }
+        }
+
+        public string AudioReactiveLevelText => _audioReactiveRgbService == null
+            ? "Audio capture unavailable"
+            : $"Level: {Math.Round(_audioReactiveRgbService.CurrentLevel * 100)}%";
+        
+        /// <summary>
+        /// Whether scene service is available.
+        /// </summary>
+        public bool IsSceneServiceEnabled => _sceneService != null;
+
+        public bool SceneQuickSelectCardEnabled
+        {
+            get => _sceneQuickSelectCardEnabled;
+            set
+            {
+                if (SetProperty(ref _sceneQuickSelectCardEnabled, value))
+                {
+                    OnPropertyChanged(nameof(IsSceneQuickSelectCardContentVisible));
+                    PersistRgbCardToggleState();
+                }
+            }
+        }
+
+        public bool IsSceneQuickSelectCardContentVisible => SceneQuickSelectCardEnabled && IsSceneServiceEnabled;
+        
+        /// <summary>
+        /// Current scene name for display.
+        /// </summary>
+        public string CurrentSceneName => _sceneService?.CurrentScene?.Name ?? "None";
+        
+        /// <summary>
+        /// Current ambient color hex value.
+        /// </summary>
+        public string AmbientColorHex { get; private set; } = "#000000";
+        
+        /// <summary>
+        /// Command to apply selected scene.
+        /// </summary>
+        public ICommand ApplySceneCommand { get; }
+        
+        /// <summary>
+        /// Command to save current settings as a new scene.
+        /// </summary>
+        public ICommand SaveAsSceneCommand { get; }
+        
+        /// <summary>
+        /// Command to toggle ambient mode.
+        /// </summary>
+        public ICommand ToggleAmbientModeCommand { get; }
+
+        /// <summary>
+        /// Command to toggle audio-reactive mode.
+        /// </summary>
+        public ICommand ToggleAudioReactiveModeCommand { get; }
+        
+        #endregion
+        
+        // Connection status properties for UI badges
+        public bool IsCorsairConnected => CorsairDevices.Count > 0;
+        public bool IsLogitechConnected => LogitechDevices.Count > 0;
+        public bool IsRazerConnected => _razerService?.IsAvailable ?? false;
+        
+        // Service availability for UI visibility
+        public bool IsCorsairEnabled => _corsairService != null;
+        public bool IsLogitechEnabled => _logitechService != null;
+        public bool IsRazerEnabled => _razerService != null;
+
+        public bool CorsairCardEnabled
+        {
+            get => _corsairCardEnabled;
+            set
+            {
+                if (SetProperty(ref _corsairCardEnabled, value))
+                {
+                    OnPropertyChanged(nameof(IsCorsairCardContentVisible));
+                    PersistRgbCardToggleState();
+                }
+            }
+        }
+
+        public bool LogitechCardEnabled
+        {
+            get => _logitechCardEnabled;
+            set
+            {
+                if (SetProperty(ref _logitechCardEnabled, value))
+                {
+                    OnPropertyChanged(nameof(IsLogitechCardContentVisible));
+                    PersistRgbCardToggleState();
+                }
+            }
+        }
+
+        public bool RazerCardEnabled
+        {
+            get => _razerCardEnabled;
+            set
+            {
+                if (SetProperty(ref _razerCardEnabled, value))
+                {
+                    OnPropertyChanged(nameof(IsRazerCardContentVisible));
+                    PersistRgbCardToggleState();
+                }
+            }
+        }
+
+        public bool HpOmenKeyboardCardEnabled
+        {
+            get => _hpOmenKeyboardCardEnabled;
+            set
+            {
+                if (SetProperty(ref _hpOmenKeyboardCardEnabled, value))
+                {
+                    OnPropertyChanged(nameof(IsHpOmenKeyboardCardContentVisible));
+                    PersistRgbCardToggleState();
+                }
+            }
+        }
+
+        public bool IsCorsairCardContentVisible => CorsairCardEnabled;
+        public bool IsLogitechCardContentVisible => LogitechCardEnabled;
+        public bool IsRazerCardContentVisible => RazerCardEnabled;
+        public bool IsHpOmenKeyboardCardContentVisible => HpOmenKeyboardCardEnabled && IsKeyboardLightingAvailable;
+
+        // Provider status badges — color + detail from IRgbProvider.ConnectionStatus
+        private OmenCore.Services.Rgb.RgbProviderConnectionStatus GetProviderStatus(string id)
+            => _rgbManager?.GetProvider(id)?.ConnectionStatus
+               ?? OmenCore.Services.Rgb.RgbProviderConnectionStatus.Disabled;
+
+        private static System.Windows.Media.SolidColorBrush StatusToBrush(OmenCore.Services.Rgb.RgbProviderConnectionStatus status)
+            => status switch
+            {
+                OmenCore.Services.Rgb.RgbProviderConnectionStatus.Connected  => new(System.Windows.Media.Color.FromRgb(0x4C, 0xAF, 0x50)),
+                OmenCore.Services.Rgb.RgbProviderConnectionStatus.NoDevices  => new(System.Windows.Media.Color.FromRgb(0xFF, 0xC1, 0x07)),
+                OmenCore.Services.Rgb.RgbProviderConnectionStatus.Error      => new(System.Windows.Media.Color.FromRgb(0xF4, 0x43, 0x36)),
+                _                                                             => new(System.Windows.Media.Color.FromRgb(0x75, 0x75, 0x75)),
+            };
+
+        public System.Windows.Media.SolidColorBrush CorsairStatusBrush => StatusToBrush(GetProviderStatus("corsair"));
+        public string CorsairStatusDetail => _rgbManager?.GetProvider("corsair")?.StatusDetail ?? "Corsair iCUE not configured";
+
+        public System.Windows.Media.SolidColorBrush LogitechStatusBrush => StatusToBrush(GetProviderStatus("logitech"));
+        public string LogitechStatusDetail => _rgbManager?.GetProvider("logitech")?.StatusDetail ?? "Logitech G HUB not configured";
+
+        public System.Windows.Media.SolidColorBrush RazerStatusBrush => StatusToBrush(GetProviderStatus("razer"));
+        public string RazerStatusDetail => _rgbManager?.GetProvider("razer")?.StatusDetail ?? "Razer Synapse not configured";
+
+        /// <summary>
+        /// Human-readable summary of which RGB backends are currently in control.
+        /// Shows HP keyboard backend + each connected peripheral provider.
+        /// </summary>
+        public string RgbOwnershipSummary
+        {
+            get
+            {
+                var parts = new System.Collections.Generic.List<string>();
+
+                if (IsKeyboardLightingAvailable && _keyboardLightingService != null)
+                {
+                    parts.Add($"HP Keyboard ({_keyboardLightingService.BackendType})");
+                }
+                else if (_keyboardLightingService?.IsPerKeyCapableHardware == true)
+                {
+                    parts.Add("HP Keyboard (unavailable)");
+                }
+
+                var providers = _rgbManager?.AvailableProviders
+                    .Where(p => p.ProviderId != "system" && p.IsAvailable)
+                    .ToList();
+
+                if (providers != null)
+                {
+                    foreach (var p in providers)
+                    {
+                        var deviceInfo = p.DeviceCount > 0 ? $"{p.DeviceCount} device{(p.DeviceCount == 1 ? "" : "s")}" : "no devices";
+                        parts.Add($"{p.ProviderName} ({deviceInfo})");
+                    }
+                }
+
+                if (parts.Count == 0)
+                    return "No active RGB controllers detected";
+
+                return string.Join(", ", parts);
+            }
+        }
+
+        public string RgbOwnershipVisualState
+        {
+            get
+            {
+                if (HasRgbConflictWarning)
+                    return "overwritten";
+
+                return ActiveRgbTargetCount > 0 ? "confirmed" : "degraded";
+            }
+        }
+
+        public string RgbOwnershipVisualLabel => RgbOwnershipVisualState switch
+        {
+            "overwritten" => "Overwritten risk",
+            "degraded" => "Degraded",
+            _ => "Confirmed"
+        };
+
+        /// <summary>
+        /// Active HP keyboard lighting backend path name (e.g. "WMI BIOS", "V2:ColorTable", "EC").
+        /// </summary>
+        public string HpKeyboardActiveBackend => _keyboardLightingService?.BackendType ?? "N/A";
+
+        /// <summary>
+        /// True when a known RGB conflict process (OMEN Light Studio, OmenCap, OGH) is detected running.
+        /// </summary>
+        public bool HasRgbConflictWarning => DetectRgbConflictProcess() != null;
+
+        /// <summary>
+        /// Conflict warning text when a known conflicting process is detected.
+        /// </summary>
+        public string RgbConflictWarningText
+        {
+            get
+            {
+                var conflict = DetectRgbConflictProcess();
+                return conflict == null
+                    ? string.Empty
+                    : $"{conflict} is running and may override OmenCore keyboard lighting. Close it to allow OmenCore full control.";
+            }
+        }
+
+        private static string? DetectRgbConflictProcess()
+        {
+            // Light-weight process check — only looks at running process names, no WMI required.
+            var conflictCandidates = new[]
+            {
+                ("OmenLightStudio",             "OMEN Light Studio"),
+                ("HPOmenLightStudio",           "OMEN Light Studio"),
+                ("OmenCommandCenterBackground", "OMEN Gaming Hub"),
+                ("HPOmenCommandCenter",         "OMEN Gaming Hub"),
+            };
+
+            foreach (var (procName, displayName) in conflictCandidates)
+            {
+                try
+                {
+                    if (System.Diagnostics.Process.GetProcessesByName(procName).Length > 0)
+                        return displayName;
+                }
+                catch
+                {
+                    // Process enumeration can fail in constrained environments; skip.
+                }
+            }
+
+            return null;
+        }
+
+        public int ActiveRgbTargetCount
+        {
+            get
+            {
+                var providerCount = _rgbManager?.AvailableProviders.Count(p => p.ProviderId != "system") ?? 0;
+                return providerCount + (IsKeyboardLightingAvailable ? 1 : 0);
+            }
+        }
+
+        public string RgbSyncParticipantSummary =>
+            ActiveRgbTargetCount == 1
+                ? "1 active lighting target"
+                : $"{ActiveRgbTargetCount} active lighting targets";
+
+        public string LastRgbSyncSummary
+        {
+            get => _lastRgbSyncSummary;
+            private set
+            {
+                if (SetProperty(ref _lastRgbSyncSummary, value))
+                {
+                    OnPropertyChanged(nameof(LastRgbSyncVisualState));
+                    OnPropertyChanged(nameof(LastRgbSyncVisualLabel));
+                }
+            }
+        }
+
+        public string LastRgbSyncDetail
+        {
+            get => _lastRgbSyncDetail;
+            private set => SetProperty(ref _lastRgbSyncDetail, value);
+        }
+
+        public System.Windows.Media.SolidColorBrush LastRgbSyncBrush
+        {
+            get => _lastRgbSyncBrush;
+            private set => SetProperty(ref _lastRgbSyncBrush, value);
+        }
+
+        public string LastRgbSyncVisualState
+        {
+            get
+            {
+                if (LastRgbSyncSummary.StartsWith("Sync failed", StringComparison.OrdinalIgnoreCase))
+                    return "blocked";
+
+                if (LastRgbSyncSummary.StartsWith("Partial", StringComparison.OrdinalIgnoreCase) ||
+                    LastRgbSyncSummary.StartsWith("No RGB", StringComparison.OrdinalIgnoreCase) ||
+                    LastRgbSyncSummary.StartsWith("Ready", StringComparison.OrdinalIgnoreCase))
+                {
+                    return "degraded";
+                }
+
+                return "confirmed";
+            }
+        }
+
+        public string LastRgbSyncVisualLabel => LastRgbSyncVisualState switch
+        {
+            "blocked" => "Blocked",
+            "degraded" => "Degraded",
+            _ => "Confirmed"
+        };
+        
+        // Razer properties
+        private readonly ObservableCollection<RazerDevice> _razerDevices = new();
+        private string _razerColorHex = "#00FF00"; // Razer Green
+        private int _razerRedValue = 0;
+        private int _razerGreenValue = 255;
+        private int _razerBlueValue = 0;
+        
+        public ObservableCollection<RazerDevice> RazerDevices => _razerDevices;
+        public bool HasRazerDevices => _razerDevices.Count > 0;
+        public bool IsRazerAvailable => _razerService?.IsAvailable ?? false;
+        public string RazerDeviceStatusText => IsRazerAvailable 
+            ? $"{_razerDevices.Count} device(s) detected" 
+            : "Razer Synapse not detected";
+        
+        public string RazerColorHex
+        {
+            get => _razerColorHex;
+            set
+            {
+                if (_razerColorHex != value)
+                {
+                    _razerColorHex = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public int RazerRedValue
+        {
+            get => _razerRedValue;
+            set
+            {
+                if (_razerRedValue != value)
+                {
+                    _razerRedValue = Math.Clamp(value, 0, 255);
+                    OnPropertyChanged();
+                    UpdateRazerHexFromRgb();
+                }
+            }
+        }
+        
+        public int RazerGreenValue
+        {
+            get => _razerGreenValue;
+            set
+            {
+                if (_razerGreenValue != value)
+                {
+                    _razerGreenValue = Math.Clamp(value, 0, 255);
+                    OnPropertyChanged();
+                    UpdateRazerHexFromRgb();
+                }
+            }
+        }
+        
+        public int RazerBlueValue
+        {
+            get => _razerBlueValue;
+            set
+            {
+                if (_razerBlueValue != value)
+                {
+                    _razerBlueValue = Math.Clamp(value, 0, 255);
+                    OnPropertyChanged();
+                    UpdateRazerHexFromRgb();
+                }
+            }
+        }
+        
+        // OpenRGB properties
+        public bool HasOpenRgbDevices => _openRgbProvider?.IsAvailable ?? false;
+        public int OpenRgbDeviceCount => _openRgbProvider?.DeviceCount ?? 0;
+        public string OpenRgbStatusText => HasOpenRgbDevices 
+            ? $"{OpenRgbDeviceCount} device(s) via OpenRGB" 
+            : "OpenRGB server not detected";
+        public System.Collections.Generic.IReadOnlyList<OmenCore.Services.Rgb.OpenRgbDevice> OpenRgbDevices => 
+            _openRgbProvider?.Devices ?? new System.Collections.Generic.List<OmenCore.Services.Rgb.OpenRgbDevice>();
+        
+        /// <summary>
+        /// True if any Corsair devices have been discovered.
+        /// Used to hide the Corsair section when no devices are connected.
+        /// </summary>
+        public bool HasCorsairDevices => CorsairDevices.Count > 0;
+        
+        /// <summary>
+        /// True if any Logitech devices have been discovered.
+        /// Used to hide the Logitech section when no devices are connected.
+        /// </summary>
+        public bool HasLogitechDevices => LogitechDevices.Count > 0;
+        
+        /// <summary>
+        /// True if HP OMEN keyboard lighting is available.
+        /// Used to show/hide the keyboard lighting section.
+        /// </summary>
+        public bool IsKeyboardLightingAvailable => _keyboardLightingService?.IsAvailable ?? false;
+
+        /// <summary>
+        /// What the "Keyboard Unavailable" card says. A backlight-only keyboard (GitHub #217) has
+        /// nothing wrong with it - there are simply no colours to set - and must not read like a fault.
+        /// </summary>
+        public string KeyboardUnavailableMessage => BuildKeyboardUnavailableMessage(
+            _keyboardLightingService?.IsBacklightOnlyKeyboard ?? false);
+
+        internal static string BuildKeyboardUnavailableMessage(bool backlightOnly) => backlightOnly
+            ? "This laptop has a single-colour backlit keyboard, so there are no colours to set (the firmware and OmenCore's model database agree). Use the Fn keys to adjust brightness."
+            : "Keyboard lighting control is not available on this system.";
+
+        public bool IsPerKeyLightingAvailable => _keyboardLightingService?.IsPerKey ?? false;
+
+        public bool IsPerKeyHardwareCapable => _keyboardLightingService?.IsPerKeyCapableHardware ?? false;
+
+        private KeyboardMapViewModel? _keyboardMap;
+
+        /// <summary>
+        /// The measured-layout editor, built lazily because constructing it interrogates the
+        /// keyboard for its lamp map and that should not happen while the view is being composed.
+        /// </summary>
+        public KeyboardMapViewModel KeyboardMap =>
+            _keyboardMap ??= new KeyboardMapViewModel(_keyboardLightingService, _logging, _configService);
+
+        /// <summary>Whether the backend read a real key layout off this keyboard.</summary>
+        public bool HasMeasuredKeyMap => KeyboardMap.IsAvailable;
+
+        /// <summary>
+        /// The fixed 6 x 14 editor is shown only where there is no measured layout to show instead.
+        /// Both at once would be two editors for one keyboard, disagreeing about what is on it.
+        /// </summary>
+        public bool IsFixedGridEditorVisible => IsPerKeyLightingAvailable && !HasMeasuredKeyMap;
+
+        private DeviceLightingViewModel? _deviceLighting;
+
+        /// <summary>The keyboard's built-in effect engine and the light bar - hardware-rendered
+        /// surfaces, as opposed to the host-painted per-key picture above.</summary>
+        public DeviceLightingViewModel DeviceLighting =>
+            _deviceLighting ??= new DeviceLightingViewModel(_keyboardLightingService, _logging, _configService);
+
+        public bool HasDeviceEffects => DeviceLighting.SupportsDeviceEffects;
+        public bool HasLightBar => DeviceLighting.IsLightBarAvailable;
+
+        private Hardware.ModelCapabilities? _capabilities;
+
+        private Hardware.ModelCapabilities Capabilities =>
+            _capabilities ??= Hardware.ModelCapabilityDatabase.GetCapabilities(Hardware.OmenBoard.Product);
+
+        /// <summary>
+        /// Whether this chassis has a four-zone KEYBOARD, which is what the zone editor edits.
+        ///
+        /// Read from the capability database rather than inferred, and the distinction it keeps
+        /// straight is the one that made this board so confusing to diagnose: on a per-key machine
+        /// the four-zone commands still succeed, but they land on the LIGHT BAR. So the zone editor
+        /// appeared to work while the keyboard never changed, and every report of it read as "the
+        /// keyboard is broken" rather than "this is the wrong surface".
+        ///
+        /// Hiding it here is only safe because the light bar now has a card of its own. Before
+        /// that, this editor was the only way to reach the bar at all.
+        /// </summary>
+        public bool HasFourZoneKeyboard => Capabilities.HasFourZoneRgb;
+
+        public string PerKeyCapabilitySummary =>
+            BuildPerKeyCapabilitySummary(IsPerKeyLightingAvailable, IsPerKeyHardwareCapable);
+
+        public static string BuildPerKeyCapabilitySummary(bool isPerKeyLightingAvailable, bool isPerKeyHardwareCapable)
+        {
+            if (isPerKeyLightingAvailable)
+            {
+                return "Per-key RGB editor is active for this keyboard.";
+            }
+
+            if (isPerKeyHardwareCapable)
+            {
+                return "Per-key RGB capable hardware detected. OmenCore currently cannot open the per-key editor on this backend yet; zone lighting remains available in this build.";
+            }
+
+            return "Per-key RGB is available on select OMEN Max models with HID per-key keyboards. This keyboard does not support per-key control.";
+        }
+        
+        /// <summary>
+        /// Backend type for keyboard lighting (WMI BIOS, WMI, EC, or None).
+        /// </summary>
+        public string KeyboardLightingBackend => _keyboardLightingService?.BackendType ?? "None";
+        
+        /// <summary>
+        /// Helpful status/hint message for keyboard lighting.
+        /// Shows tips if WMI-based control may not work on certain models.
+        /// </summary>
+        public string KeyboardLightingHint
+        {
+            get
+            {
+                if (!IsKeyboardLightingAvailable)
+                    return "Keyboard RGB not detected on this system.";
+                
+                var backend = KeyboardLightingBackend;
+                if (backend.Contains("WMI"))
+                {
+                    return "💡 If colors don't change, try enabling 'Experimental EC Keyboard' in Settings → Hardware.";
+                }
+                else if (backend.Contains("EC"))
+                {
+                    return "Using EC direct access (experimental). Changes may take a moment to apply.";
+                }
+                else if (backend.Contains("OGH"))
+                {
+                    return "Using OMEN Gaming Hub proxy. Ensure Gaming Hub services are running.";
+                }
+                return string.Empty;
+            }
+        }
+
+        public string KeyboardRestoreStatusText
+        {
+            get => _keyboardRestoreStatusText;
+            private set => SetProperty(ref _keyboardRestoreStatusText, value);
+        }
+
+        public string SelectedObservedRgbSurface
+        {
+            get => _selectedObservedRgbSurface;
+            set => SetProperty(ref _selectedObservedRgbSurface, value);
+        }
+
+        public string RgbSurfaceObservationStatusText
+        {
+            get => _rgbSurfaceObservationStatusText;
+            private set => SetProperty(ref _rgbSurfaceObservationStatusText, value);
+        }
+        
+        /// <summary>
+        /// Whether to automatically apply saved keyboard colors on startup.
+        /// </summary>
+        public bool ApplyKeyboardColorsOnStartup
+        {
+            get => _applyKeyboardColorsOnStartup;
+            set
+            {
+                if (_applyKeyboardColorsOnStartup != value)
+                {
+                    _applyKeyboardColorsOnStartup = value;
+                    OnPropertyChanged();
+                    SaveKeyboardStartupSetting();
+                }
+            }
+        }
+
+        #region Zone Color Properties
+        
+        public string Zone1ColorHex
+        {
+            get => _zone1ColorHex;
+            set
+            {
+                if (_zone1ColorHex != value)
+                {
+                    _zone1ColorHex = value;
+                    OnPropertyChanged();
+                    OnPropertyChanged(nameof(Zone1Brush));
+                }
+            }
+        }
+        
+        public string Zone2ColorHex
+        {
+            get => _zone2ColorHex;
+            set
+            {
+                if (_zone2ColorHex != value)
+                {
+                    _zone2ColorHex = value;
+                    OnPropertyChanged();
+                    OnPropertyChanged(nameof(Zone2Brush));
+                }
+            }
+        }
+        
+        public string Zone3ColorHex
+        {
+            get => _zone3ColorHex;
+            set
+            {
+                if (_zone3ColorHex != value)
+                {
+                    _zone3ColorHex = value;
+                    OnPropertyChanged();
+                    OnPropertyChanged(nameof(Zone3Brush));
+                }
+            }
+        }
+        
+        public string Zone4ColorHex
+        {
+            get => _zone4ColorHex;
+            set
+            {
+                if (_zone4ColorHex != value)
+                {
+                    _zone4ColorHex = value;
+                    OnPropertyChanged();
+                    OnPropertyChanged(nameof(Zone4Brush));
+                }
+            }
+        }
+        
+        // Brushes for XAML binding
+        public SolidColorBrush Zone1Brush => new(ParseMediaColor(_zone1ColorHex));
+        public SolidColorBrush Zone2Brush => new(ParseMediaColor(_zone2ColorHex));
+        public SolidColorBrush Zone3Brush => new(ParseMediaColor(_zone3ColorHex));
+        public SolidColorBrush Zone4Brush => new(ParseMediaColor(_zone4ColorHex));
+
+        // Per-Key lighting
+        public ObservableCollection<PerKeyCell> PerKeyGrid { get; } = new();
+
+        public string SelectedPerKeyColorHex
+        {
+            get => _selectedPerKeyColorHex;
+            set
+            {
+                if (_selectedPerKeyColorHex != value)
+                {
+                    _selectedPerKeyColorHex = value;
+                    OnPropertyChanged();
+                    OnPropertyChanged(nameof(SelectedPerKeyColorBrush));
+                }
+            }
+        }
+
+        public SolidColorBrush SelectedPerKeyColorBrush => new(ParseMediaColor(_selectedPerKeyColorHex));
+        
+        public KeyboardPreset? SelectedKeyboardPreset
+        {
+            get => _selectedKeyboardPreset;
+            set
+            {
+                if (_selectedKeyboardPreset != value)
+                {
+                    _selectedKeyboardPreset = value;
+                    OnPropertyChanged();
+                    if (value != null)
+                    {
+                        ApplyKeyboardPresetColors(value);
+                    }
+                }
+            }
+        }
+        
+        #endregion
+
+        #region Temperature-Responsive Lighting Properties
+        
+        public bool TemperatureResponsiveLightingEnabled
+        {
+            get => _temperatureResponsiveLightingEnabled;
+            set
+            {
+                if (_temperatureResponsiveLightingEnabled != value)
+                {
+                    _temperatureResponsiveLightingEnabled = value;
+                    OnPropertyChanged();
+                    if (value)
+                    {
+                        StartTemperatureMonitoring();
+                    }
+                    else
+                    {
+                        StopTemperatureMonitoring();
+                    }
+                }
+            }
+        }
+        
+        public bool PerformanceModeSyncedLightingEnabled
+        {
+            get => _performanceModeSyncedLightingEnabled;
+            set
+            {
+                if (_performanceModeSyncedLightingEnabled != value)
+                {
+                    _performanceModeSyncedLightingEnabled = value;
+                    OnPropertyChanged();
+                    if (value)
+                    {
+                        StartPerformanceModeMonitoring();
+                    }
+                    else
+                    {
+                        StopPerformanceModeMonitoring();
+                    }
+                }
+            }
+        }
+        
+        public bool ThrottlingIndicatorLightingEnabled
+        {
+            get => _throttlingIndicatorLightingEnabled;
+            set
+            {
+                if (_throttlingIndicatorLightingEnabled != value)
+                {
+                    _throttlingIndicatorLightingEnabled = value;
+                    OnPropertyChanged();
+                    if (value)
+                    {
+                        StartThrottlingMonitoring();
+                    }
+                    else
+                    {
+                        StopThrottlingMonitoring();
+                    }
+                }
+            }
+        }
+        
+        public double CpuTempThresholdLow
+        {
+            get => _cpuTempThresholdLow;
+            set
+            {
+                if (_cpuTempThresholdLow != value)
+                {
+                    _cpuTempThresholdLow = Math.Clamp(value, 20, 80);
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public double CpuTempThresholdMedium
+        {
+            get => _cpuTempThresholdMedium;
+            set
+            {
+                if (_cpuTempThresholdMedium != value)
+                {
+                    _cpuTempThresholdMedium = Math.Clamp(value, 40, 90);
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public double CpuTempThresholdHigh
+        {
+            get => _cpuTempThresholdHigh;
+            set
+            {
+                if (_cpuTempThresholdHigh != value)
+                {
+                    _cpuTempThresholdHigh = Math.Clamp(value, 60, 100);
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public double GpuTempThresholdLow
+        {
+            get => _gpuTempThresholdLow;
+            set
+            {
+                if (_gpuTempThresholdLow != value)
+                {
+                    _gpuTempThresholdLow = Math.Clamp(value, 20, 70);
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public double GpuTempThresholdMedium
+        {
+            get => _gpuTempThresholdMedium;
+            set
+            {
+                if (_gpuTempThresholdMedium != value)
+                {
+                    _gpuTempThresholdMedium = Math.Clamp(value, 35, 85);
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public double GpuTempThresholdHigh
+        {
+            get => _gpuTempThresholdHigh;
+            set
+            {
+                if (_gpuTempThresholdHigh != value)
+                {
+                    _gpuTempThresholdHigh = Math.Clamp(value, 50, 95);
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public string TempLowColorHex
+        {
+            get => _tempLowColorHex;
+            set
+            {
+                if (_tempLowColorHex != value)
+                {
+                    _tempLowColorHex = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public string TempMediumColorHex
+        {
+            get => _tempMediumColorHex;
+            set
+            {
+                if (_tempMediumColorHex != value)
+                {
+                    _tempMediumColorHex = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public string TempHighColorHex
+        {
+            get => _tempHighColorHex;
+            set
+            {
+                if (_tempHighColorHex != value)
+                {
+                    _tempHighColorHex = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public string ThrottlingColorHex
+        {
+            get => _throttlingColorHex;
+            set
+            {
+                if (_throttlingColorHex != value)
+                {
+                    _throttlingColorHex = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public string BalancedModeColorHex
+        {
+            get => _balancedModeColorHex;
+            set
+            {
+                if (_balancedModeColorHex != value)
+                {
+                    _balancedModeColorHex = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public string PerformanceModeColorHex
+        {
+            get => _performanceModeColorHex;
+            set
+            {
+                if (_performanceModeColorHex != value)
+                {
+                    _performanceModeColorHex = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public string QuietModeColorHex
+        {
+            get => _quietModeColorHex;
+            set
+            {
+                if (_quietModeColorHex != value)
+                {
+                    _quietModeColorHex = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        public string CustomModeColorHex
+        {
+            get => _customModeColorHex;
+            set
+            {
+                if (_customModeColorHex != value)
+                {
+                    _customModeColorHex = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+        
+        #endregion
+
+        public CorsairDevice? SelectedCorsairDevice
+        {
+            get => _selectedCorsairDevice;
+            set
+            {
+                if (_selectedCorsairDevice != value)
+                {
+                    _selectedCorsairDevice = value;
+                    OnPropertyChanged();
+                    (ApplyCorsairLightingCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+                }
+            }
+        }
+
+        public CorsairLightingPreset? SelectedCorsairPreset
+        {
+            get => _selectedCorsairPreset;
+            set
+            {
+                if (_selectedCorsairPreset != value)
+                {
+                    _selectedCorsairPreset = value;
+                    OnPropertyChanged();
+                    OnPropertyChanged(nameof(SelectedCorsairLightingPreset));
+                    (ApplyCorsairLightingCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+                    (ApplyCorsairPresetToSystemCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+                }
+            }
+        }
+
+        // Alias for XAML binding compatibility
+        public CorsairLightingPreset? SelectedCorsairLightingPreset
+        {
+            get => SelectedCorsairPreset;
+            set => SelectedCorsairPreset = value;
+        }
+
+        public LogitechDevice? SelectedLogitechDevice
+        {
+            get => _selectedLogitechDevice;
+            set
+            {
+                if (_selectedLogitechDevice != value)
+                {
+                    _selectedLogitechDevice = value;
+                    OnPropertyChanged();
+                    if (value != null)
+                    {
+                        LogitechColorHex = value.CurrentColorHex;
+                        LogitechBrightness = value.Status.BrightnessPercent;
+                    }
+                    (ApplyLogitechColorCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+                }
+            }
+        }
+
+        public string LogitechColorHex
+        {
+            get => _logitechColorHex;
+            set
+            {
+                if (_logitechColorHex != value)
+                {
+                    _logitechColorHex = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+
+        public int LogitechBrightness
+        {
+            get => _logitechBrightness;
+            set
+            {
+                if (_logitechBrightness != value)
+                {
+                    _logitechBrightness = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+
+        public string CorsairColorHex
+        {
+            get => _corsairColorHex;
+            set
+            {
+                if (_corsairColorHex != value)
+                {
+                    _corsairColorHex = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+
+        public int LogitechRedValue
+        {
+            get => _logitechRedValue;
+            set
+            {
+                if (_logitechRedValue != value)
+                {
+                    _logitechRedValue = Math.Clamp(value, 0, 255);
+                    OnPropertyChanged();
+                    UpdateLogitechHexFromRgb();
+                }
+            }
+        }
+
+        public int LogitechGreenValue
+        {
+            get => _logitechGreenValue;
+            set
+            {
+                if (_logitechGreenValue != value)
+                {
+                    _logitechGreenValue = Math.Clamp(value, 0, 255);
+                    OnPropertyChanged();
+                    UpdateLogitechHexFromRgb();
+                }
+            }
+        }
+
+        public int LogitechBlueValue
+        {
+            get => _logitechBlueValue;
+            set
+            {
+                if (_logitechBlueValue != value)
+                {
+                    _logitechBlueValue = Math.Clamp(value, 0, 255);
+                    OnPropertyChanged();
+                    UpdateLogitechHexFromRgb();
+                }
+            }
+        }
+
+        public MacroProfile? SelectedMacroProfile
+        {
+            get => _selectedMacroProfile;
+            set
+            {
+                if (_selectedMacroProfile != value)
+                {
+                    _selectedMacroProfile = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+
+        public ObservableCollection<MacroProfile> MacroProfiles { get; } = new();
+
+        // System RGB
+        private string _systemColorHex = "#FF0000";
+        public string SystemColorHex
+        {
+            get => _systemColorHex;
+            set
+            {
+                if (_systemColorHex != value)
+                {
+                    _systemColorHex = value;
+                    OnPropertyChanged();
+                }
+            }
+        }
+
+        public ICommand ApplyToSystemCommand { get; }
+
+        private async Task ApplyColorToSystemAsync()
+        {
+            if (_rgbManager == null) return;
+            await _rgbManager.ApplyEffectToAllAsync($"color:{SystemColorHex}");
+        }
+
+        public string CorsairDeviceStatusText => $"{CorsairDevices.Count} device(s) detected";
+        public string LogitechDeviceStatusText => $"{LogitechDevices.Count} device(s) detected";
+        public bool HasCorsairMouse => CorsairDevices.Any(d => d.DeviceType == CorsairDeviceType.Mouse);
+        public ObservableCollection<CorsairDpiStage> CorsairDpiStages { get; } = new();
+        public ObservableCollection<OmenCore.Corsair.CorsairDpiProfile> CorsairDpiProfiles { get; } = new();
+        private OmenCore.Corsair.CorsairDpiProfile? _selectedCorsairDpiProfile;
+        public OmenCore.Corsair.CorsairDpiProfile? SelectedCorsairDpiProfile
+        {
+            get => _selectedCorsairDpiProfile;
+            set
+            {
+                if (_selectedCorsairDpiProfile != value)
+                {
+                    _selectedCorsairDpiProfile = value;
+                    OnPropertyChanged();
+                    (ApplyCorsairDpiProfileCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+                    (DeleteCorsairDpiProfileCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
+                }
+            }
+        }
+
+        public ICommand ApplyCorsairLightingCommand { get; }
+        public ICommand ApplyCorsairCustomColorCommand { get; }
+        public ICommand ApplyCorsairDpiCommand { get; }
+        public ICommand RestoreCorsairDpiCommand { get; }
+        public ICommand SaveCorsairDpiProfileCommand { get; }
+        public ICommand ApplyCorsairDpiProfileCommand { get; }
+        public ICommand DeleteCorsairDpiProfileCommand { get; }
+        public ICommand FlashCorsairDeviceCommand { get; }
+        public ICommand ApplyLogitechColorCommand { get; }
+        public ICommand DiscoverCorsairDevicesCommand { get; }
+        public ICommand DiscoverLogitechDevicesCommand { get; }
+        public ICommand LoadMacroProfileCommand { get; }
+        
+        // Razer Commands
+        public ICommand DiscoverRazerDevicesCommand { get; }
+        public ICommand ApplyRazerColorCommand { get; }
+        public ICommand ApplyRazerBreathingCommand { get; }
+        public ICommand ApplyRazerSpectrumCommand { get; }
+        
+        // OpenRGB Commands
+        public ICommand ApplyOpenRgbColorCommand { get; }
+        
+        // 4-Zone Keyboard Commands
+        public ICommand ApplyKeyboardColorsCommand { get; }
+        public ICommand RestoreKeyboardLightingCommand { get; }
+        public ICommand RunRgbSurfaceProbeCommand { get; }
+        public ICommand SaveRgbSurfaceObservationCommand { get; }
+        public ICommand ApplyAllZonesSameColorCommand { get; }
+        public ICommand ApplyQuickColorCommand { get; }
+        public ICommand SetZone1ColorCommand { get; }
+        public ICommand SetZone2ColorCommand { get; }
+        public ICommand SetZone3ColorCommand { get; }
+        public ICommand SetZone4ColorCommand { get; }
+
+        /// <summary>
+        /// Synthetic keyboard-shaped visual for the four-zone editor - not read from any device,
+        /// just a standard TKL laptop layout with each key tagged to the zone it falls under. Lets
+        /// the existing Zone1..Zone4 pickers be clicked on a keyboard shape instead of four labelled
+        /// rectangles. See <see cref="FourZoneKeyboardLayout"/>.
+        /// </summary>
+        public IReadOnlyList<FourZoneKeyVisual> FourZoneKeys => FourZoneKeyboardLayout.Keys;
+        public double FourZoneCanvasWidth => FourZoneKeyboardLayout.CanvasWidth;
+        public double FourZoneCanvasHeight => FourZoneKeyboardLayout.CanvasHeight;
+
+        /// <summary>Routes a click on the four-zone keyboard visual to the matching existing zone command.</summary>
+        public ICommand SetZoneColorByIndexCommand { get; }
+
+        // Per-Key Lighting Commands
+        public ICommand PaintKeyCommand { get; }
+        public ICommand FillAllPerKeyCommand { get; }
+        public ICommand ApplyPerKeyLightingCommand { get; }
+
+        public LightingViewModel(CorsairDeviceService? corsairService, LogitechDeviceService? logitechService, LoggingService logging, KeyboardLightingService? keyboardLightingService = null, ConfigurationService? configService = null, RazerService? razerService = null, OmenCore.Services.Rgb.RgbManager? rgbManager = null, HardwareMonitoringService? hardwareMonitoringService = null, PerformanceModeService? performanceModeService = null, RgbSceneService? sceneService = null, ScreenSamplingService? screenSamplingService = null, AudioReactiveRgbService? audioReactiveRgbService = null)
+        {
+            _corsairService = corsairService;
+            _logitechService = logitechService;
+            _razerService = razerService;
+            _keyboardLightingService = keyboardLightingService;
+            _configService = configService;
+            _logging = logging;
+            _rgbManager = rgbManager;
+            _hardwareMonitoringService = hardwareMonitoringService;
+            _performanceModeService = performanceModeService;
+            _sceneService = sceneService;
+            _screenSamplingService = screenSamplingService;
+            _audioReactiveRgbService = audioReactiveRgbService;
+            
+            // Get OpenRGB provider from RgbManager if available
+            _openRgbProvider = rgbManager?.GetProvider("openrgb") as OmenCore.Services.Rgb.OpenRgbProvider;
+            if (_rgbManager != null)
+            {
+                _rgbManager.SyncCompleted += OnRgbSyncCompleted;
+            }
+            
+            // Load saved keyboard colors from config
+            LoadKeyboardColorsFromConfig();
+            LoadRgbSurfaceObservationFromConfig();
+            LoadRgbCardToggleStateFromConfig();
+
+            // Initialize Corsair commands (only functional if service is available)
+            DiscoverCorsairDevicesCommand = new AsyncRelayCommand(async _ =>
+            {
+                if (_corsairService != null)
+                {
+                    await _corsairService.DiscoverAsync();
+                    RefreshRgbStatus();
+                }
+            });
+            ApplyCorsairLightingCommand = new AsyncRelayCommand(async _ => await ApplyCorsairLightingAsync(), _ => SelectedCorsairPreset != null && _corsairService != null);
+            ApplyCorsairCustomColorCommand = new AsyncRelayCommand(async _ => await ApplyCorsairCustomColorAsync());
+            ApplyCorsairDpiCommand = new AsyncRelayCommand(async _ => await ApplyCorsairDpiAsync());
+            RestoreCorsairDpiCommand = new AsyncRelayCommand(async _ => await RestoreCorsairDpiAsync());
+            ApplyCorsairPresetToSystemCommand = new AsyncRelayCommand(async _ => await ApplyCorsairPresetToSystemAsync(), _ => SelectedCorsairPreset != null && _corsairService != null);
+            SaveCorsairDpiProfileCommand = new AsyncRelayCommand(async _ => await SaveCorsairDpiProfileAsync());
+            ApplyCorsairDpiProfileCommand = new AsyncRelayCommand(async _ => await ApplyCorsairDpiProfileAsync(), _ => SelectedCorsairDpiProfile != null);
+            DeleteCorsairDpiProfileCommand = new AsyncRelayCommand(async _ => await DeleteCorsairDpiProfileAsync(), _ => SelectedCorsairDpiProfile != null);
+            FlashCorsairDeviceCommand = new RelayCommand(async device => 
+            {
+                if (device is CorsairDevice corsairDevice && _corsairService != null)
+                    await _corsairService.FlashDeviceAsync(corsairDevice);
+            });
+            
+            // Sync All RGB Command
+            SyncAllRgbCommand = new AsyncRelayCommand(async _ => await SyncAllRgbAsync());
+            OpenDynamicLightingSettingsCommand = new RelayCommand(_ => OpenDynamicLightingSettings());
+            
+            // Initialize Logitech commands (only functional if service is available)
+            DiscoverLogitechDevicesCommand = new AsyncRelayCommand(async _ =>
+            {
+                if (_logitechService != null)
+                {
+                    await _logitechService.DiscoverAsync();
+                    RefreshRgbStatus();
+                }
+            });
+            ApplyLogitechColorCommand = new AsyncRelayCommand(async _ => await ApplyLogitechColorAsync(), _ => SelectedLogitechDevice != null && _logitechService != null);
+            LoadMacroProfileCommand = new AsyncRelayCommand(async _ => await LoadMacroProfileAsync());
+            
+            // Razer Commands
+            DiscoverRazerDevicesCommand = new AsyncRelayCommand(async _ => await DiscoverRazerDevicesAsync());
+            ApplyRazerColorCommand = new AsyncRelayCommand(async _ => await ApplyRazerColorAsync());
+            ApplyRazerBreathingCommand = new AsyncRelayCommand(async _ => await ApplyRazerBreathingAsync());
+            ApplyRazerSpectrumCommand = new AsyncRelayCommand(async _ => await ApplyRazerSpectrumAsync());
+            
+            // OpenRGB Commands
+            ApplyOpenRgbColorCommand = new AsyncRelayCommand(async param => await ApplyOpenRgbColorAsync(param as string));
+            
+            // 4-Zone Keyboard Commands
+            ApplyKeyboardColorsCommand = new AsyncRelayCommand(async _ => await ApplyKeyboardColorsAsync());
+            RestoreKeyboardLightingCommand = new AsyncRelayCommand(async _ => await RestoreKeyboardLightingAsync());
+            RunRgbSurfaceProbeCommand = new AsyncRelayCommand(async _ => await RunRgbSurfaceProbeAsync(), _ => IsKeyboardLightingAvailable);
+            SaveRgbSurfaceObservationCommand = new RelayCommand(_ => SaveRgbSurfaceObservation());
+            ApplyAllZonesSameColorCommand = new AsyncRelayCommand(async _ => await ApplyAllZonesSameColorAsync());
+            ApplyQuickColorCommand = new AsyncRelayCommand(async param => await ApplyQuickColorAsync(param as string));
+            SetZone1ColorCommand = new RelayCommand(_ => OpenColorPickerForZone(1, "WASD"));
+            SetZone2ColorCommand = new RelayCommand(_ => OpenColorPickerForZone(2, "Left"));
+            SetZone3ColorCommand = new RelayCommand(_ => OpenColorPickerForZone(3, "Right"));
+            SetZone4ColorCommand = new RelayCommand(_ => OpenColorPickerForZone(4, "Far Right"));
+            SetZoneColorByIndexCommand = new RelayCommand(param =>
+            {
+                var zoneName = param switch
+                {
+                    1 => "WASD",
+                    2 => "Left",
+                    3 => "Right",
+                    4 => "Far Right",
+                    _ => null
+                };
+                if (zoneName != null && param is int zoneIndex)
+                {
+                    OpenColorPickerForZone(zoneIndex, zoneName);
+                }
+            });
+
+            // Per-Key Lighting Commands
+            PaintKeyCommand = new RelayCommand(cell =>
+            {
+                if (cell is PerKeyCell keyCell)
+                    keyCell.ColorHex = SelectedPerKeyColorHex;
+            });
+            FillAllPerKeyCommand = new RelayCommand(_ =>
+            {
+                foreach (var cell in PerKeyGrid.Where(c => c.IsVisible))
+                    cell.ColorHex = SelectedPerKeyColorHex;
+            });
+            ApplyPerKeyLightingCommand = new AsyncRelayCommand(
+                async _ => await ApplyPerKeyLightingAsync(),
+                _ => IsPerKeyLightingAvailable);
+            InitializePerKeyGrid();
+            
+            // Scene Commands
+            ApplySceneCommand = new AsyncRelayCommand(async param => await ApplySceneFromParameterAsync(param));
+            SaveAsSceneCommand = new AsyncRelayCommand(async _ => await SaveCurrentAsSceneAsync());
+            ToggleAmbientModeCommand = new RelayCommand(_ => IsAmbientModeActive = !IsAmbientModeActive);
+            ToggleAudioReactiveModeCommand = new RelayCommand(_ => IsAudioReactiveModeActive = !IsAudioReactiveModeActive);
+
+            AudioVisualizationModes.Clear();
+            foreach (var mode in Enum.GetValues<AudioVisualizationMode>())
+            {
+                AudioVisualizationModes.Add(mode);
+            }
+
+            if (_audioReactiveRgbService != null)
+            {
+                _audioReactiveRgbService.AudioDataProcessed += OnAudioReactiveDataProcessed;
+                SelectedAudioVisualizationMode = _audioReactiveRgbService.Mode;
+            }
+            
+            // Initialize scenes from service
+            InitializeScenesFromService();
+
+            // Initialize lighting presets - prefer saved config presets when available
+            if (_configService?.Config?.CorsairLightingPresets != null && _configService.Config.CorsairLightingPresets.Count > 0)
+            {
+                CorsairLightingPresets.Clear();
+                foreach (var preset in _configService.Config.CorsairLightingPresets)
+                {
+                    CorsairLightingPresets.Add(preset);
+                }
+            }
+            else
+            {
+                CorsairLightingPresets.Add(new CorsairLightingPreset { Name = "Red", ColorHex = "#FF0000" });
+                CorsairLightingPresets.Add(new CorsairLightingPreset { Name = "Green", ColorHex = "#00FF00" });
+                CorsairLightingPresets.Add(new CorsairLightingPreset { Name = "Blue", ColorHex = "#0000FF" });
+                CorsairLightingPresets.Add(new CorsairLightingPreset { Name = "Purple", ColorHex = "#9B30FF" });
+                CorsairLightingPresets.Add(new CorsairLightingPreset { Name = "Cyan", ColorHex = "#00FFFF" });
+                CorsairLightingPresets.Add(new CorsairLightingPreset { Name = "White", ColorHex = "#FFFFFF" });
+            }
+
+            SelectedCorsairPreset = CorsairLightingPresets.FirstOrDefault();
+
+            // Load saved DPI profiles from config
+            if (_configService?.Config?.CorsairDpiProfiles != null)
+            {
+                CorsairDpiProfiles.Clear();
+                foreach (var p in _configService.Config.CorsairDpiProfiles)
+                {
+                    CorsairDpiProfiles.Add(p);
+                }
+            }
+            
+            // Initialize keyboard presets
+            KeyboardPresets.Add(new KeyboardPreset { Name = "OMEN Red", Zone1 = "#E6002E", Zone2 = "#E6002E", Zone3 = "#E6002E", Zone4 = "#E6002E" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Gaming", Zone1 = "#FF0000", Zone2 = "#FF4500", Zone3 = "#FF6600", Zone4 = "#FF0000" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Cool Blue", Zone1 = "#0066FF", Zone2 = "#00CCFF", Zone3 = "#00CCFF", Zone4 = "#0066FF" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Rainbow", Zone1 = "#FF0000", Zone2 = "#00FF00", Zone3 = "#0000FF", Zone4 = "#FFFF00" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Purple Haze", Zone1 = "#9400D3", Zone2 = "#8B008B", Zone3 = "#9932CC", Zone4 = "#9400D3" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "White", Zone1 = "#FFFFFF", Zone2 = "#FFFFFF", Zone3 = "#FFFFFF", Zone4 = "#FFFFFF" });
+            
+            // New OMEN Light Studio style presets
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Wave Blue", Zone1 = "#0033FF", Zone2 = "#0066FF", Zone3 = "#0099FF", Zone4 = "#00CCFF" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Wave Red", Zone1 = "#FF0000", Zone2 = "#FF3300", Zone3 = "#FF6600", Zone4 = "#FF9900" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Breathing Green", Zone1 = "#00FF00", Zone2 = "#00FF00", Zone3 = "#00FF00", Zone4 = "#00FF00" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Reactive Purple", Zone1 = "#6600FF", Zone2 = "#9900FF", Zone3 = "#CC00FF", Zone4 = "#FF00FF" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Spectrum Flow", Zone1 = "#FF0000", Zone2 = "#FFFF00", Zone3 = "#00FF00", Zone4 = "#00FFFF" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Audio Reactive", Zone1 = "#FF4500", Zone2 = "#FF6600", Zone3 = "#FF8700", Zone4 = "#FFA800" });
+            
+            // Additional presets for more variety (v2.7.1)
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Cyberpunk", Zone1 = "#FF00FF", Zone2 = "#00FFFF", Zone3 = "#FF00FF", Zone4 = "#00FFFF" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Sunset", Zone1 = "#FF4500", Zone2 = "#FF6347", Zone3 = "#FF7F50", Zone4 = "#FFA07A" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Forest", Zone1 = "#228B22", Zone2 = "#32CD32", Zone3 = "#90EE90", Zone4 = "#228B22" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Ocean", Zone1 = "#000080", Zone2 = "#0000FF", Zone3 = "#1E90FF", Zone4 = "#00CED1" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Lava", Zone1 = "#8B0000", Zone2 = "#FF0000", Zone3 = "#FF4500", Zone4 = "#FF6600" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Ice", Zone1 = "#E0FFFF", Zone2 = "#B0E0E6", Zone3 = "#87CEEB", Zone4 = "#ADD8E6" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Stealth", Zone1 = "#1A1A1A", Zone2 = "#2D2D2D", Zone3 = "#404040", Zone4 = "#1A1A1A" });
+            KeyboardPresets.Add(new KeyboardPreset { Name = "Off", Zone1 = "#000000", Zone2 = "#000000", Zone3 = "#000000", Zone4 = "#000000" });
+            
+            // Only select default preset if we didn't load colors from config
+            // (selecting a preset overwrites the colors, which would discard saved colors)
+            if (!_colorsLoadedFromConfig)
+            {
+                SelectedKeyboardPreset = KeyboardPresets.FirstOrDefault();
+            }
+            
+            // Initialize default DPI stages for mouse configuration
+            CorsairDpiStages.Add(new CorsairDpiStage { Name = "Stage 1", Dpi = 800, IsDefault = true });
+            CorsairDpiStages.Add(new CorsairDpiStage { Name = "Stage 2", Dpi = 1600 });
+            CorsairDpiStages.Add(new CorsairDpiStage { Name = "Stage 3", Dpi = 3200 });
+
+            // Initialize macro profiles
+            MacroProfiles.Add(new MacroProfile { Name = "Default" });
+            MacroProfiles.Add(new MacroProfile { Name = "Gaming" });
+            MacroProfiles.Add(new MacroProfile { Name = "Productivity" });
+            SelectedMacroProfile = MacroProfiles.FirstOrDefault();
+
+            // System RGB controls
+            SystemColorHex = "#FF0000";
+            ApplyToSystemCommand = new AsyncRelayCommand(async _ => await ApplyColorToSystemAsync());
+            
+            // Initialize temperature-responsive lighting monitoring
+            if (_hardwareMonitoringService != null)
+            {
+                _hardwareMonitoringService.SampleUpdated += OnMonitoringSampleUpdated;
+            }
+            
+            // Initialize performance mode monitoring
+            if (_performanceModeService != null)
+            {
+                _performanceModeService.ModeApplied += OnPerformanceModeApplied;
+            }
+        }
+
+        private void LoadRgbCardToggleStateFromConfig()
+        {
+            var config = _configService?.Config;
+            if (config == null)
+            {
+                _sceneQuickSelectCardEnabled = true;
+                _corsairCardEnabled = true;
+                _logitechCardEnabled = true;
+                _razerCardEnabled = true;
+                _hpOmenKeyboardCardEnabled = true;
+                return;
+            }
+
+            config.Features ??= new FeaturePreferences();
+
+            _sceneQuickSelectCardEnabled = config.SceneQuickSelectCardEnabled;
+            _corsairCardEnabled = config.Features.CorsairIntegrationEnabled;
+            _logitechCardEnabled = config.Features.LogitechIntegrationEnabled;
+            _razerCardEnabled = config.Features.RazerIntegrationEnabled;
+            _hpOmenKeyboardCardEnabled = config.Features.KeyboardLightingEnabled;
+
+            OnPropertyChanged(nameof(SceneQuickSelectCardEnabled));
+            OnPropertyChanged(nameof(IsSceneQuickSelectCardContentVisible));
+            OnPropertyChanged(nameof(CorsairCardEnabled));
+            OnPropertyChanged(nameof(IsCorsairCardContentVisible));
+            OnPropertyChanged(nameof(LogitechCardEnabled));
+            OnPropertyChanged(nameof(IsLogitechCardContentVisible));
+            OnPropertyChanged(nameof(RazerCardEnabled));
+            OnPropertyChanged(nameof(IsRazerCardContentVisible));
+            OnPropertyChanged(nameof(HpOmenKeyboardCardEnabled));
+            OnPropertyChanged(nameof(IsHpOmenKeyboardCardContentVisible));
+        }
+
+        private void PersistRgbCardToggleState()
+        {
+            var config = _configService?.Config;
+            if (config == null)
+            {
+                return;
+            }
+
+            config.Features ??= new FeaturePreferences();
+            config.SceneQuickSelectCardEnabled = _sceneQuickSelectCardEnabled;
+            config.Features.CorsairIntegrationEnabled = _corsairCardEnabled;
+            config.Features.LogitechIntegrationEnabled = _logitechCardEnabled;
+            config.Features.RazerIntegrationEnabled = _razerCardEnabled;
+            config.Features.KeyboardLightingEnabled = _hpOmenKeyboardCardEnabled;
+
+            _configService?.Save(config);
+        }
+
+        private void OpenColorPickerForZone(int zoneNumber, string zoneName)
+        {
+            // Get the current color for this zone
+            string currentColor = zoneNumber switch
+            {
+                1 => Zone1ColorHex,
+                2 => Zone2ColorHex,
+                3 => Zone3ColorHex,
+                4 => Zone4ColorHex,
+                _ => "#E6002E"
+            };
+
+            // Create and show the color picker dialog
+            var dialog = new ColorPickerDialog
+            {
+                Owner = Application.Current.MainWindow
+            };
+            dialog.SetZoneInfo(zoneNumber, zoneName);
+            dialog.SetInitialColor(currentColor);
+
+            if (dialog.ShowDialog() == true && dialog.DialogResultOk)
+            {
+                // Update the zone color
+                switch (zoneNumber)
+                {
+                    case 1:
+                        Zone1ColorHex = dialog.SelectedHexColor;
+                        break;
+                    case 2:
+                        Zone2ColorHex = dialog.SelectedHexColor;
+                        break;
+                    case 3:
+                        Zone3ColorHex = dialog.SelectedHexColor;
+                        break;
+                    case 4:
+                        Zone4ColorHex = dialog.SelectedHexColor;
+                        break;
+                }
+                
+                _logging.Info($"Zone {zoneNumber} color set to {dialog.SelectedHexColor}");
+            }
+        }
+
+        private void UpdateLogitechHexFromRgb()
+        {
+            _logitechColorHex = $"#{_logitechRedValue:X2}{_logitechGreenValue:X2}{_logitechBlueValue:X2}";
+            OnPropertyChanged(nameof(LogitechColorHex));
+        }
+
+        private void UpdateRazerHexFromRgb()
+        {
+            _razerColorHex = $"#{_razerRedValue:X2}{_razerGreenValue:X2}{_razerBlueValue:X2}";
+            OnPropertyChanged(nameof(RazerColorHex));
+        }
+
+        private void RefreshRgbStatus()
+        {
+            OnPropertyChanged(nameof(ActiveRgbTargetCount));
+            OnPropertyChanged(nameof(RgbSyncParticipantSummary));
+            OnPropertyChanged(nameof(CorsairStatusBrush));
+            OnPropertyChanged(nameof(CorsairStatusDetail));
+            OnPropertyChanged(nameof(LogitechStatusBrush));
+            OnPropertyChanged(nameof(LogitechStatusDetail));
+            OnPropertyChanged(nameof(RazerStatusBrush));
+            OnPropertyChanged(nameof(RazerStatusDetail));
+            OnPropertyChanged(nameof(OpenRgbStatusText));
+            OnPropertyChanged(nameof(OpenRgbDeviceCount));
+            OnPropertyChanged(nameof(HasOpenRgbDevices));
+            OnPropertyChanged(nameof(RgbOwnershipSummary));
+            OnPropertyChanged(nameof(RgbOwnershipVisualState));
+            OnPropertyChanged(nameof(RgbOwnershipVisualLabel));
+            OnPropertyChanged(nameof(HpKeyboardActiveBackend));
+            OnPropertyChanged(nameof(HasRgbConflictWarning));
+            OnPropertyChanged(nameof(RgbConflictWarningText));
+        }
+
+        private void OnRgbSyncCompleted(object? sender, OmenCore.Services.Rgb.RgbSyncEventArgs e)
+        {
+            var dispatcher = Application.Current?.Dispatcher;
+            void Update()
+            {
+                var totalSucceeded = e.ProvidersSucceeded;
+                var totalAttempted = e.ProvidersAffected;
+                if (e.ProvidersFailed == 0)
+                {
+                    LastRgbSyncSummary = totalAttempted == 1
+                        ? "Sync complete: 1 provider updated"
+                        : $"Sync complete: {totalAttempted} providers updated";
+                    LastRgbSyncBrush = StatusToBrush(OmenCore.Services.Rgb.RgbProviderConnectionStatus.Connected);
+                }
+                else if (totalSucceeded > 0)
+                {
+                    LastRgbSyncSummary = $"Partial sync: {totalSucceeded}/{totalAttempted} providers updated";
+                    LastRgbSyncBrush = StatusToBrush(OmenCore.Services.Rgb.RgbProviderConnectionStatus.NoDevices);
+                }
+                else
+                {
+                    LastRgbSyncSummary = "Sync failed: no providers updated";
+                    LastRgbSyncBrush = StatusToBrush(OmenCore.Services.Rgb.RgbProviderConnectionStatus.Error);
+                }
+
+                LastRgbSyncDetail = $"{DateTime.Now:HH:mm:ss} - {e.EffectId}";
+                RefreshRgbStatus();
+            }
+
+            if (dispatcher?.CheckAccess() == true)
+                Update();
+            else
+                dispatcher?.BeginInvoke((Action)Update);
+        }
+
+        private void UpdateLastRgbSyncResult(string colorHex, int attempted, int succeeded, int failed)
+        {
+            if (attempted == 0)
+            {
+                LastRgbSyncSummary = "No RGB targets available";
+                LastRgbSyncBrush = StatusToBrush(OmenCore.Services.Rgb.RgbProviderConnectionStatus.NoDevices);
+            }
+            else if (failed == 0)
+            {
+                LastRgbSyncSummary = attempted == 1
+                    ? "Sync complete: 1 target updated"
+                    : $"Sync complete: {attempted} targets updated";
+                LastRgbSyncBrush = StatusToBrush(OmenCore.Services.Rgb.RgbProviderConnectionStatus.Connected);
+            }
+            else if (succeeded > 0)
+            {
+                LastRgbSyncSummary = $"Partial sync: {succeeded}/{attempted} targets updated";
+                LastRgbSyncBrush = StatusToBrush(OmenCore.Services.Rgb.RgbProviderConnectionStatus.NoDevices);
+            }
+            else
+            {
+                LastRgbSyncSummary = "Sync failed: no targets updated";
+                LastRgbSyncBrush = StatusToBrush(OmenCore.Services.Rgb.RgbProviderConnectionStatus.Error);
+            }
+
+            LastRgbSyncDetail = $"{DateTime.Now:HH:mm:ss} - Static {colorHex}";
+            RefreshRgbStatus();
+        }
+
+        #region Razer Methods
+
+        private async Task DiscoverRazerDevicesAsync()
+        {
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                _razerService?.Initialize();
+                _razerService?.DiscoverDevices();
+                _razerDevices.Clear();
+                if (_razerService?.Devices != null)
+                {
+                    foreach (var device in _razerService.Devices)
+                    {
+                        _razerDevices.Add(device);
+                    }
+                }
+                OnPropertyChanged(nameof(RazerDevices));
+                OnPropertyChanged(nameof(HasRazerDevices));
+                OnPropertyChanged(nameof(RazerDeviceStatusText));
+                RefreshRgbStatus();
+                await Task.CompletedTask;
+            }, "Discovering Razer devices...");
+        }
+
+        private async Task ApplyRazerColorAsync()
+        {
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                _razerService?.Initialize();
+                _razerService?.SetStaticColor((byte)_razerRedValue, (byte)_razerGreenValue, (byte)_razerBlueValue);
+                _logging.Info($"Applied Razer static color: {RazerColorHex}");
+                await Task.CompletedTask;
+            }, "Applying Razer color...");
+        }
+
+        private async Task ApplyRazerBreathingAsync()
+        {
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                _razerService?.Initialize();
+                _razerService?.SetBreathingEffect((byte)_razerRedValue, (byte)_razerGreenValue, (byte)_razerBlueValue);
+                _logging.Info($"Applied Razer breathing effect: {RazerColorHex}");
+                await Task.CompletedTask;
+            }, "Applying Razer breathing...");
+        }
+
+        private async Task ApplyRazerSpectrumAsync()
+        {
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                _razerService?.Initialize();
+                _razerService?.SetSpectrumEffect();
+                _logging.Info("Applied Razer spectrum cycling effect");
+                await Task.CompletedTask;
+            }, "Applying Razer spectrum...");
+        }
+        
+        private async Task ApplyOpenRgbColorAsync(string? colorHex)
+        {
+            if (_openRgbProvider == null || !_openRgbProvider.IsAvailable) return;
+            
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                try
+                {
+                    var color = string.IsNullOrEmpty(colorHex) 
+                        ? System.Drawing.Color.Red 
+                        : System.Drawing.ColorTranslator.FromHtml(colorHex);
+                    await _openRgbProvider.SetStaticColorAsync(color);
+                    _logging.Info($"Applied OpenRGB color: {colorHex ?? "#FF0000"} to {_openRgbProvider.DeviceCount} device(s)");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Error($"Failed to apply OpenRGB color: {ex.Message}");
+                }
+            }, "Applying OpenRGB color...");
+        }
+
+        #endregion
+
+        private async Task ApplyCorsairLightingAsync()
+        {
+            if (SelectedCorsairPreset != null && _corsairService != null)
+            {
+                await ExecuteWithLoadingAsync(async () =>
+                {
+                    await _corsairService.ApplyLightingToAllAsync(SelectedCorsairPreset.ColorHex);
+                    _logging.Info($"Applied Corsair lighting preset: {SelectedCorsairPreset.Name}");
+                }, "Applying Corsair lighting...");
+            }
+        }
+
+        private async Task ApplyCorsairPresetToSystemAsync()
+        {
+            if (SelectedCorsairPreset == null || _rgbManager == null) return;
+
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                await _rgbManager.ApplyEffectToAllAsync($"preset:{SelectedCorsairPreset.Name}");
+                _logging.Info($"Applied Corsair preset '{SelectedCorsairPreset.Name}' to system");
+            }, "Applying lighting preset to system...");
+        }
+        
+        /// <summary>
+        /// Sync a color across all connected RGB devices (Corsair, Logitech, Razer, HP keyboard).
+        /// Uses the current Corsair custom color as the sync color.
+        /// </summary>
+        private async Task SyncAllRgbAsync()
+        {
+            var syncColor = CorsairColorHex; // Use Corsair color picker as the sync source
+            
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                var color = System.Drawing.ColorTranslator.FromHtml(syncColor);
+                var providerResult = new { Attempted = 0, Succeeded = 0, Failed = 0 };
+
+                if (_rgbManager != null)
+                {
+                    OmenCore.Services.Rgb.RgbSyncEventArgs? completed = null;
+                    void CaptureSyncResult(object? _, OmenCore.Services.Rgb.RgbSyncEventArgs args) => completed = args;
+
+                    _rgbManager.SyncCompleted += CaptureSyncResult;
+                    try
+                    {
+                        await _rgbManager.SyncStaticColorAsync(color);
+                    }
+                    finally
+                    {
+                        _rgbManager.SyncCompleted -= CaptureSyncResult;
+                    }
+
+                    if (completed != null)
+                    {
+                        providerResult = new
+                        {
+                            Attempted = completed.ProvidersAffected,
+                            Succeeded = completed.ProvidersSucceeded,
+                            Failed = completed.ProvidersFailed
+                        };
+                    }
+                }
+
+                var keyboardSucceeded = false;
+                if (IsKeyboardLightingAvailable && _keyboardLightingService != null)
+                {
+                    try
+                    {
+                        var colors = new[] { color, color, color, color };
+                        await _keyboardLightingService.SetAllZoneColors(colors);
+                        keyboardSucceeded = true;
+                        _logging.Info($"Synced color {syncColor} to OMEN keyboard");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logging.Warn($"Failed to sync to OMEN keyboard: {ex.Message}");
+                    }
+                }
+
+                var totalAttempted = providerResult.Attempted + (IsKeyboardLightingAvailable ? 1 : 0);
+                var totalSucceeded = providerResult.Succeeded + (keyboardSucceeded ? 1 : 0);
+                var totalFailed = totalAttempted - totalSucceeded;
+
+                UpdateLastRgbSyncResult(syncColor, totalAttempted, totalSucceeded, totalFailed);
+                _logging.Info($"RGB Sync complete: {totalSucceeded}/{totalAttempted} target(s) updated");
+            }, "Syncing color to all RGB devices...");
+        }
+
+        private async Task ApplyCorsairCustomColorAsync()
+        {
+            if (_corsairService == null) return;
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                await _corsairService.ApplyLightingToAllAsync(CorsairColorHex);
+                _logging.Info($"Applied custom Corsair color: {CorsairColorHex}");
+            }, "Applying custom color...");
+        }
+
+        public async Task ApplyCorsairDpiAsync(bool skipConfirmation = false)
+        {
+            if (SelectedCorsairDevice == null)
+            {
+                _logging.Warn("No Corsair device selected for DPI apply");
+                return;
+            }
+
+            if (!skipConfirmation)
+            {
+                var res = MessageBox.Show(
+                    "This will change the hardware DPI settings on the selected device. Do you want to continue?",
+                    "Confirm DPI Change",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning,
+                    MessageBoxResult.No);
+
+                if (res != MessageBoxResult.Yes)
+                {
+                    _logging.Info("User cancelled DPI apply");
+                    return;
+                }
+            }
+
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                if (_corsairService == null) return;
+                
+                // Log the intended stages
+                foreach (var stage in CorsairDpiStages)
+                {
+                    _logging.Info($"Applying DPI Stage {stage.Name}: {stage.Dpi} DPI");
+                }
+
+                try
+                {
+                    var applied = await _corsairService.ApplyDpiStagesAsync(SelectedCorsairDevice, CorsairDpiStages);
+                    if (!applied)
+                    {
+                        _logging.Warn("DPI settings were not applied - active Corsair backend does not support writing DPI to this device");
+                        MessageBox.Show(
+                            "OmenCore couldn't actually write these DPI settings to the device - the active Corsair connection (RGB.NET/iCUE) doesn't support DPI configuration. Nothing on the mouse changed.",
+                            "DPI Settings Not Applied",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Warning);
+                        return;
+                    }
+
+                    // Update the device model to reflect the new DPI values
+                    SelectedCorsairDevice.DpiStages.Clear();
+                    foreach (var s in CorsairDpiStages)
+                    {
+                        SelectedCorsairDevice.DpiStages.Add(new CorsairDpiStage { Name = s.Name, Dpi = s.Dpi, IsDefault = s.IsDefault, AngleSnapping = s.AngleSnapping, LiftOffDistanceMm = s.LiftOffDistanceMm, Index = s.Index });
+                    }
+
+                    // Optionally persist as defaults
+                    if (_configService != null)
+                    {
+                        _configService.Config.DefaultCorsairDpi = CorsairDpiStages.Select(s => new CorsairDpiStage { Name = s.Name, Dpi = s.Dpi, IsDefault = s.IsDefault, AngleSnapping = s.AngleSnapping, LiftOffDistanceMm = s.LiftOffDistanceMm, Index = s.Index }).ToList();
+                        _configService.Save(_configService.Config);
+                    }
+
+                    // Also update the selected profile if one is chosen (save changes back to profile)
+                    if (SelectedCorsairDpiProfile != null)
+                    {
+                        SelectedCorsairDpiProfile.Stages.Clear();
+                        foreach (var s in CorsairDpiStages)
+                        {
+                            SelectedCorsairDpiProfile.Stages.Add(new CorsairDpiStage { Name = s.Name, Dpi = s.Dpi, IsDefault = s.IsDefault, AngleSnapping = s.AngleSnapping, LiftOffDistanceMm = s.LiftOffDistanceMm, Index = s.Index });
+                        }
+                        // Persist profile changes to config
+                        if (_configService != null)
+                        {
+                            var cfgList = _configService.Config.CorsairDpiProfiles;
+                            // find and replace by name
+                            for (int i = 0; i < cfgList.Count; i++)
+                            {
+                                if (cfgList[i].Name == SelectedCorsairDpiProfile.Name)
+                                {
+                                    cfgList[i] = SelectedCorsairDpiProfile;
+                                    break;
+                                }
+                            }
+                            _configService.Save(_configService.Config);
+                        }
+                    }
+
+                    _logging.Info("DPI settings applied successfully");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Error("Failed to apply DPI settings", ex);
+                }
+
+                await Task.CompletedTask;
+            }, "Applying DPI settings...");
+        }
+
+        private async Task ApplyLogitechColorAsync()
+        {
+            if (SelectedLogitechDevice != null && _logitechService != null)
+            {
+                await ExecuteWithLoadingAsync(async () =>
+                {
+                    await _logitechService.ApplyStaticColorAsync(SelectedLogitechDevice, LogitechColorHex, LogitechBrightness);
+                }, "Applying Logitech lighting...");
+            }
+        }
+
+        public Task RestoreCorsairDpiAsync(bool skipConfirmation = false)
+        {
+            if (!skipConfirmation)
+            {
+                var res = MessageBox.Show(
+                    "This will restore DPI stages to their saved defaults (or built-in defaults if none). Continue?",
+                    "Restore DPI Defaults",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question,
+                    MessageBoxResult.No);
+                if (res != MessageBoxResult.Yes)
+                {
+                    _logging.Info("User cancelled DPI restore");
+                    return Task.CompletedTask;
+                }
+            }
+
+            // Use config defaults if present
+            if (_configService?.Config?.DefaultCorsairDpi != null && _configService.Config.DefaultCorsairDpi.Count > 0)
+            {
+                CorsairDpiStages.Clear();
+                foreach (var s in _configService.Config.DefaultCorsairDpi)
+                {
+                    CorsairDpiStages.Add(new CorsairDpiStage { Name = s.Name, Dpi = s.Dpi, IsDefault = s.IsDefault, AngleSnapping = s.AngleSnapping, LiftOffDistanceMm = s.LiftOffDistanceMm, Index = s.Index });
+                }
+                _logging.Info("Restored DPI stages from config defaults");
+                return Task.CompletedTask;
+            }
+
+            // Fallback built-in defaults
+            CorsairDpiStages.Clear();
+            CorsairDpiStages.Add(new CorsairDpiStage { Name = "Stage 1", Dpi = 800, IsDefault = true, Index = 0 });
+            CorsairDpiStages.Add(new CorsairDpiStage { Name = "Stage 2", Dpi = 1600, Index = 1 });
+            CorsairDpiStages.Add(new CorsairDpiStage { Name = "Stage 3", Dpi = 3200, Index = 2 });
+            _logging.Info("Restored built-in DPI defaults");
+            return Task.CompletedTask;
+        }
+
+        public async Task ApplyCorsairDpiProfileAsync()
+        {
+            if (SelectedCorsairDpiProfile == null)
+            {
+                _logging.Warn("No DPI profile selected");
+                return;
+            }
+
+            CorsairDpiStages.Clear();
+            foreach (var s in SelectedCorsairDpiProfile.Stages)
+            {
+                CorsairDpiStages.Add(new CorsairDpiStage { Name = s.Name, Dpi = s.Dpi, IsDefault = s.IsDefault, AngleSnapping = s.AngleSnapping, LiftOffDistanceMm = s.LiftOffDistanceMm, Index = s.Index });
+            }
+
+            // Optionally apply to device immediately
+            await ApplyCorsairDpiAsync();
+        }
+
+        public async Task SaveCorsairDpiProfileAsync(string profileName)
+        {
+            if (string.IsNullOrWhiteSpace(profileName)) return;
+            var trimmed = profileName.Trim();
+
+            var existing = CorsairDpiProfiles.FirstOrDefault(p => p.Name == trimmed);
+            if (existing != null)
+            {
+                // Overwrite existing profile stages
+                existing.Stages.Clear();
+                foreach (var s in CorsairDpiStages)
+                {
+                    existing.Stages.Add(new CorsairDpiStage { Name = s.Name, Dpi = s.Dpi, IsDefault = s.IsDefault, AngleSnapping = s.AngleSnapping, LiftOffDistanceMm = s.LiftOffDistanceMm, Index = s.Index });
+                }
+
+                if (_configService != null)
+                {
+                    _configService.Config.CorsairDpiProfiles = CorsairDpiProfiles.ToList();
+                    _configService.Save(_configService.Config);
+                }
+
+                _logging.Info($"Overwrote DPI profile '{existing.Name}'");
+                await Task.CompletedTask;
+                return;
+            }
+
+            var profile = new OmenCore.Corsair.CorsairDpiProfile { Name = trimmed };
+            foreach (var s in CorsairDpiStages)
+            {
+                profile.Stages.Add(new CorsairDpiStage { Name = s.Name, Dpi = s.Dpi, IsDefault = s.IsDefault, AngleSnapping = s.AngleSnapping, LiftOffDistanceMm = s.LiftOffDistanceMm, Index = s.Index });
+            }
+
+            CorsairDpiProfiles.Add(profile);
+            if (_configService != null)
+            {
+                _configService.Config.CorsairDpiProfiles = CorsairDpiProfiles.ToList();
+                _configService.Save(_configService.Config);
+            }
+
+            _logging.Info($"Saved DPI profile '{profile.Name}'");
+            await Task.CompletedTask;
+        }
+
+        private async Task SaveCorsairDpiProfileAsync()
+        {
+            // Prompt for a profile name
+            var namePrompt = new InputPromptWindow("Save DPI Profile", "Enter a name for the DPI profile:")
+            {
+                Owner = Application.Current.MainWindow
+            };
+            if (namePrompt.ShowDialog() != true || string.IsNullOrWhiteSpace(namePrompt.Input))
+            {
+                _logging.Info("User cancelled Save DPI Profile");
+                return;
+            }
+
+            var name = namePrompt.Input.Trim();
+            var exists = CorsairDpiProfiles.Any(p => p.Name == name);
+            if (exists)
+            {
+                var res = MessageBox.Show($"A DPI profile named '{name}' already exists. Overwrite it?", "Overwrite DPI Profile", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+                if (res != MessageBoxResult.Yes)
+                {
+                    _logging.Info("User declined to overwrite existing DPI profile");
+                    return;
+                }
+            }
+
+            await SaveCorsairDpiProfileAsync(name);
+        }
+
+        public async Task DeleteCorsairDpiProfileByNameAsync(string profileName)
+        {
+            if (string.IsNullOrWhiteSpace(profileName)) return;
+            var toRemove = CorsairDpiProfiles.FirstOrDefault(p => p.Name == profileName);
+            if (toRemove == null) return;
+            CorsairDpiProfiles.Remove(toRemove);
+            if (SelectedCorsairDpiProfile == toRemove)
+            {
+                SelectedCorsairDpiProfile = CorsairDpiProfiles.FirstOrDefault();
+            }
+            if (_configService != null)
+            {
+                _configService.Config.CorsairDpiProfiles = CorsairDpiProfiles.ToList();
+                _configService.Save(_configService.Config);
+            }
+            _logging.Info($"Deleted DPI profile '{profileName}'");
+            await Task.CompletedTask;
+        }
+
+        private async Task DeleteCorsairDpiProfileAsync()
+        {
+            if (SelectedCorsairDpiProfile == null)
+            {
+                _logging.Warn("No DPI profile selected");
+                return;
+            }
+
+            var res = MessageBox.Show(
+                $"Are you sure you want to delete the DPI profile '{SelectedCorsairDpiProfile.Name}'? This cannot be undone.",
+                "Delete DPI Profile",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning,
+                MessageBoxResult.No);
+
+            if (res != MessageBoxResult.Yes)
+            {
+                _logging.Info("User cancelled DPI profile delete");
+                return;
+            }
+
+            await DeleteCorsairDpiProfileByNameAsync(SelectedCorsairDpiProfile.Name);
+        }
+
+        private async Task LoadMacroProfileAsync()
+        {
+            if (SelectedMacroProfile != null)
+            {
+                await ExecuteWithLoadingAsync(async () =>
+                {
+                    _logging.Info($"Loading macro profile: {SelectedMacroProfile.Name}");
+                    // Note: Full macro implementation would require iCUE/G HUB SDK integration
+                    _logging.Warn("Macro profiles are UI placeholders - use iCUE or G HUB for macro configuration");
+                    await Task.CompletedTask;
+                }, "Loading macro profile...");
+            }
+        }
+        
+        #region 4-Zone Keyboard Methods
+        
+        private async Task ApplyKeyboardColorsAsync()
+        {
+            if (_keyboardLightingService == null || !_keyboardLightingService.IsAvailable)
+            {
+                _logging.Warn("Keyboard lighting not available");
+                KeyboardRestoreStatusText = "Keyboard lighting is unavailable on this backend.";
+                return;
+            }
+            
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                await ApplyCurrentKeyboardZonesToBackendAsync();
+                
+                // Save colors to config for persistence
+                SaveKeyboardColorsToConfig();
+                
+                // Log telemetry to help user understand which backend works
+                var telemetry = _keyboardLightingService.GetTelemetry();
+                string backendHint = "";
+                if (telemetry != null)
+                {
+                    _logging.Info($"Keyboard telemetry: WMI {telemetry.WmiSuccessRate:F0}% success, EC {telemetry.EcSuccessRate:F0}% success");
+
+                    // If WMI has never once verified successfully, suggest the EC fallback. This
+                    // used to be logged only - a user reading "accepted the write but did not
+                    // verify" on the Lighting page itself had no path to this actual fix without
+                    // opening a log file most people never look at (Discord field reports kept
+                    // asking "RGB isn't changing" for exactly this reason). Surfaced into the same
+                    // status text the page already shows.
+                    if (telemetry.WmiSuccessCount == 0 && telemetry.WmiFailureCount > 0)
+                    {
+                        backendHint = " WMI keyboard commands aren't verifying on your model - try enabling 'Experimental EC Keyboard' in Settings if colors don't visibly change.";
+                        _logging.Warn($"💡{backendHint}");
+                    }
+                }
+
+                _logging.Info($"✓ Applied keyboard zone colors: Z1={_zone1ColorHex}, Z2={_zone2ColorHex}, Z3={_zone3ColorHex}, Z4={_zone4ColorHex}");
+                KeyboardRestoreStatusText = $"{_keyboardLightingService.LastApplyStatus} Surface: {_keyboardLightingService.LastApplySurface}.{backendHint}";
+                await Task.CompletedTask;
+            }, "Applying keyboard colors...");
+        }
+
+        private async Task RestoreKeyboardLightingAsync()
+        {
+            if (_keyboardLightingService == null || !_keyboardLightingService.IsAvailable)
+            {
+                KeyboardRestoreStatusText = "Keyboard lighting is unavailable; check backend detection or Settings > Hardware.";
+                _logging.Warn("Keyboard lighting restore requested, but no keyboard backend is available");
+                return;
+            }
+
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                LoadKeyboardColorsFromConfig();
+                await ApplyCurrentKeyboardZonesToBackendAsync();
+                KeyboardRestoreStatusText = $"Restored saved keyboard colors. {_keyboardLightingService.LastApplyStatus} Surface: {_keyboardLightingService.LastApplySurface}.";
+                _logging.Info($"Restored keyboard lighting from saved colors via {KeyboardLightingBackend}: Z1={_zone1ColorHex}, Z2={_zone2ColorHex}, Z3={_zone3ColorHex}, Z4={_zone4ColorHex}");
+            }, "Restoring keyboard lighting...");
+        }
+
+        private async Task RunRgbSurfaceProbeAsync()
+        {
+            if (_keyboardLightingService == null || !_keyboardLightingService.IsAvailable)
+            {
+                RgbSurfaceObservationStatusText = "RGB probe unavailable because no HP keyboard lighting backend is active.";
+                _logging.Warn("RGB observed-surface probe requested, but no keyboard backend is available");
+                return;
+            }
+
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                var probeColor = ParseDrawingColor(RgbObservationProbeColorHex);
+                await _keyboardLightingService.SetAllZoneColors(new[] { probeColor, probeColor, probeColor, probeColor });
+
+                SaveRgbSurfaceObservationProbeMetadata(updateSurface: false);
+                RgbSurfaceObservationStatusText =
+                    $"Probe sent via {KeyboardLightingBackend}; select what changed and save. {_keyboardLightingService.LastApplyStatus}";
+                _logging.Info($"RGB observed-surface probe applied {RgbObservationProbeColorHex} via {KeyboardLightingBackend}; surface selection pending");
+            }, "Probing RGB surface...");
+        }
+
+        private void SaveRgbSurfaceObservation()
+        {
+            try
+            {
+                if (_configService == null)
+                {
+                    RgbSurfaceObservationStatusText = "RGB observation could not be saved because configuration is unavailable.";
+                    return;
+                }
+
+                SaveRgbSurfaceObservationProbeMetadata(updateSurface: true);
+                RgbSurfaceObservationStatusText = BuildRgbSurfaceObservationStatus(_configService.Config.KeyboardLighting);
+                _logging.Info($"RGB observed surface saved: {SelectedObservedRgbSurface}");
+            }
+            catch (Exception ex)
+            {
+                RgbSurfaceObservationStatusText = $"RGB observation save failed: {ex.Message}";
+                _logging.Warn($"Failed to save RGB observed surface: {ex.Message}");
+            }
+        }
+
+        private void SaveRgbSurfaceObservationProbeMetadata(bool updateSurface)
+        {
+            if (_configService == null) return;
+
+            if (_configService.Config.KeyboardLighting == null)
+                _configService.Config.KeyboardLighting = new KeyboardLightingSettings();
+
+            var settings = _configService.Config.KeyboardLighting;
+            if (updateSurface)
+            {
+                settings.ObservedSurface = string.IsNullOrWhiteSpace(SelectedObservedRgbSurface)
+                    ? RgbObservationNotRecorded
+                    : SelectedObservedRgbSurface.Trim();
+            }
+
+            settings.ObservedProbeColorHex = RgbObservationProbeColorHex;
+            settings.ObservedBackend = KeyboardLightingBackend;
+            settings.ObservedApplyStatus = _keyboardLightingService?.LastApplyStatus ?? "No keyboard lighting apply attempted this session.";
+            settings.ObservedAtUtc = DateTime.UtcNow;
+            _configService.Save(_configService.Config);
+        }
+
+        private Task ApplyCurrentKeyboardZonesToBackendAsync()
+        {
+            return _keyboardLightingService?.SetAllZoneColors(BuildKeyboardZoneColorsForBackend()) ?? Task.CompletedTask;
+        }
+
+        private System.Drawing.Color[] BuildKeyboardZoneColorsForBackend()
+        {
+            // UI Zone1..4 = WASD, middle-left, middle-right, right.
+            // Firmware/WMI expects right, middle-right, middle-left, WASD.
+            return new[]
+            {
+                ParseDrawingColor(_zone4ColorHex),
+                ParseDrawingColor(_zone3ColorHex),
+                ParseDrawingColor(_zone2ColorHex),
+                ParseDrawingColor(_zone1ColorHex)
+            };
+        }
+        
+        private async Task ApplyAllZonesSameColorAsync()
+        {
+            if (_keyboardLightingService == null || !_keyboardLightingService.IsAvailable)
+            {
+                _logging.Warn("Keyboard lighting not available");
+                return;
+            }
+            
+            await ExecuteWithLoadingAsync(async () =>
+            {
+                // Use Zone 1 color for all zones
+                var color = ParseDrawingColor(_zone1ColorHex);
+                _keyboardLightingService.SetZoneColor(KeyboardLightingService.KeyboardZone.All, color);
+                
+                // Update all zone properties to match
+                Zone2ColorHex = _zone1ColorHex;
+                Zone3ColorHex = _zone1ColorHex;
+                Zone4ColorHex = _zone1ColorHex;
+                
+                // Save colors to config for persistence
+                SaveKeyboardColorsToConfig();
+                
+                _logging.Info($"✓ Applied {_zone1ColorHex} to all keyboard zones");
+                await Task.CompletedTask;
+            }, "Applying color to all zones...");
+        }
+        
+        /// <summary>
+        /// Quick color application - applies a single color to all keyboard zones instantly
+        /// </summary>
+        private async Task ApplyQuickColorAsync(string? colorHex)
+        {
+            if (string.IsNullOrEmpty(colorHex)) return;
+            
+            if (_keyboardLightingService == null || !_keyboardLightingService.IsAvailable)
+            {
+                _logging.Warn("Keyboard lighting not available");
+                return;
+            }
+            
+            try
+            {
+                var color = ParseDrawingColor(colorHex);
+                _keyboardLightingService.SetZoneColor(KeyboardLightingService.KeyboardZone.All, color);
+                
+                // Update all zone color properties to reflect the change
+                Zone1ColorHex = colorHex;
+                Zone2ColorHex = colorHex;
+                Zone3ColorHex = colorHex;
+                Zone4ColorHex = colorHex;
+                
+                // Save to config for persistence
+                SaveKeyboardColorsToConfig();
+                
+                _logging.Info($"✓ Quick color {colorHex} applied to all keyboard zones");
+            }
+            catch (Exception ex)
+            {
+                _logging.Error($"Failed to apply quick color: {ex.Message}");
+            }
+            
+            await Task.CompletedTask;
+        }
+        
+        private void LoadKeyboardColorsFromConfig()
+        {
+            try
+            {
+                var config = _configService?.Config?.KeyboardLighting;
+                if (config == null) return;
+                
+                // Check if any colors are saved (not null/default)
+                bool hasCustomColors = config.Zone1Color != null || config.Zone2Color != null || 
+                                       config.Zone3Color != null || config.Zone4Color != null;
+                
+                _zone1ColorHex = config.Zone1Color ?? "#E6002E";
+                _zone2ColorHex = config.Zone2Color ?? "#E6002E";
+                _zone3ColorHex = config.Zone3Color ?? "#E6002E";
+                _zone4ColorHex = config.Zone4Color ?? "#E6002E";
+                
+                // Load the apply on startup setting
+                _applyKeyboardColorsOnStartup = config.ApplyOnStartup;
+                
+                // Mark that we loaded colors from config - this prevents the default preset from
+                // overwriting our saved colors during initialization
+                _colorsLoadedFromConfig = hasCustomColors;
+                
+                _logging.Info($"Loaded keyboard colors from config: Z1={_zone1ColorHex}, Z2={_zone2ColorHex}, Z3={_zone3ColorHex}, Z4={_zone4ColorHex}");
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to load keyboard colors: {ex.Message}");
+            }
+        }
+
+        private void LoadRgbSurfaceObservationFromConfig()
+        {
+            try
+            {
+                var config = _configService?.Config?.KeyboardLighting;
+                if (config == null)
+                {
+                    SelectedObservedRgbSurface = RgbObservationNotRecorded;
+                    RgbSurfaceObservationStatusText = "No RGB surface observation recorded.";
+                    return;
+                }
+
+                var observedSurface = string.IsNullOrWhiteSpace(config.ObservedSurface)
+                    ? RgbObservationNotRecorded
+                    : config.ObservedSurface.Trim();
+
+                if (!RgbObservedSurfaceOptions.Contains(observedSurface))
+                {
+                    RgbObservedSurfaceOptions.Add(observedSurface);
+                }
+
+                SelectedObservedRgbSurface = observedSurface;
+                RgbSurfaceObservationStatusText = BuildRgbSurfaceObservationStatus(config);
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to load RGB surface observation: {ex.Message}");
+            }
+        }
+
+        private static string BuildRgbSurfaceObservationStatus(KeyboardLightingSettings settings)
+        {
+            if (settings.ObservedAtUtc == null ||
+                string.IsNullOrWhiteSpace(settings.ObservedSurface) ||
+                string.Equals(settings.ObservedSurface, RgbObservationNotRecorded, StringComparison.OrdinalIgnoreCase))
+            {
+                return "No RGB surface observation recorded.";
+            }
+
+            var backend = string.IsNullOrWhiteSpace(settings.ObservedBackend)
+                ? "unknown backend"
+                : settings.ObservedBackend.Trim();
+            var color = string.IsNullOrWhiteSpace(settings.ObservedProbeColorHex)
+                ? RgbObservationProbeColorHex
+                : settings.ObservedProbeColorHex.Trim();
+
+            return $"Observed {settings.ObservedSurface} using {backend} at {settings.ObservedAtUtc.Value.ToLocalTime():g}; probe {color}.";
+        }
+        
+        private void SaveKeyboardColorsToConfig()
+        {
+            try
+            {
+                if (_configService == null) return;
+                
+                if (_configService.Config.KeyboardLighting == null)
+                    _configService.Config.KeyboardLighting = new KeyboardLightingSettings();
+                
+                _configService.Config.KeyboardLighting.Zone1Color = _zone1ColorHex;
+                _configService.Config.KeyboardLighting.Zone2Color = _zone2ColorHex;
+                _configService.Config.KeyboardLighting.Zone3Color = _zone3ColorHex;
+                _configService.Config.KeyboardLighting.Zone4Color = _zone4ColorHex;
+                
+                _configService.Save(_configService.Config);
+                _logging.Info("Keyboard colors saved to config");
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to save keyboard colors: {ex.Message}");
+            }
+        }
+        
+        private void SaveKeyboardStartupSetting()
+        {
+            try
+            {
+                if (_configService == null) return;
+                
+                if (_configService.Config.KeyboardLighting == null)
+                    _configService.Config.KeyboardLighting = new KeyboardLightingSettings();
+                
+                _configService.Config.KeyboardLighting.ApplyOnStartup = _applyKeyboardColorsOnStartup;
+                _configService.Save(_configService.Config);
+                _logging.Info($"Keyboard apply on startup setting saved: {_applyKeyboardColorsOnStartup}");
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to save keyboard startup setting: {ex.Message}");
+            }
+        }
+        
+        /// <summary>
+        /// Applies saved keyboard colors on app startup.
+        /// Call this after the keyboard lighting service is ready.
+        /// </summary>
+        public async Task ApplySavedKeyboardColorsAsync()
+        {
+            try
+            {
+                var config = _configService?.Config?.KeyboardLighting;
+                if (config == null || !config.ApplyOnStartup)
+                {
+                    _logging.Info("Keyboard color restore disabled or no saved colors");
+                    return;
+                }
+
+                if (_configService?.Config == null ||
+                    !StartupRestorePolicy.IsEnabled(_configService.Config, StartupRestoreCategory.Rgb))
+                {
+                    _logging.Info("RGB startup restore category disabled - skipping keyboard color restore");
+                    return;
+                }
+                
+                if (_keyboardLightingService == null || !_keyboardLightingService.IsAvailable)
+                {
+                    _logging.Warn("Keyboard lighting not available for color restore");
+                    return;
+                }
+                
+                // Check if user had backlight OFF - don't turn it on!
+                if (!config.BacklightWasEnabled)
+                {
+                    _logging.Info("Keyboard backlight was OFF - respecting user preference, not restoring colors");
+                    return;
+                }
+
+                // A per-key picture beats a four-zone fill and the two cannot both run - the fill
+                // would paint over every key the picture placed. Where a picture was saved it is
+                // the more specific record of what the user chose, so it wins and returns.
+                //
+                // ORDER MATTERS. KeyboardMap is lazy because constructing it interrogates the
+                // keyboard for its layout and lamp map, so it is tested LAST: on a machine with no
+                // saved picture - every machine, on first run - the cheap config checks short
+                // circuit and startup never touches the device at all.
+                if (config.RestorePerKeyPictureOnStartup && config.PerKeyPicture.Count > 0
+                    && KeyboardMap.IsAvailable)
+                {
+                    await KeyboardMap.ApplyRestoredPictureAsync();
+                    _logging.Info($"✓ Restored per-key picture on startup: {config.PerKeyPicture.Count} cells");
+                    return;
+                }
+
+                await _keyboardLightingService.SetAllZoneColors(BuildKeyboardZoneColorsForBackend());
+                _logging.Info($"✓ Restored keyboard colors on startup: Z1={_zone1ColorHex}, Z2={_zone2ColorHex}, Z3={_zone3ColorHex}, Z4={_zone4ColorHex}");
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to restore keyboard colors: {ex.Message}");
+            }
+
+            return;
+        }
+
+        private void ApplyKeyboardPresetColors(KeyboardPreset preset)
+        {
+            Zone1ColorHex = preset.Zone1;
+            Zone2ColorHex = preset.Zone2;
+            Zone3ColorHex = preset.Zone3;
+            Zone4ColorHex = preset.Zone4;
+        }
+        
+        private static System.Windows.Media.Color ParseMediaColor(string hex)
+        {
+            try
+            {
+                if (hex.StartsWith("#"))
+                    hex = hex[1..];
+                if (hex.Length == 6)
+                {
+                    return System.Windows.Media.Color.FromRgb(
+                        Convert.ToByte(hex.Substring(0, 2), 16),
+                        Convert.ToByte(hex.Substring(2, 2), 16),
+                        Convert.ToByte(hex.Substring(4, 2), 16));
+                }
+            }
+            catch (Exception ex) when (ex is FormatException || ex is OverflowException || ex is ArgumentOutOfRangeException)
+            {
+                System.Diagnostics.Debug.WriteLine($"Invalid media color '{hex}': {ex.Message}");
+            }
+            return System.Windows.Media.Colors.Red;
+        }
+        
+        private static System.Drawing.Color ParseDrawingColor(string hex)
+        {
+            try
+            {
+                if (hex.StartsWith("#"))
+                    hex = hex[1..];
+                if (hex.Length == 6)
+                {
+                    return System.Drawing.Color.FromArgb(
+                        Convert.ToByte(hex.Substring(0, 2), 16),
+                        Convert.ToByte(hex.Substring(2, 2), 16),
+                        Convert.ToByte(hex.Substring(4, 2), 16));
+                }
+            }
+            catch (Exception ex) when (ex is FormatException || ex is OverflowException || ex is ArgumentOutOfRangeException)
+            {
+                System.Diagnostics.Debug.WriteLine($"Invalid drawing color '{hex}': {ex.Message}");
+            }
+            return System.Drawing.Color.Red;
+        }
+        
+        #region Temperature-Responsive Lighting Methods
+        
+        // Turning a reactive toggle on paints straight away rather than waiting for the next
+        // monitoring sample. Without this the feature looks broken: the poll cadence is 2-10 s
+        // depending on window state, and the temperature band usually does not change when the
+        // toggle is flipped, so the same-colour refresh interval could hold the first paint back
+        // for 30 s. "No effect" and "an effect that starts within half a minute" are the same
+        // thing from the user's chair.
+        private void StartTemperatureMonitoring()
+        {
+            if (!WarnIfMonitoringUnavailable("temperature-responsive")) return;
+
+            _logging.Info("Started temperature-responsive lighting monitoring");
+            var sample = _hardwareMonitoringService!.Samples.LastOrDefault();
+            if (sample == null) return;
+
+            // Clear the rate limiter's memory so this paint is not suppressed as a repeat of one
+            // made while the toggle was last on.
+            _lastTemperatureLightingApplyUtc = DateTime.MinValue;
+            _lastTemperatureLightingColorHex = null;
+
+            var colorHex = GetTemperatureLightingColor(sample);
+            if (ShouldApplyTemperatureLighting(colorHex))
+                _ = ApplyTemperatureBasedLightingAsync(colorHex);
+        }
+
+        private void StopTemperatureMonitoring()
+        {
+            if (_hardwareMonitoringService != null)
+            {
+                _logging.Info("Stopped temperature-responsive lighting monitoring");
+            }
+        }
+
+        private void StartPerformanceModeMonitoring()
+        {
+            if (_performanceModeService == null)
+            {
+                _logging.Warn("Performance mode synced lighting enabled with no performance mode " +
+                              "service; it will not respond to mode changes");
+                return;
+            }
+
+            _logging.Info("Started performance mode synced lighting monitoring");
+            var mode = _performanceModeService.GetCurrentMode();
+            if (!string.IsNullOrEmpty(mode))
+                _ = ApplyPerformanceModeLightingAsync(mode);
+        }
+
+        private void StopPerformanceModeMonitoring()
+        {
+            if (_performanceModeService != null)
+            {
+                _logging.Info("Stopped performance mode synced lighting monitoring");
+            }
+        }
+
+        private void StartThrottlingMonitoring()
+        {
+            if (!WarnIfMonitoringUnavailable("throttling indicator")) return;
+
+            _logging.Info("Started throttling indicator lighting monitoring");
+
+            // Unlike the other two this one is conditional on the machine's state, so there is
+            // nothing to paint unless it is throttling right now. Silence here is correct.
+            var sample = _hardwareMonitoringService!.Samples.LastOrDefault();
+            if (sample?.IsThrottling == true && ShouldApplyThrottlingLighting())
+                _ = ApplyThrottlingLightingAsync(sample);
+        }
+
+        private void StopThrottlingMonitoring()
+        {
+            if (_hardwareMonitoringService != null)
+            {
+                _logging.Info("Stopped throttling indicator lighting monitoring");
+            }
+        }
+
+        /// <summary>
+        /// True when hardware monitoring is wired up. A null service used to be silent, which is
+        /// how three reactive features shipped inert — the toggle moved, nothing subscribed.
+        /// </summary>
+        private bool WarnIfMonitoringUnavailable(string feature)
+        {
+            if (_hardwareMonitoringService != null) return true;
+
+            _logging.Warn($"{feature} lighting enabled with no hardware monitoring service; " +
+                          "it will not respond to temperature changes");
+            return false;
+        }
+        
+        private void OnMonitoringSampleUpdated(object? sender, MonitoringSample sample)
+        {
+            if (!TemperatureResponsiveLightingEnabled && !ThrottlingIndicatorLightingEnabled)
+                return;
+
+            // Marshal to the UI thread before touching any WPF-owned objects.
+            // The async void lighting methods access WPF-bound properties (color hex, threshold
+            // values, service availability flags) before their first await, so they must start on
+            // the dispatcher thread — exactly as DashboardViewModel and MainViewModel do.
+            Application.Current?.Dispatcher?.BeginInvoke(() =>
+            {
+                // Temperature-responsive lighting
+                if (TemperatureResponsiveLightingEnabled)
+                {
+                    var colorHex = GetTemperatureLightingColor(sample);
+                    if (ShouldApplyTemperatureLighting(colorHex))
+                    {
+                        _ = ApplyTemperatureBasedLightingAsync(colorHex);
+                    }
+                }
+
+                // Throttling indicators
+                if (ThrottlingIndicatorLightingEnabled && sample.IsThrottling && ShouldApplyThrottlingLighting())
+                {
+                    _ = ApplyThrottlingLightingAsync(sample);
+                }
+            });
+        }
+        
+        private void OnPerformanceModeApplied(object? sender, string modeName)
+        {
+            if (!PerformanceModeSyncedLightingEnabled)
+                return;
+            
+            Application.Current?.Dispatcher?.BeginInvoke(() =>
+            {
+                _ = ApplyPerformanceModeLightingAsync(modeName);
+            });
+        }
+        
+        private string GetTemperatureLightingColor(MonitoringSample sample)
+        {
+            var maxTemp = Math.Max(sample.CpuTemperatureC, sample.GpuTemperatureC);
+
+            if (maxTemp >= Math.Max(CpuTempThresholdHigh, GpuTempThresholdHigh))
+                return TempHighColorHex;
+
+            if (maxTemp >= Math.Max(CpuTempThresholdMedium, GpuTempThresholdMedium))
+                return TempMediumColorHex;
+
+            return TempLowColorHex;
+        }
+
+        private bool ShouldApplyTemperatureLighting(string colorHex)
+        {
+            if (_temperatureLightingApplyInFlight)
+                return false;
+
+            var now = DateTime.UtcNow;
+            var colorChanged = !string.Equals(_lastTemperatureLightingColorHex, colorHex, StringComparison.OrdinalIgnoreCase);
+            var intervalSeconds = colorChanged ? TemperatureLightingMinIntervalSeconds : TemperatureLightingSameColorRefreshSeconds;
+
+            if ((now - _lastTemperatureLightingApplyUtc).TotalSeconds < intervalSeconds)
+                return false;
+
+            _lastTemperatureLightingApplyUtc = now;
+            _lastTemperatureLightingColorHex = colorHex;
+            _temperatureLightingApplyInFlight = true;
+            return true;
+        }
+
+        private bool ShouldApplyThrottlingLighting()
+        {
+            if (_throttlingLightingApplyInFlight)
+                return false;
+
+            var now = DateTime.UtcNow;
+            if ((now - _lastThrottlingLightingApplyUtc).TotalSeconds < ThrottlingLightingMinIntervalSeconds)
+                return false;
+
+            _lastThrottlingLightingApplyUtc = now;
+            _throttlingLightingApplyInFlight = true;
+            return true;
+        }
+
+        /// <summary>
+        /// Paint one colour across every lighting surface these reactive features drive.
+        ///
+        /// Temperature, throttling and performance mode differ only in which colour they pick and
+        /// which effect string the RGB manager gets; the fan-out itself is the same, and used to be
+        /// three copies of it. <paramref name="rgbEffect"/> is the one genuine difference — the
+        /// throttling indicator pulses where the others hold steady.
+        /// </summary>
+        private async Task FanOutLightingColorAsync(string colorHex, string rgbEffect, string reason)
+        {
+            var color = ParseDrawingColor(colorHex);
+
+            if (_keyboardLightingService?.IsAvailable == true)
+            {
+                await _keyboardLightingService.SetAllZoneColors(new[] { color, color, color, color });
+            }
+
+            // The light bar is a separate device on a separate transport, so it takes its own call.
+            // It was missing from all three features, which left temperature-responsive lighting
+            // driving every RGB peripheral in the house while the strip on the front of the chassis
+            // — the one light the user is actually looking at — never moved.
+            //
+            // Brightness comes from the light bar card when the user has opened it, so the reactive
+            // colour does not quietly undo a brightness they chose. This deliberately reads the
+            // backing field: touching the property would construct that view-model, and hence probe
+            // hardware, from a monitoring callback.
+            if (_keyboardLightingService?.IsLightBarAvailable == true)
+            {
+                _keyboardLightingService.SetLightBarColors(
+                    new[] { (color.R, color.G, color.B) },
+                    (byte)(_deviceLighting?.BarBrightness ?? 100));
+            }
+
+            if (_rgbManager != null)
+            {
+                await _rgbManager.ApplyEffectToAllAsync(rgbEffect);
+            }
+
+            if (_corsairService != null && CorsairDevices.Count > 0)
+            {
+                await _corsairService.ApplyLightingToAllAsync(colorHex);
+            }
+
+            if (_logitechService != null && LogitechDevices.Count > 0)
+            {
+                foreach (var device in LogitechDevices)
+                {
+                    await _logitechService.ApplyStaticColorAsync(device, colorHex, LogitechBrightness);
+                }
+            }
+
+            if (_razerService?.IsAvailable == true && _razerDevices.Count > 0)
+            {
+                await Task.Run(() => _razerService.SetStaticColor(color.R, color.G, color.B));
+            }
+
+            _logging.Info($"Applied {reason} lighting: {colorHex}");
+        }
+
+        private async Task ApplyTemperatureBasedLightingAsync(string colorHex)
+        {
+            try
+            {
+                await FanOutLightingColorAsync(colorHex, $"color:{colorHex}", "temperature-based");
+            }
+            catch (Exception ex)
+            {
+                _logging.Error("Failed to apply temperature-based lighting", ex);
+            }
+            finally
+            {
+                _temperatureLightingApplyInFlight = false;
+            }
+        }
+
+        private async Task ApplyThrottlingLightingAsync(MonitoringSample sample)
+        {
+            try
+            {
+                await FanOutLightingColorAsync(
+                    ThrottlingColorHex, $"pulse:{ThrottlingColorHex}:1000", "throttling indicator");
+            }
+            catch (Exception ex)
+            {
+                _logging.Error("Failed to apply throttling indicator lighting", ex);
+            }
+            finally
+            {
+                _throttlingLightingApplyInFlight = false;
+            }
+        }
+
+        private async Task ApplyPerformanceModeLightingAsync(string modeName)
+        {
+            try
+            {
+                var colorHex = modeName.ToLower() switch
+                {
+                    "balanced" => BalancedModeColorHex,
+                    "performance" or "high performance" => PerformanceModeColorHex,
+                    "quiet" or "power saver" => QuietModeColorHex,
+                    _ => CustomModeColorHex
+                };
+
+                await FanOutLightingColorAsync(colorHex, $"color:{colorHex}", $"performance mode '{modeName}'");
+            }
+            catch (Exception ex)
+            {
+                _logging.Error($"Failed to apply performance mode lighting for '{modeName}'", ex);
+            }
+        }
+        
+        #endregion
+        
+        #endregion
+        
+        #region Scene Methods
+        
+        /// <summary>
+        /// Initialize scenes collection from service.
+        /// </summary>
+        private void InitializeScenesFromService()
+        {
+            if (_sceneService == null) return;
+            
+            Scenes.Clear();
+            foreach (var scene in _sceneService.Scenes)
+            {
+                Scenes.Add(scene);
+            }
+            
+            // Select current scene if any
+            _selectedScene = _sceneService.CurrentScene;
+            OnPropertyChanged(nameof(SelectedScene));
+            OnPropertyChanged(nameof(CurrentSceneName));
+            
+            // Subscribe to scene changes
+            _sceneService.SceneChanged += OnSceneServiceSceneChanged;
+            _sceneService.ScenesListChanged += OnSceneServiceListChanged;
+            
+            // Subscribe to ambient color changes
+            if (_screenSamplingService != null)
+            {
+                _screenSamplingService.ColorChanged += OnAmbientColorChanged;
+            }
+        }
+        
+        private void OnSceneServiceSceneChanged(object? sender, RgbSceneChangedEventArgs e)
+        {
+            DispatcherHelper.RunOnUiThread(() =>
+            {
+                _selectedScene = e.CurrentScene;
+                OnPropertyChanged(nameof(SelectedScene));
+                OnPropertyChanged(nameof(CurrentSceneName));
+
+                _isAmbientModeActive = e.CurrentScene.Effect == RgbSceneEffect.Ambient;
+                OnPropertyChanged(nameof(IsAmbientModeActive));
+
+                _isAudioReactiveModeActive = e.CurrentScene.Effect == RgbSceneEffect.AudioReactive;
+                OnPropertyChanged(nameof(IsAudioReactiveModeActive));
+            });
+        }
+        
+        private void OnSceneServiceListChanged(object? sender, EventArgs e)
+        {
+            DispatcherHelper.RunOnUiThread(() =>
+            {
+                Scenes.Clear();
+                if (_sceneService != null)
+                {
+                    foreach (var scene in _sceneService.Scenes)
+                    {
+                        Scenes.Add(scene);
+                    }
+                }
+            });
+        }
+        
+        private void OnAmbientColorChanged(object? sender, System.Drawing.Color color)
+        {
+            DispatcherHelper.RunOnUiThread(() =>
+            {
+                AmbientColorHex = $"#{color.R:X2}{color.G:X2}{color.B:X2}";
+                OnPropertyChanged(nameof(AmbientColorHex));
+            });
+        }
+        
+        /// <summary>
+        /// Apply a scene from a command parameter.
+        /// </summary>
+        private async Task ApplySceneFromParameterAsync(object? parameter)
+        {
+            if (_sceneService == null)
+            {
+                _logging.Warn("Cannot apply scene: Scene service is null");
+                return;
+            }
+            
+            var scene = parameter as RgbScene;
+            if (scene == null)
+            {
+                _logging.Warn("Cannot apply scene: Invalid scene parameter");
+                return;
+            }
+            
+            try
+            {
+                _selectedScene = scene;
+                OnPropertyChanged(nameof(SelectedScene));
+                
+                var result = await _sceneService.ApplySceneAsync(scene);
+                if (result.Success)
+                {
+                    OnPropertyChanged(nameof(CurrentSceneName));
+                    _logging.Info($"Applied scene '{scene.Name}' successfully");
+                }
+                else
+                {
+                    _logging.Warn($"Scene '{scene.Name}' applied with errors: {string.Join(", ", result.Errors)}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.Error($"Failed to apply scene '{scene.Name}'", ex);
+            }
+        }
+        
+        /// <summary>
+        /// Apply the currently selected scene.
+        /// </summary>
+        private async Task ApplySelectedSceneAsync()
+        {
+            if (_sceneService == null || _selectedScene == null)
+            {
+                _logging.Warn("Cannot apply scene: Scene service or scene is null");
+                return;
+            }
+            
+            try
+            {
+                var result = await _sceneService.ApplySceneAsync(_selectedScene);
+                if (result.Success)
+                {
+                    OnPropertyChanged(nameof(CurrentSceneName));
+                    _logging.Info($"Applied scene '{_selectedScene.Name}' successfully");
+                }
+                else
+                {
+                    _logging.Warn($"Scene '{_selectedScene.Name}' applied with errors: {string.Join(", ", result.Errors)}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.Error($"Failed to apply scene '{_selectedScene.Name}'", ex);
+            }
+        }
+        
+        /// <summary>
+        /// Save current lighting settings as a new scene.
+        /// </summary>
+        private async Task SaveCurrentAsSceneAsync()
+        {
+            if (_sceneService == null)
+            {
+                _logging.Warn("Cannot save scene: Scene service is not available");
+                return;
+            }
+            
+            await Task.Run(() =>
+            {
+                try
+                {
+                    var scene = _sceneService.CreateSceneFromCurrent($"Custom Scene {Scenes.Count + 1}");
+                    
+                    // Copy current zone colors
+                    scene.ZoneColors = new System.Collections.Generic.Dictionary<int, string>
+                    {
+                        { 0, Zone1ColorHex },
+                        { 1, Zone2ColorHex },
+                        { 2, Zone3ColorHex },
+                        { 3, Zone4ColorHex }
+                    };
+                    scene.PrimaryColor = Zone1ColorHex;
+                    
+                    _sceneService.AddScene(scene);
+                    
+                    DispatcherHelper.RunOnUiThread(() =>
+                    {
+                        Scenes.Add(scene);
+                        SelectedScene = scene;
+                    });
+                    
+                    _logging.Info($"Created new scene: {scene.Name}");
+                }
+                catch (Exception ex)
+                {
+                    _logging.Error("Failed to save current settings as scene", ex);
+                }
+            });
+        }
+        
+        /// <summary>
+        /// Toggle ambient/screen sampling mode.
+        /// </summary>
+        private void ToggleAmbientMode(bool enabled)
+        {
+            if (_screenSamplingService == null)
+            {
+                _logging.Warn("Screen sampling service not available");
+                return;
+            }
+
+            if (enabled && _isAudioReactiveModeActive)
+            {
+                _isAudioReactiveModeActive = false;
+                OnPropertyChanged(nameof(IsAudioReactiveModeActive));
+            }
+            
+            if (enabled)
+            {
+                _screenSamplingService.Start();
+                _logging.Info("Ambient mode enabled");
+            }
+            else
+            {
+                _screenSamplingService.Stop();
+                _logging.Info("Ambient mode disabled");
+            }
+        }
+
+        private async Task ToggleAudioReactiveModeAsync(bool enabled)
+        {
+            if (_audioReactiveRgbService == null)
+            {
+                _logging.Warn("Audio reactive service not available");
+                return;
+            }
+
+            if (enabled && _isAmbientModeActive)
+            {
+                _isAmbientModeActive = false;
+                OnPropertyChanged(nameof(IsAmbientModeActive));
+                _screenSamplingService?.Stop();
+            }
+
+            if (enabled)
+            {
+                var started = await _audioReactiveRgbService.StartAsync();
+                if (!started)
+                {
+                    _isAudioReactiveModeActive = false;
+                    OnPropertyChanged(nameof(IsAudioReactiveModeActive));
+                    return;
+                }
+
+                _logging.Info("Audio-reactive mode enabled");
+            }
+            else
+            {
+                await _audioReactiveRgbService.StopAsync();
+                _logging.Info("Audio-reactive mode disabled");
+            }
+
+            OnPropertyChanged(nameof(AudioReactiveLevelText));
+        }
+
+        private void OnAudioReactiveDataProcessed(object? sender, AudioDataEventArgs e)
+        {
+            DispatcherHelper.RunOnUiThread(() =>
+            {
+                AmbientColorHex = $"#{_audioReactiveRgbService?.GetCurrentColor().R ?? 0:X2}{_audioReactiveRgbService?.GetCurrentColor().G ?? 0:X2}{_audioReactiveRgbService?.GetCurrentColor().B ?? 0:X2}";
+                OnPropertyChanged(nameof(AmbientColorHex));
+                OnPropertyChanged(nameof(AudioReactiveLevelText));
+            });
+        }
+
+        public void NotifyHostMinimized(bool minimized)
+            => _screenSamplingService?.SetHostMinimized(minimized);
+
+        #region Per-Key Lighting
+
+        private void InitializePerKeyGrid()
+        {
+            var layout = new[]
+            {
+                new[] { "Esc","F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12","" },
+                new[] { "`","1","2","3","4","5","6","7","8","9","0","-","=","BS" },
+                new[] { "Tab","Q","W","E","R","T","Y","U","I","O","P","[","]","\\" },
+                new[] { "Caps","A","S","D","F","G","H","J","K","L",";","'","Ent","" },
+                new[] { "Sh","Z","X","C","V","B","N","M",",",".","/","Sh","","" },
+                new[] { "Ct","Win","Alt","Spc","","","","Alt","","","","Ct","","" },
+            };
+            foreach (var row in layout)
+            {
+                foreach (var key in row)
+                {
+                    PerKeyGrid.Add(new PerKeyCell
+                    {
+                        KeyName = key,
+                        KeyLabel = key,
+                        IsVisible = !string.IsNullOrEmpty(key),
+                        ColorHex = "#1A1A2E"
+                    });
+                }
+            }
+        }
+
+        private async Task ApplyPerKeyLightingAsync()
+        {
+            if (_keyboardLightingService == null || !IsPerKeyLightingAvailable) return;
+            var flatColors = PerKeyGrid
+                .Select(c => c.IsVisible ? ParseDrawingColor(c.ColorHex) : System.Drawing.Color.Black)
+                .ToArray();
+            var success = await _keyboardLightingService.ApplyPerKeyGridAsync(flatColors);
+            if (!success)
+                _logging.Warn("[LightingVM] ApplyPerKeyGridAsync returned false");
+        }
+
+        #endregion
+        
+        #endregion
+
+        public void Cleanup()
+        {
+            if (_audioReactiveRgbService != null)
+                _audioReactiveRgbService.AudioDataProcessed -= OnAudioReactiveDataProcessed;
+            if (_hardwareMonitoringService != null)
+                _hardwareMonitoringService.SampleUpdated -= OnMonitoringSampleUpdated;
+            if (_performanceModeService != null)
+                _performanceModeService.ModeApplied -= OnPerformanceModeApplied;
+            if (_sceneService != null)
+            {
+                _sceneService.SceneChanged -= OnSceneServiceSceneChanged;
+                _sceneService.ScenesListChanged -= OnSceneServiceListChanged;
+            }
+            if (_screenSamplingService != null)
+                _screenSamplingService.ColorChanged -= OnAmbientColorChanged;
+            if (_rgbManager != null)
+                _rgbManager.SyncCompleted -= OnRgbSyncCompleted;
+        }
+    }
+    
+    /// <summary>
+    /// Represents a keyboard zone color preset.
+    /// </summary>
+    public class KeyboardPreset
+    {
+        public string Name { get; set; } = "";
+        public string Zone1 { get; set; } = "#E6002E";
+        public string Zone2 { get; set; } = "#E6002E";
+        public string Zone3 { get; set; } = "#E6002E";
+        public string Zone4 { get; set; } = "#E6002E";
+    }
+
+    /// <summary>
+    /// Represents a single key in the per-key RGB grid editor.
+    /// Implements INotifyPropertyChanged so ColorHex changes propagate to the UI.
+    /// </summary>
+    public class PerKeyCell : System.ComponentModel.INotifyPropertyChanged
+    {
+        private string _colorHex = "#1A1A2E";
+
+        public string KeyName { get; set; } = "";
+        public string KeyLabel { get; set; } = "";
+        public bool IsVisible { get; set; } = true;
+
+        public string ColorHex
+        {
+            get => _colorHex;
+            set
+            {
+                if (_colorHex != value)
+                {
+                    _colorHex = value;
+                    PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(ColorHex)));
+                    PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(KeyBrush)));
+                }
+            }
+        }
+
+        public System.Windows.Media.SolidColorBrush KeyBrush
+        {
+            get
+            {
+                try
+                {
+                    var c = (System.Windows.Media.Color)
+                        System.Windows.Media.ColorConverter.ConvertFromString(_colorHex);
+                    return new System.Windows.Media.SolidColorBrush(c);
+                }
+                catch
+                {
+                    return System.Windows.Media.Brushes.Black;
+                }
+            }
+        }
+
+        public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+    }
+}

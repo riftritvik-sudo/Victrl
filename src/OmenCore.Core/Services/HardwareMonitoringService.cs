@@ -1,0 +1,1703 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using OmenCore.Hardware;
+using OmenCore.Models;
+using OmenCore.Services.Diagnostics;
+using OmenCore.Utils;
+
+namespace OmenCore.Services
+{
+    /// <summary>
+    /// Hardware monitoring service with performance enhancements and dashboard support.
+    /// Features: Object pooling, change detection, adaptive polling, low-overhead mode, power monitoring, alerts.
+    /// </summary>
+    public class HardwareMonitoringService : IHardwareMonitoringService, IDisposable
+    {
+        private readonly IHardwareMonitorBridge _bridge;
+        private readonly LoggingService _logging;
+        private readonly ObservableCollection<MonitoringSample> _samples = new();
+        private readonly int _history;
+        private readonly TimeSpan _activeCadenceInterval = TimeSpan.FromSeconds(2);
+        private readonly TimeSpan _idleCadenceInterval = TimeSpan.FromSeconds(5);
+        private readonly TimeSpan _trayOnlyCadenceInterval = TimeSpan.FromSeconds(10);
+
+        // Even a background-cadence poll of the discrete GPU (every 5-10s) can be enough to keep
+        // it out of its deepest RTD3/idle power state, artificially raising chassis temperature
+        // with nothing running - the same effect the "Ohman" project measured and fixed for its
+        // own nvidia-smi polling. Once the GPU itself (not just the UI) has been confirmed idle
+        // for a few consecutive samples, back off far further than the existing idle/tray-only
+        // tiers while any window-active/overlay cadence is left untouched, so this only affects
+        // background cost, never perceived responsiveness while someone is actually watching.
+        // Must stay well under HardwareWatchdogService.FreezeThresholdSeconds: the watchdog treats
+        // "no monitoring sample for that long" as frozen sensors and forces fans to 90%. v4.3.1
+        // shipped this at 2 minutes, which outlasted the 90s limit, so every tray-only idle stretch
+        // tripped the watchdog roughly every two minutes and pinned real fans at 90% (GitHub #203
+        // and field bundles from board 8BD4). Thermal protection also only sees a new temperature
+        // once per cadence tick, so a long interval means slower reaction to a sudden load.
+        internal static readonly TimeSpan GpuDeepIdleCadence = TimeSpan.FromSeconds(30);
+        private readonly TimeSpan _gpuDeepIdleCadenceInterval = GpuDeepIdleCadence;
+        private const double GpuIdleUtilizationThresholdPercent = 1.0;
+        private const double GpuIdlePowerThresholdWatts = 12.0;
+        private const int GpuIdleReadingsRequired = 3;
+        private volatile int _consecutiveGpuIdleReadings;
+        private CancellationTokenSource? _cts;
+        private volatile bool _lowOverheadMode; // volatile for thread-safe reads from monitor loop
+        private volatile bool _uiWindowActive = true; // Thread-safe cache updated by the UI thread via SetUiWindowActive()
+        private volatile bool _trayOnlyMode; // True when UI is hidden to tray and no active fan curve/hold requires fast updates
+        private volatile bool _overlayRealtimeMode; // True while in-game OSD overlay is visible and requires responsive telemetry cadence
+        // The loop sleeps for a full cadence between samples. Without a way to cut that sleep short,
+        // opening the window, showing the OSD, or leaving low-overhead mode only took effect after the
+        // sleep that was already in progress ended - invisible at a 10s tray cadence, but v4.3.1's 2-minute
+        // deep-idle cadence turned it into "the OSD / General page takes minutes to show numbers".
+        private readonly object _cadenceWakeLock = new();
+        private CancellationTokenSource? _cadenceWaitCts;
+
+        /// <summary>Ends the monitor loop's current inter-sample sleep so a cadence change applies now.</summary>
+        private void WakeMonitorLoop()
+        {
+            lock (_cadenceWakeLock)
+            {
+                _cadenceWaitCts?.Cancel();
+            }
+        }
+
+        private MonitoringSample? _lastSample;
+
+        /// <summary>
+        /// Most recent sample regardless of the UI-facing significant-change filter or WPF
+        /// Dispatcher availability - unlike <see cref="Samples"/> (which only gets a new entry
+        /// when both <c>ShouldUpdateUI</c> passes and a live Dispatcher processes the
+        /// <c>BeginInvoke</c>), this is set unconditionally on every successful monitoring tick.
+        /// Intended for consumers that need the latest reading rather than UI-throttled history,
+        /// e.g. diagnostics export.
+        /// </summary>
+        public MonitoringSample? LastSample => _lastSample;
+        private readonly double _changeThreshold = 0.5; // Minimum change to trigger UI update (degrees/percent)
+        private readonly double _lowOverheadChangeThreshold = 3.0; // Higher threshold in low overhead mode
+        private readonly double _powerChangeThresholdWatts = 1.0; // Force UI update on significant power change (Watts)
+        private volatile bool _isPaused; // For S0 Modern Standby support (volatile for thread-safety)
+        private readonly object _pauseLock = new();
+        private volatile bool _pendingUIUpdate; // Throttle BeginInvoke backlog
+        private readonly ResumeRecoveryDiagnosticsService _resumeDiagnostics; // Always non-null; STEP-12 Option A
+
+        // New fields for dashboard functionality
+        private readonly List<HardwareMetrics> _metricsHistory = new();
+        private readonly List<SystemAlert> _activeAlerts = new();
+        private readonly object _dashboardLock = new();
+        private HardwareMetrics? _lastMetrics;
+        private const int ReadSampleTimeoutMs = 10000; // 10 second timeout for sample reads
+        private int _consecutiveTimeouts = 0; // Track consecutive timeouts for diagnostics
+        private static readonly TimeSpan DashboardMetricsRetention = TimeSpan.FromHours(24);
+        private static readonly TimeSpan DashboardMetricAgePruneInterval = TimeSpan.FromMinutes(1);
+        private const int MaxDashboardMetricsHistory = 3600; // Keeps at least 2h at active 2s cadence.
+        private const int MaxHistoricalDataPoints = 600;
+        private const int PowerTrendSampleCount = 5;
+        private DateTime _nextDashboardMetricAgePruneUtc = DateTime.MinValue;
+        
+        // Monitoring health tracking (v2.7.0)
+        private DateTime _lastSuccessfulSampleTime = DateTime.MinValue;
+        private volatile MonitoringHealthStatus _healthStatus = MonitoringHealthStatus.Unknown;
+        private const int StaleSampleThresholdSeconds = 15;  // Mark stale after 15s without update
+        private const int DegradedTimeoutThreshold = 2;      // Mark degraded after 2 consecutive timeouts
+        private const int RestartTimeoutThreshold = 3;       // Attempt bridge restart after 3 consecutive timeouts
+        private bool _restartInProgress = false;             // Prevent concurrent restart attempts
+        
+        // Temperature freeze detection (v2.7.0 enhancement, improved v2.8.6)
+        private double _lastCpuTempForFreezeCheck = 0;
+        private double _lastGpuTempForFreezeCheck = 0;
+        private int _consecutiveSameCpuTemp = 0;
+        private int _consecutiveSameGpuTemp = 0;
+        private const int FreezeThresholdReadings = 30;      // 30 readings with same temp = potential freeze
+        private const int IdleCpuFreezeThreshold = 120;      // Idle CPU can legitimately hold flat temps for longer
+        private const int IdleGpuFreezeThreshold = 120;      // v2.8.6: Idle GPU (load <10%) needs 120 readings (~2min) before flagging
+        private const double TempFreezeEpsilon = 0.1;        // Temperature must change by at least 0.1°C
+
+        // Same quantization caveat as WmiBiosMonitor's detector (see IsIdenticalTempSuspicious there):
+        // integer-degree sensors legitimately repeat one value at thermal equilibrium, so an identical
+        // run only indicates a stuck sensor when a correlated signal says the temperature should have
+        // moved. This detector matters more than the diagnostic one because a false positive here also
+        // flips _usingWmiFallback and can trigger a monitoring-bridge restart.
+        private const double FreezeLoadVarianceThresholdPercent = 15.0;
+        private const int AbsoluteFreezeReadCeiling = 400;   // backstop for genuinely constant load
+        private double _cpuLoadMinDuringFreezeWindow = double.MaxValue;
+        private double _cpuLoadMaxDuringFreezeWindow = double.MinValue;
+        private double _gpuLoadMinDuringFreezeWindow = double.MaxValue;
+        private double _gpuLoadMaxDuringFreezeWindow = double.MinValue;
+        private HpWmiBios? _wmiBiosService;                  // Optional WMI fallback for temps
+        private bool _usingWmiFallback = false;              // Track if we're in fallback mode
+        private int _consecutiveZeroTempReadings = 0;        // Track sustained zero-temp data quality failures
+        private const int ZeroTempDegradedThreshold = 10;    // Mark degraded after 10 consecutive 0°C readings (~10s)
+        private bool _gpuFreezeWarningLogged = false;        // v2.8.6: Only log GPU freeze warning once per freeze event
+        private const int FreezeRestartBaseCooldownSeconds = 90;
+
+        // GitHub #143 (Victus 8DCD): Performance fan reportedly collapsed from ~5000 RPM to
+        // below 2000 RPM while CPU stayed above 80°C for roughly five minutes, recovering only
+        // after a manual mode change. This does NOT attempt to diagnose or fix that report — per
+        // this project's evidence-gate rule, a control-policy change needs a field reproduction
+        // with wmi-command-history/tuning-fan-focus evidence first. This is diagnostic-only: it
+        // makes that evidence loud and easy to find in a log, so "the requested mode applied
+        // successfully" is never mistaken for "the fan is actually spinning at a safe speed" when
+        // the two disagree for a sustained period. Thresholds match the reporter's own numbers.
+        private const double UnexpectedLowRpmHighTempThresholdC = 80.0;
+        private const int UnexpectedLowRpmFloor = 2000;
+        private const int UnexpectedLowRpmSustainedReadings = 5; // avoid firing on a single transient dip
+        private int _consecutiveCpuHighTempLowRpm = 0;
+        private int _consecutiveGpuHighTempLowRpm = 0;
+        private bool _cpuHighTempLowRpmWarningLogged = false;
+        private bool _gpuHighTempLowRpmWarningLogged = false;
+        private const int FreezeRestartMaxCooldownSeconds = 300;
+        private const int FreezeRestartBudgetWindowMinutes = 15;
+        private const int FreezeRestartMaxAttemptsPerWindow = 4;
+        private readonly object _freezeRestartGate = new();
+        private readonly Queue<DateTime> _freezeRestartAttemptsUtc = new();
+        private DateTime _freezeRestartSuppressedUntilUtc = DateTime.MinValue;
+        private int _freezeRestartCooldownSeconds = FreezeRestartBaseCooldownSeconds;
+        private TimeSpan? _lastAppliedCadence;
+        private string _lastCadenceReason = "Cadence not initialized";
+        private readonly object _cadenceTransitionLock = new();
+        private readonly Queue<MonitoringCadenceTransition> _cadenceTransitions = new();
+        private const int MaxCadenceTransitions = 80;
+        private string? _lastProviderError;
+
+        public ReadOnlyObservableCollection<MonitoringSample> Samples { get; }
+        public event EventHandler<MonitoringSample>? SampleUpdated;
+        public event EventHandler<MonitoringCadenceTransition>? CadenceChanged;
+        
+        /// <summary>
+        /// Event fired when monitoring health status changes.
+        /// </summary>
+        public event EventHandler<MonitoringHealthStatus>? HealthStatusChanged;
+
+        public HardwareMonitoringService(IHardwareMonitorBridge bridge, LoggingService logging, MonitoringPreferences preferences, ResumeRecoveryDiagnosticsService resumeDiagnostics)
+        {
+            _bridge = bridge;
+            _logging = logging;
+            _resumeDiagnostics = resumeDiagnostics;
+            _history = Math.Max(30, preferences.HistoryCount);
+            _lowOverheadMode = preferences.LowOverheadMode;
+            Samples = new ReadOnlyObservableCollection<MonitoringSample>(_samples);
+            
+            // Set initial low overhead mode on the bridge if it supports it
+            if (_bridge is LibreHardwareMonitorImpl lhwm)
+            {
+                lhwm.SetLowOverheadMode(_lowOverheadMode);
+            }
+
+            UpdateBridgeSamplingPolicy();
+        }
+
+        public bool LowOverheadMode => _lowOverheadMode;
+        
+        /// <summary>
+        /// Current monitoring health status (Healthy, Degraded, or Stale).
+        /// </summary>
+        public MonitoringHealthStatus HealthStatus => _healthStatus;
+
+        /// <summary>
+        /// Human-readable monitoring source label.
+        /// </summary>
+        public string MonitoringSource => _bridge.MonitoringSource;
+        
+        /// <summary>
+        /// Time since last successful sensor reading.
+        /// </summary>
+        public TimeSpan LastSampleAge => _lastSuccessfulSampleTime == DateTime.MinValue 
+            ? TimeSpan.MaxValue 
+            : DateTime.Now - _lastSuccessfulSampleTime;
+        
+        /// <summary>
+        /// Number of consecutive timeouts (useful for diagnostics).
+        /// </summary>
+        public int ConsecutiveTimeouts => _consecutiveTimeouts;
+
+        /// <summary>
+        /// Human-readable reason for the currently active monitoring cadence.
+        /// </summary>
+        public string CurrentCadenceReason => _lastCadenceReason;
+
+        /// <summary>
+        /// Current cadence interval in milliseconds. Returns 0 until cadence telemetry has initialized.
+        /// </summary>
+        public int CurrentCadenceIntervalMs => _lastAppliedCadence.HasValue
+            ? (int)_lastAppliedCadence.Value.TotalMilliseconds
+            : 0;
+
+        /// <summary>
+        /// Snapshot of recent cadence transitions with state flags for diagnostics export.
+        /// </summary>
+        public IReadOnlyList<MonitoringCadenceTransition> GetCadenceTransitionsSnapshot()
+        {
+            lock (_cadenceTransitionLock)
+            {
+                return _cadenceTransitions.ToList();
+            }
+        }
+
+        public void SetLowOverheadMode(bool enabled)
+        {
+            var changed = _lowOverheadMode != enabled;
+            _lowOverheadMode = enabled;
+            _logging.Info($"Hardware monitoring low overhead mode changed: {enabled}");
+            
+            // Also set on the bridge for cache lifetime adjustment
+            if (_bridge is LibreHardwareMonitorImpl lhwm)
+            {
+                lhwm.SetLowOverheadMode(enabled);
+            }
+
+            UpdateBridgeSamplingPolicy();
+            if (changed) WakeMonitorLoop();
+        }
+
+        private TimeSpan GetEffectiveCadenceInterval()
+        {
+            // OSD overlay is latency-sensitive; keep active cadence while visible even in tray state.
+            if (_overlayRealtimeMode)
+            {
+                return _activeCadenceInterval;
+            }
+
+            if (_lowOverheadMode && !_uiWindowActive && _trayOnlyMode)
+            {
+                return ApplyGpuDeepIdleOverride(_trayOnlyCadenceInterval);
+            }
+
+            if (_lowOverheadMode)
+            {
+                return _idleCadenceInterval;
+            }
+
+            // _uiWindowActive is a volatile bool set by the UI thread (via SetUiWindowActive).
+            // Do NOT access Application.Current.MainWindow properties here — this method runs
+            // on the background monitor-loop thread and WPF DependencyObject access from a
+            // non-owner thread throws InvalidOperationException (root cause of GH-#109/#110).
+            if (_uiWindowActive)
+                return _activeCadenceInterval;
+
+            // Tray-only ultra-low cadence: no visible UI and no active fan-curve work.
+            if (_trayOnlyMode)
+                return ApplyGpuDeepIdleOverride(_trayOnlyCadenceInterval);
+
+            return ApplyGpuDeepIdleOverride(_idleCadenceInterval);
+        }
+
+        /// <summary>
+        /// Widens an idle/tray-only cadence further once the GPU itself has been confirmed idle
+        /// for <see cref="GpuIdleReadingsRequired"/> consecutive samples. Never called from the
+        /// active-window or overlay-realtime branches, so this cannot make the app feel slow
+        /// while someone is actually looking at it.
+        /// </summary>
+        private TimeSpan ApplyGpuDeepIdleOverride(TimeSpan baseline) =>
+            _consecutiveGpuIdleReadings >= GpuIdleReadingsRequired ? _gpuDeepIdleCadenceInterval : baseline;
+
+        /// <summary>
+        /// Tracks consecutive idle GPU readings so <see cref="ApplyGpuDeepIdleOverride"/> can back
+        /// off further. Resets to zero the instant the GPU shows any real load or draw, so a
+        /// workload starting up is never delayed by a stale "still idle" assumption - this only
+        /// widens the interval between reads while nothing is happening, it never changes what a
+        /// read reports.
+        /// </summary>
+        private void UpdateGpuIdleTracking(MonitoringSample sample)
+        {
+            bool gpuIdle = sample.GpuLoadPercent <= GpuIdleUtilizationThresholdPercent &&
+                           sample.GpuPowerWatts <= GpuIdlePowerThresholdWatts;
+
+            _consecutiveGpuIdleReadings = gpuIdle
+                ? Math.Min(_consecutiveGpuIdleReadings + 1, GpuIdleReadingsRequired)
+                : 0;
+        }
+
+        /// <summary>
+        /// Called from the UI thread when the main window becomes visible/hidden or is
+        /// minimised/restored, so the monitor loop can adapt its polling cadence without
+        /// touching WPF objects off the UI thread.
+        /// </summary>
+        public void SetUiWindowActive(bool active)
+        {
+            var changed = _uiWindowActive != active;
+            _uiWindowActive = active;
+            UpdateBridgeSamplingPolicy();
+            if (changed) WakeMonitorLoop();
+        }
+
+        /// <summary>
+        /// Enable the ultra-low (10 s) tray-only cadence. Call with <c>true</c> when the app
+        /// is hidden to the system tray and no active fan curve or hold requires fast telemetry;
+        /// call with <c>false</c> when any of those conditions change.
+        /// Has no effect when <see cref="SetUiWindowActive"/> has been called with <c>true</c>
+        /// (the UI-active cadence always takes precedence).
+        /// </summary>
+        public void SetTrayOnlyMode(bool trayOnly)
+        {
+            var changed = _trayOnlyMode != trayOnly;
+            _trayOnlyMode = trayOnly;
+            UpdateBridgeSamplingPolicy();
+            if (changed) WakeMonitorLoop();
+        }
+
+        /// <summary>
+        /// Forces active telemetry cadence while a realtime overlay (for example the in-game OSD)
+        /// is visible, even when the main window is hidden to tray.
+        /// </summary>
+        public void SetOverlayRealtimeMode(bool enabled)
+        {
+            var changed = _overlayRealtimeMode != enabled;
+            _overlayRealtimeMode = enabled;
+            UpdateBridgeSamplingPolicy();
+            if (changed) WakeMonitorLoop();
+        }
+
+        private void UpdateBridgeSamplingPolicy()
+        {
+            if (_bridge is not IAdaptiveSamplingBridge adaptiveBridge)
+            {
+                return;
+            }
+
+            bool staticTrayMode = _lowOverheadMode && !_uiWindowActive && _trayOnlyMode && !_overlayRealtimeMode;
+            adaptiveBridge.SetStaticTraySamplingMode(staticTrayMode);
+        }
+
+        private void UpdateCadenceTelemetry(TimeSpan cadence)
+        {
+            if (_lastAppliedCadence.HasValue && _lastAppliedCadence.Value == cadence)
+            {
+                return;
+            }
+
+            var reason = BuildCadenceReason(cadence);
+            _lastCadenceReason = reason;
+
+            string description;
+            if (cadence == _activeCadenceInterval)
+                description = "Unified monitoring pipeline (active cadence)";
+            else if (cadence == _gpuDeepIdleCadenceInterval)
+                description = "Unified monitoring pipeline (GPU confirmed idle, deep-idle cadence)";
+            else if (cadence == _trayOnlyCadenceInterval)
+                description = "Unified monitoring pipeline (tray-only ultra-low cadence)";
+            else
+                description = "Unified monitoring pipeline (idle cadence)";
+
+            bool intervalChanged = !_lastAppliedCadence.HasValue ||
+                (int)_lastAppliedCadence.Value.TotalMilliseconds != (int)cadence.TotalMilliseconds;
+
+            _lastAppliedCadence = cadence;
+
+            var transition = new MonitoringCadenceTransition
+            {
+                TimestampUtc = DateTime.UtcNow,
+                CadenceMs = (int)cadence.TotalMilliseconds,
+                Reason = reason,
+                UiWindowActive = _uiWindowActive,
+                TrayOnlyMode = _trayOnlyMode,
+                OverlayRealtimeMode = _overlayRealtimeMode,
+                LowOverheadMode = _lowOverheadMode
+            };
+
+            lock (_cadenceTransitionLock)
+            {
+                _cadenceTransitions.Enqueue(transition);
+                while (_cadenceTransitions.Count > MaxCadenceTransitions)
+                {
+                    _cadenceTransitions.Dequeue();
+                }
+            }
+
+            if (intervalChanged)
+            {
+                BackgroundTimerRegistry.Unregister("HardwareMonitorLoop");
+                BackgroundTimerRegistry.Register(
+                    "HardwareMonitorLoop",
+                    "HardwareMonitoringService",
+                    description,
+                    (int)cadence.TotalMilliseconds,
+                    BackgroundTimerTier.Critical);
+            }
+            else
+            {
+                BackgroundTimerRegistry.UpdateDescription("HardwareMonitorLoop", description);
+            }
+
+            _logging.Info($"[MonitorLoop] Cadence switched to {(int)cadence.TotalMilliseconds}ms");
+            CadenceChanged?.Invoke(this, transition);
+        }
+
+        private string BuildCadenceReason(TimeSpan cadence)
+        {
+            if (_overlayRealtimeMode)
+            {
+                return "overlay-realtime: OSD visible forces active 1s cadence";
+            }
+
+            if (cadence == _gpuDeepIdleCadenceInterval)
+            {
+                return "gpu-deep-idle: GPU confirmed idle in the background, backed off to reduce idle-power keep-awake cost";
+            }
+
+            if (_lowOverheadMode && !_uiWindowActive && _trayOnlyMode && cadence == _trayOnlyCadenceInterval)
+            {
+                return "low-overhead/tray-only: app minimized with no active fan curve/hold";
+            }
+
+            if (_lowOverheadMode)
+            {
+                return "low-overhead: fixed idle cadence to reduce polling overhead";
+            }
+
+            if (_uiWindowActive)
+            {
+                return "ui-active: main window visible/interactive";
+            }
+
+            if (_trayOnlyMode && cadence == _trayOnlyCadenceInterval)
+            {
+                return "tray-only: app minimized with no active fan curve/hold";
+            }
+
+            return "idle-background: window inactive but fan activity requires standard idle cadence";
+        }
+
+        /// <summary>
+        /// Set MSR access for enhanced throttling detection on LibreHardwareMonitor.
+        /// </summary>
+        public void SetMsrAccess(IMsrAccess? msrAccess)
+        {
+            if (_bridge is LibreHardwareMonitorImpl lhwm)
+            {
+                lhwm.SetMsrAccess(msrAccess);
+            }
+        }
+        
+        /// <summary>
+        /// Set WMI BIOS service for temperature fallback when primary sensors freeze.
+        /// </summary>
+        public void SetWmiBiosService(HpWmiBios? wmiBios)
+        {
+            _wmiBiosService = wmiBios;
+            if (wmiBios != null)
+            {
+                _logging.Info("WMI BIOS temperature fallback configured for freeze recovery");
+            }
+        }
+
+        /// <summary>
+        /// Pause monitoring during system suspend (S0 Modern Standby).
+        /// Prevents fan revving from WMI/EC queries while system is in standby.
+        /// </summary>
+        public void Pause()
+        {
+            lock (_pauseLock)
+            {
+                if (!_isPaused)
+                {
+                    _isPaused = true;
+                    _logging.Info("Hardware monitoring paused (system entering standby)");
+                    _resumeDiagnostics.RecordStep("monitoring", "Monitoring paused for suspend");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Resume monitoring after system wakes from suspend.
+        /// </summary>
+        public void Resume()
+        {
+            lock (_pauseLock)
+            {
+                if (_isPaused)
+                {
+                    _isPaused = false;
+                    ResetFreezeDetectionState();
+                    _consecutiveTimeouts = 0;
+                    _consecutiveZeroTempReadings = 0;
+                    _lastSuccessfulSampleTime = DateTime.Now;
+                    _logging.Info("Hardware monitoring resumed (system waking from standby)");
+                    _resumeDiagnostics.RecordStep("monitoring", "Monitoring resumed after standby");
+
+                    // Some sensor stacks return stale data after sleep until reinitialized.
+                    // Trigger a best-effort bridge refresh so users do not need to restart OmenCore.
+                    _ = Task.Run(RecoverAfterResumeAsync);
+                }
+            }
+        }
+
+        public bool IsPaused => _isPaused;
+
+        public void Start()
+        {
+            Stop();
+            _cts = new CancellationTokenSource();
+            _ = Task.Run(() => MonitorLoopAsync(_cts.Token));
+            var initialCadence = GetEffectiveCadenceInterval();
+            UpdateCadenceTelemetry(initialCadence);
+        }
+
+        public void Stop()
+        {
+            if (_cts == null)
+            {
+                return;
+            }
+            BackgroundTimerRegistry.Unregister("HardwareMonitorLoop");
+            _cts.Cancel();
+            _cts.Dispose();
+            _cts = null;
+        }
+
+        private async Task MonitorLoopAsync(CancellationToken token)
+        {
+            _logging.Info("Optimized hardware monitoring loop started");
+            var consecutiveErrors = 0;
+            const int maxErrors = 5;
+            int iteration = 0;
+            var lastHeartbeat = DateTime.Now;
+            const int HeartbeatIntervalSeconds = 60; // Log heartbeat every minute
+
+            while (!token.IsCancellationRequested)
+            {
+                iteration++;
+                
+                // Periodic heartbeat to confirm loop is still running
+                if ((DateTime.Now - lastHeartbeat).TotalSeconds >= HeartbeatIntervalSeconds)
+                {
+                    _logging.Info($"[MonitorLoop] ❤️ Heartbeat: iteration {iteration}, errors={consecutiveErrors}, timeouts={_consecutiveTimeouts}");
+                    lastHeartbeat = DateTime.Now;
+                }
+                
+                // Check if paused (S0 Modern Standby support)
+                if (_isPaused)
+                {
+                    try
+                    {
+                        // Wait while paused, checking every 500ms
+                        await Task.Delay(500, token);
+                        continue;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                }
+
+                try
+                {
+                    // Add timeout to prevent infinite hangs in hardware monitoring
+                    using var readCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    readCts.CancelAfter(ReadSampleTimeoutMs);
+                    
+                    MonitoringSample? sample;
+                    try
+                    {
+                        sample = await _bridge.ReadSampleAsync(readCts.Token);
+                        _lastProviderError = null;
+                        _consecutiveTimeouts = 0; // Reset on successful read
+                        _lastSuccessfulSampleTime = DateTime.Now;
+                        
+                        // Validate data quality: sustained zero temps indicate broken sensor path
+                        if (sample.CpuTemperatureC <= 0 && sample.GpuTemperatureC <= 0)
+                        {
+                            _consecutiveZeroTempReadings++;
+                            if (_consecutiveZeroTempReadings >= ZeroTempDegradedThreshold)
+                            {
+                                UpdateHealthStatus(MonitoringHealthStatus.Degraded);
+                                if (_consecutiveZeroTempReadings == ZeroTempDegradedThreshold)
+                                {
+                                    _logging.Warn($"[MonitorLoop] ⚠ Sustained zero temperatures ({_consecutiveZeroTempReadings} consecutive readings) — sensor data path may be broken");
+                                }
+                            }
+                            else
+                            {
+                                UpdateHealthStatus(MonitoringHealthStatus.Healthy);
+                            }
+                        }
+                        else
+                        {
+                            _consecutiveZeroTempReadings = 0;
+                            UpdateHealthStatus(MonitoringHealthStatus.Healthy);
+                        }
+                    }
+                    catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                    {
+                        // Timeout occurred (not overall cancellation)
+                        _consecutiveTimeouts++;
+                        _lastProviderError = $"ReadSampleAsync timeout after {ReadSampleTimeoutMs}ms";
+                        _logging.Warn($"[MonitorLoop] ReadSampleAsync timed out after {ReadSampleTimeoutMs}ms (consecutive: {_consecutiveTimeouts})");
+                        
+                        // Update health status based on consecutive timeouts
+                        if (_consecutiveTimeouts >= DegradedTimeoutThreshold)
+                        {
+                            UpdateHealthStatus(MonitoringHealthStatus.Degraded);
+                            _logging.Warn("[MonitorLoop] Multiple consecutive timeouts - hardware monitoring may be stuck");
+                        }
+                        
+                        // Auto-restart bridge after reaching threshold (v2.7.0)
+                        if (_consecutiveTimeouts >= RestartTimeoutThreshold && !_restartInProgress)
+                        {
+                            _restartInProgress = true;
+                            _logging.Warn($"[MonitorLoop] 🔄 Consecutive timeouts reached threshold ({RestartTimeoutThreshold}), attempting bridge restart...");
+                            
+                            try
+                            {
+                                var restarted = await _bridge.TryRestartAsync();
+                                if (restarted)
+                                {
+                                    _logging.Info("[MonitorLoop] ✅ Bridge restart successful - resuming monitoring");
+                                    _consecutiveTimeouts = 0;
+                                    UpdateHealthStatus(MonitoringHealthStatus.Healthy);
+                                }
+                                else
+                                {
+                                    _logging.Error("[MonitorLoop] ❌ Bridge restart failed - monitoring may remain degraded");
+                                }
+                            }
+                            catch (Exception restartEx)
+                            {
+                                _logging.Error($"[MonitorLoop] ❌ Bridge restart exception: {restartEx.Message}");
+                            }
+                            finally
+                            {
+                                _restartInProgress = false;
+                            }
+                        }
+                        
+                        // Continue to next iteration instead of hanging
+                        continue;
+                    }
+                    
+                    consecutiveErrors = 0; // Reset error counter on success
+
+                    // Temperature freeze detection (v2.7.0)
+                    sample = CheckAndRecoverFrozenTemps(sample);
+                    CheckForUnexpectedLowRpmAtHighTemp(sample);
+                    sample = EnrichCpuTelemetry(sample);
+                    UpdateGpuIdleTracking(sample);
+
+                    // ALWAYS update historical metrics for charts/graphs (bug fix v2.7.0)
+                    // The history must be populated even when UI updates are skipped
+                    UpdateDashboardMetrics(sample);
+
+                    // Fan-out delivery model: one shared sample source broadcasts to all
+                    // subscribers, so consumers do not perform duplicate sensor reads.
+                    // Invoke each subscriber in isolation so one faulty consumer cannot
+                    // break the monitoring loop or watchdog heartbeat updates.
+                    var sampleHandlers = SampleUpdated;
+                    if (sampleHandlers != null)
+                    {
+                        foreach (EventHandler<MonitoringSample> handler in sampleHandlers.GetInvocationList())
+                        {
+                            try
+                            {
+                                handler(this, sample);
+                            }
+                            catch (Exception subscriberEx)
+                            {
+                                var targetName = handler.Target?.GetType().Name ?? "static";
+                                _logging.Error($"[MonitorLoop] SampleUpdated subscriber failed ({targetName}.{handler.Method.Name})", subscriberEx);
+                            }
+                        }
+                    }
+                    
+                    // Change detection optimization - only update UI if values changed significantly
+                    var shouldUpdate = ShouldUpdateUI(sample);
+                    if (shouldUpdate)
+                    {
+                        if (!_lowOverheadMode)
+                        {
+                            // Throttle UI updates to prevent Dispatcher backlog during heavy load
+                            if (!_pendingUIUpdate)
+                            {
+                                _pendingUIUpdate = true;
+                                // Use BeginInvoke to avoid potential deadlocks
+                                UiThreadMarshaller.BeginInvoke(() =>
+                                {
+                                    _samples.Add(sample);
+                                    while (_samples.Count > _history)
+                                    {
+                                        _samples.RemoveAt(0);
+                                    }
+                                    _pendingUIUpdate = false;
+                                });
+                            }
+                        }
+
+                        _lastSample = sample;
+                    }
+                    else
+                    {
+                        // UI not updated, but history and lastSample still need tracking
+                        _lastSample = sample;
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    consecutiveErrors++;
+                    _lastProviderError = ex.Message;
+                    _logging.Error($"Hardware monitoring error ({consecutiveErrors}/{maxErrors})", ex);
+
+                    if (consecutiveErrors >= maxErrors)
+                    {
+                        // P2 fix: back off and restart the loop rather than exiting permanently.
+                        // A transient hardware glitch (driver reset, sleep/wake) should not
+                        // permanently kill telemetry without user action.
+                        _logging.Warn($"[MonitorLoop] {maxErrors} consecutive errors — backing off 10s then restarting loop");
+                        consecutiveErrors = 0;
+                        try
+                        {
+                            await Task.Delay(TimeSpan.FromSeconds(10), token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                try
+                {
+                    // Unified cadence policy for all monitoring consumers.
+                    // Register the wake source BEFORE reading the cadence, so a mode change that lands
+                    // between the read and the sleep still cuts the sleep short instead of being missed.
+                    CancellationTokenSource waitCts;
+                    lock (_cadenceWakeLock)
+                    {
+                        waitCts = _cadenceWaitCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    }
+
+                    try
+                    {
+                        var delay = GetEffectiveCadenceInterval();
+                        UpdateCadenceTelemetry(delay);
+                        await Task.Delay(delay, waitCts.Token);
+                    }
+                    catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                    {
+                        // Woken by a cadence change: sample again right away at the new cadence.
+                    }
+                    finally
+                    {
+                        lock (_cadenceWakeLock)
+                        {
+                            _cadenceWaitCts = null;
+                        }
+                        waitCts.Dispose();
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+
+            _logging.Info("Optimized hardware monitoring loop stopped");
+        }
+
+        private MonitoringSample EnrichCpuTelemetry(MonitoringSample sample)
+        {
+            var staleMonitoring = _healthStatus == MonitoringHealthStatus.Stale ||
+                                  _healthStatus == MonitoringHealthStatus.Degraded;
+            var source = _bridge.MonitoringSource;
+
+            sample.CpuTemperatureTelemetry = MonitoringTelemetryAdapter.BuildCpuTemperatureTelemetry(
+                sample,
+                source,
+                staleMonitoring,
+                _lastProviderError);
+
+            sample.CpuPowerTelemetry = MonitoringTelemetryAdapter.BuildCpuPowerTelemetry(
+                sample,
+                source,
+                staleMonitoring,
+                _lastProviderError);
+
+            return sample;
+        }
+
+        /// <summary>
+        /// Determines if UI should be updated based on change threshold.
+        /// Reduces unnecessary UI updates and improves performance.
+        /// Uses a higher threshold in low-overhead mode to reduce CPU wake-ups.
+        /// </summary>
+        private bool ShouldUpdateUI(MonitoringSample newSample)
+        {
+            if (_lastSample == null)
+                return true;
+
+            // Use higher threshold in low overhead mode to reduce updates
+            var threshold = _lowOverheadMode ? _lowOverheadChangeThreshold : _changeThreshold;
+
+            // Check if any significant changes occurred
+            var cpuTempChange = Math.Abs(newSample.CpuTemperatureC - _lastSample.CpuTemperatureC);
+            var gpuTempChange = Math.Abs(newSample.GpuTemperatureC - _lastSample.GpuTemperatureC);
+            var cpuLoadChange = Math.Abs(newSample.CpuLoadPercent - _lastSample.CpuLoadPercent);
+            var gpuLoadChange = Math.Abs(newSample.GpuLoadPercent - _lastSample.GpuLoadPercent);
+
+            // Also update UI when power readings change significantly (fixes intermittent 0W display)
+            var cpuPowerChange = Math.Abs(newSample.CpuPowerWatts - _lastSample.CpuPowerWatts);
+            var gpuPowerChange = Math.Abs(newSample.GpuPowerWatts - _lastSample.GpuPowerWatts);
+
+            return cpuTempChange >= threshold ||
+                   gpuTempChange >= threshold ||
+                   cpuLoadChange >= threshold ||
+                   gpuLoadChange >= threshold ||
+                   cpuPowerChange >= _powerChangeThresholdWatts ||
+                   gpuPowerChange >= _powerChangeThresholdWatts;
+        }
+
+        // IHardwareMonitoringService implementation
+        public Task<HardwareMetrics> GetCurrentMetricsAsync()
+        {
+            lock (_dashboardLock)
+            {
+                if (_lastMetrics == null)
+                {
+                    _logging.Info("GetCurrentMetricsAsync: _lastMetrics is null, returning default");
+                    return Task.FromResult(new HardwareMetrics { Timestamp = DateTime.Now });
+                }
+                
+                _logging.Info($"GetCurrentMetricsAsync: Returning metrics - CPU: {_lastMetrics.CpuTemperature}°C, GPU: {_lastMetrics.GpuTemperature}°C, Power: {_lastMetrics.PowerConsumption}W");
+                return Task.FromResult(_lastMetrics);
+            }
+        }
+
+        public Task<IEnumerable<SystemAlert>> GetActiveAlertsAsync()
+        {
+            lock (_dashboardLock)
+            {
+                return Task.FromResult<IEnumerable<SystemAlert>>(_activeAlerts.ToList());
+            }
+        }
+
+        public Task<IEnumerable<HistoricalDataPoint>> GetHistoricalDataAsync(ChartType chartType, TimeSpan timeRange)
+        {
+            var cutoffTime = DateTime.Now - timeRange;
+
+            lock (_dashboardLock)
+            {
+                var matchingCount = 0;
+                for (var i = 0; i < _metricsHistory.Count; i++)
+                {
+                    if (_metricsHistory[i].Timestamp >= cutoffTime)
+                    {
+                        matchingCount++;
+                    }
+                }
+
+                if (matchingCount == 0)
+                {
+                    return Task.FromResult<IEnumerable<HistoricalDataPoint>>(Array.Empty<HistoricalDataPoint>());
+                }
+
+                var step = Math.Max(1, (int)Math.Ceiling(matchingCount / (double)MaxHistoricalDataPoints));
+                var label = GetLabelForChartType(chartType);
+                var realData = new List<HistoricalDataPoint>(Math.Min(matchingCount, MaxHistoricalDataPoints));
+                var seen = 0;
+
+                for (var i = 0; i < _metricsHistory.Count; i++)
+                {
+                    var metric = _metricsHistory[i];
+                    if (metric.Timestamp < cutoffTime)
+                    {
+                        continue;
+                    }
+
+                    if (seen % step == 0 || seen == matchingCount - 1)
+                    {
+                        realData.Add(new HistoricalDataPoint
+                        {
+                            Timestamp = metric.Timestamp,
+                            Value = GetValueForChartType(metric, chartType),
+                            Label = label
+                        });
+                    }
+
+                    seen++;
+                }
+
+                // v2.7.0: Return empty list instead of synthetic data to show proper empty state
+                // Synthetic data can mask telemetry failures and confuse users
+                return Task.FromResult<IEnumerable<HistoricalDataPoint>>(realData);
+            }
+        }
+
+        /// <summary>
+        /// Check if there is historical data available for charts.
+        /// Use this to decide whether to show empty state UI.
+        /// </summary>
+        public bool HasHistoricalData()
+        {
+            lock (_dashboardLock)
+            {
+                return _metricsHistory.Count > 0;
+            }
+        }
+        
+        /// <summary>
+        /// Check if there is historical data for a specific time range.
+        /// </summary>
+        public bool HasHistoricalData(TimeSpan timeRange)
+        {
+            lock (_dashboardLock)
+            {
+                var cutoffTime = DateTime.Now - timeRange;
+                for (var i = _metricsHistory.Count - 1; i >= 0; i--)
+                {
+                    if (_metricsHistory[i].Timestamp >= cutoffTime)
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        }
+
+        // REMOVED: GenerateSampleData method - replaced with empty state pattern
+        // Synthetic data masks telemetry failures and confuses users
+
+        public Task<IEnumerable<HardwareSensorReading>> GetAllSensorDataAsync()
+        {
+            var sample = _lastSample;
+            if (sample == null)
+            {
+                return Task.FromResult<IEnumerable<HardwareSensorReading>>(Array.Empty<HardwareSensorReading>());
+            }
+
+            var readings = new List<HardwareSensorReading>
+            {
+                new()
+                {
+                    Name = "CPU Temperature",
+                    Type = "Temperature",
+                    Value = sample.CpuTemperatureC,
+                    Unit = "°C",
+                    MinValue = sample.CpuTemperatureC,
+                    MaxValue = sample.CpuTemperatureC
+                },
+                new()
+                {
+                    Name = "GPU Temperature",
+                    Type = "Temperature",
+                    Value = sample.GpuTemperatureC,
+                    Unit = "°C",
+                    MinValue = sample.GpuTemperatureC,
+                    MaxValue = sample.GpuTemperatureC
+                },
+                new()
+                {
+                    Name = "CPU Load",
+                    Type = "Load",
+                    Value = sample.CpuLoadPercent,
+                    Unit = "%",
+                    MinValue = 0,
+                    MaxValue = 100
+                },
+                new()
+                {
+                    Name = "GPU Load",
+                    Type = "Load",
+                    Value = sample.GpuLoadPercent,
+                    Unit = "%",
+                    MinValue = 0,
+                    MaxValue = 100
+                },
+                new()
+                {
+                    Name = "System Fan Speed",
+                    Type = "Speed",
+                    Value = sample.FanRpm,
+                    Unit = "RPM",
+                    MinValue = 0,
+                    MaxValue = sample.FanRpm
+                },
+                new()
+                {
+                    Name = "Battery",
+                    Type = "Charge",
+                    Value = sample.BatteryChargePercent,
+                    Unit = "%",
+                    MinValue = 0,
+                    MaxValue = 100
+                }
+            };
+
+            return Task.FromResult<IEnumerable<HardwareSensorReading>>(readings);
+        }
+
+        public Task<string> ExportMonitoringDataAsync()
+        {
+            var exportData = new
+            {
+                ExportTime = DateTime.Now,
+                CurrentMetrics = _lastMetrics,
+                HistoricalData = _metricsHistory.TakeLast(100), // Last 100 data points
+                ActiveAlerts = _activeAlerts
+            };
+
+            return Task.FromResult(System.Text.Json.JsonSerializer.Serialize(exportData, new System.Text.Json.JsonSerializerOptions
+            {
+                WriteIndented = true
+            }));
+        }
+
+        public Task StartMonitoringAsync()
+        {
+            if (_cts != null) return Task.CompletedTask;
+            Start();
+            return Task.CompletedTask;
+        }
+
+        public Task StopMonitoringAsync()
+        {
+            Stop();
+            return Task.CompletedTask;
+        }
+
+        public bool IsMonitoring => _cts != null;
+
+        private void UpdateDashboardMetrics(MonitoringSample sample)
+        {
+            var now = DateTime.Now;
+            var batteryInfo = BatteryInfoProvider.Get(_logging);
+            var metrics = new HardwareMetrics
+            {
+                Timestamp = now,
+                CpuTemperature = sample.CpuTemperatureC,
+                GpuTemperature = sample.GpuTemperatureC,
+                PowerConsumption = CalculateMeasuredPowerConsumption(sample),
+                BatteryChargePercentage = sample.BatteryChargePercent > 0
+                    ? Math.Clamp(sample.BatteryChargePercent, 0, 100)
+                    : -1,
+                // Battery health is not the same as current charge: it is full-charge capacity
+                // against design capacity. Both come from root\wmi via BatteryInfoProvider,
+                // which caches them - this runs on every monitoring tick. -1 means the pack
+                // did not report the capacities, and must stay distinguishable from a real 0.
+                BatteryHealthPercentage = batteryInfo.HealthPercent ?? -1,
+                BatteryCycles = batteryInfo.CycleCount ?? -1,
+                PowerEfficiency = CalculatePowerEfficiency(sample),
+                // Use average RPM from the two fan sensors as an efficiency proxy (0-100 scale)
+                FanEfficiency = sample.Fan1Rpm > 0 || sample.Fan2Rpm > 0
+                    ? Math.Min(100, ((sample.Fan1Rpm + sample.Fan2Rpm) / 2.0) / 50.0)
+                    : 0,
+                // The same mean, unscaled. The fan chart's axis is labelled "RPM", so it needs the
+                // RPM figure rather than the 0-100 proxy above; plotting the proxy there rendered
+                // ~2800 RPM as "28 RPM".
+                FanRpmAverage = sample.Fan1Rpm > 0 || sample.Fan2Rpm > 0
+                    ? (sample.Fan1Rpm + sample.Fan2Rpm) / 2.0
+                    : 0
+            };
+
+            if (_logging.Level >= LogLevel.Debug)
+            {
+                _logging.Debug($"UpdateDashboardMetrics: Created metrics - CPU: {metrics.CpuTemperature:F1}C, GPU: {metrics.GpuTemperature:F1}C, Power: {metrics.PowerConsumption:F1}W");
+            }
+
+            lock (_dashboardLock)
+            {
+                // Calculate trend without per-sample LINQ/list allocations in the monitor loop.
+                if (_metricsHistory.Count >= 2)
+                {
+                    var sumPower = 0.0;
+                    var count = 0;
+                    for (var i = _metricsHistory.Count - 1; i >= 0 && count < PowerTrendSampleCount; i--)
+                    {
+                        sumPower += _metricsHistory[i].PowerConsumption;
+                        count++;
+                    }
+
+                    if (count > 0)
+                    {
+                        metrics.PowerConsumptionTrend = metrics.PowerConsumption - (sumPower / count);
+                    }
+                }
+
+                _lastMetrics = metrics;
+                _metricsHistory.Add(metrics);
+
+                PruneDashboardMetricHistory(metrics.Timestamp);
+
+                // Check for alerts
+                CheckForAlerts(metrics);
+            }
+
+            if (_logging.Level >= LogLevel.Debug)
+            {
+                _logging.Debug("UpdateDashboardMetrics: _lastMetrics updated successfully");
+            }
+        }
+
+        private void PruneDashboardMetricHistory(DateTime now)
+        {
+            var nowUtc = now.ToUniversalTime();
+            if (nowUtc >= _nextDashboardMetricAgePruneUtc)
+            {
+                var cutoffTime = now - DashboardMetricsRetention;
+                _metricsHistory.RemoveAll(m => m.Timestamp < cutoffTime);
+                _nextDashboardMetricAgePruneUtc = nowUtc + DashboardMetricAgePruneInterval;
+            }
+
+            var excessCount = _metricsHistory.Count - MaxDashboardMetricsHistory;
+            if (excessCount > 0)
+            {
+                _metricsHistory.RemoveRange(0, excessCount);
+            }
+        }
+
+        private static double CalculateMeasuredPowerConsumption(MonitoringSample sample)
+        {
+            // Dashboard total power should only reflect measured sensors.
+            // When sensors are unavailable, return 0 and let the UI show unavailable states.
+            var cpuPower = sample.CpuPowerWatts > 0 ? sample.CpuPowerWatts : 0;
+            var gpuPower = sample.GpuTemperatureState == TelemetryDataState.Inactive
+                ? 0
+                : (sample.GpuPowerWatts > 0 ? sample.GpuPowerWatts : 0);
+
+            return cpuPower + gpuPower;
+        }
+
+        private double CalculatePowerEfficiency(MonitoringSample sample)
+        {
+            // Simplified efficiency calculation
+            double loadFactor = (sample.CpuLoadPercent + sample.GpuLoadPercent) / 200.0; // Average load 0-1
+            double tempEfficiency = Math.Max(0.5, 1 - ((sample.CpuTemperatureC + sample.GpuTemperatureC) / 2 - 50) / 100.0);
+
+            return Math.Min(100, (loadFactor * tempEfficiency * 100));
+        }
+
+        private void CheckForAlerts(HardwareMetrics metrics)
+        {
+            _activeAlerts.Clear();
+
+            // Temperature alerts
+            if (metrics.CpuTemperature > 90)
+            {
+                _activeAlerts.Add(new SystemAlert
+                {
+                    Icon = "🔥",
+                    Title = "High CPU Temperature",
+                    Message = $"CPU temperature is {metrics.CpuTemperature:F1}°C. Consider improving cooling.",
+                    Timestamp = DateTime.Now.ToString("HH:mm:ss"),
+                    Severity = AlertSeverity.Critical
+                });
+            }
+            else if (metrics.CpuTemperature > 80)
+            {
+                _activeAlerts.Add(new SystemAlert
+                {
+                    Icon = "⚠️",
+                    Title = "Elevated CPU Temperature",
+                    Message = $"CPU temperature is {metrics.CpuTemperature:F1}°C.",
+                    Timestamp = DateTime.Now.ToString("HH:mm:ss"),
+                    Severity = AlertSeverity.Warning
+                });
+            }
+
+            if (metrics.GpuTemperature > 85)
+            {
+                _activeAlerts.Add(new SystemAlert
+                {
+                    Icon = "🔥",
+                    Title = "High GPU Temperature",
+                    Message = $"GPU temperature is {metrics.GpuTemperature:F1}°C. Consider improving cooling.",
+                    Timestamp = DateTime.Now.ToString("HH:mm:ss"),
+                    Severity = AlertSeverity.Critical
+                });
+            }
+            else if (metrics.GpuTemperature > 75)
+            {
+                _activeAlerts.Add(new SystemAlert
+                {
+                    Icon = "⚠️",
+                    Title = "Elevated GPU Temperature",
+                    Message = $"GPU temperature is {metrics.GpuTemperature:F1}°C.",
+                    Timestamp = DateTime.Now.ToString("HH:mm:ss"),
+                    Severity = AlertSeverity.Warning
+                });
+            }
+
+            // Power consumption alerts
+            if (metrics.PowerConsumption > 120)
+            {
+                _activeAlerts.Add(new SystemAlert
+                {
+                    Icon = "⚡",
+                    Title = "High Power Consumption",
+                    Message = $"System is drawing {metrics.PowerConsumption:F1}W. Consider power management settings.",
+                    Timestamp = DateTime.Now.ToString("HH:mm:ss"),
+                    Severity = AlertSeverity.Warning
+                });
+            }
+
+            // Battery health alerts
+            if (metrics.BatteryHealthPercentage > 0 && metrics.BatteryHealthPercentage < 70)
+            {
+                _activeAlerts.Add(new SystemAlert
+                {
+                    Icon = "🔋",
+                    Title = "Battery Health Warning",
+                    Message = $"Battery health is at {metrics.BatteryHealthPercentage:F1}%. Consider battery calibration.",
+                    Timestamp = DateTime.Now.ToString("HH:mm:ss"),
+                    Severity = AlertSeverity.Warning
+                });
+            }
+        }
+
+        private double GetValueForChartType(HardwareMetrics metrics, ChartType chartType)
+        {
+            return chartType switch
+            {
+                ChartType.PowerConsumption => metrics.PowerConsumption,
+                ChartType.BatteryHealth => metrics.BatteryChargePercentage >= 0 ? metrics.BatteryChargePercentage : 0,
+                ChartType.Temperature => (metrics.CpuTemperature + metrics.GpuTemperature) / 2,
+                // Must match GetLabelForChartType, which labels this series "RPM". FanEfficiency is
+                // a 0-100 proxy, so charting it under an RPM axis understated the reading by ~50x.
+                ChartType.FanSpeeds => metrics.FanRpmAverage,
+                _ => 0
+            };
+        }
+
+        private string GetLabelForChartType(ChartType chartType)
+        {
+            return chartType switch
+            {
+                ChartType.PowerConsumption => "Watts",
+                ChartType.BatteryHealth => "Charge %",
+                ChartType.Temperature => "°C",
+                ChartType.FanSpeeds => "RPM",
+                _ => ""
+            };
+        }
+
+        public void Dispose()
+        {
+            Stop();
+            if (_bridge is IDisposable disposableBridge)
+            {
+                disposableBridge.Dispose();
+            }
+        }
+        
+        /// <summary>
+        /// Check for frozen temperatures and attempt recovery via WMI BIOS fallback.
+        /// Temperatures are considered "frozen" when they don't change by even 0.1°C for 30+ readings.
+        /// This can happen when LibreHardwareMonitor returns stale cached values.
+        /// </summary>
+        private static double FreezeWindowLoadSwing(double min, double max)
+            => min > max ? 0 : max - min;
+
+        /// <summary>
+        /// Whether a run of identical temperature readings is genuinely suspicious rather than
+        /// ordinary thermal equilibrium on a quantized sensor. Mirrors
+        /// <c>WmiBiosMonitor.IsIdenticalTempSuspicious</c>; see the constants above for rationale.
+        /// </summary>
+        private static bool IsIdenticalTempSuspicious(int consecutiveIdenticalReads, double loadMin, double loadMax)
+        {
+            if (consecutiveIdenticalReads >= AbsoluteFreezeReadCeiling)
+            {
+                return true;
+            }
+
+            return FreezeWindowLoadSwing(loadMin, loadMax) >= FreezeLoadVarianceThresholdPercent;
+        }
+
+        private MonitoringSample CheckAndRecoverFrozenTemps(MonitoringSample sample)
+        {
+            bool cpuFrozen = false;
+            bool gpuFrozen = false;
+            var effectiveCpuFreezeThreshold = (sample.CpuLoadPercent < 10 && sample.CpuPowerWatts <= 5)
+                ? IdleCpuFreezeThreshold
+                : FreezeThresholdReadings;
+            
+            // Check CPU temperature for freeze
+            if (Math.Abs(sample.CpuTemperatureC - _lastCpuTempForFreezeCheck) < TempFreezeEpsilon)
+            {
+                _consecutiveSameCpuTemp++;
+                if (sample.CpuLoadPercent < _cpuLoadMinDuringFreezeWindow) _cpuLoadMinDuringFreezeWindow = sample.CpuLoadPercent;
+                if (sample.CpuLoadPercent > _cpuLoadMaxDuringFreezeWindow) _cpuLoadMaxDuringFreezeWindow = sample.CpuLoadPercent;
+
+                if (_consecutiveSameCpuTemp >= effectiveCpuFreezeThreshold &&
+                    IsIdenticalTempSuspicious(_consecutiveSameCpuTemp, _cpuLoadMinDuringFreezeWindow, _cpuLoadMaxDuringFreezeWindow))
+                {
+                    cpuFrozen = true;
+                    if (_consecutiveSameCpuTemp == effectiveCpuFreezeThreshold)
+                    {
+                        _logging.Warn($"🥶 CPU temperature appears frozen at {sample.CpuTemperatureC:F1}°C for {_consecutiveSameCpuTemp} readings (load={sample.CpuLoadPercent:F0}%, power={sample.CpuPowerWatts:F1}W, load swing during hold={FreezeWindowLoadSwing(_cpuLoadMinDuringFreezeWindow, _cpuLoadMaxDuringFreezeWindow):F0}%)");
+                    }
+                }
+            }
+            else
+            {
+                if (_consecutiveSameCpuTemp >= effectiveCpuFreezeThreshold)
+                {
+                    _logging.Info($"✅ CPU temperature unfroze: {_lastCpuTempForFreezeCheck:F1}°C → {sample.CpuTemperatureC:F1}°C");
+                    _usingWmiFallback = false;
+                    ResetFreezeRestartGuards();
+                }
+                _consecutiveSameCpuTemp = 0;
+                _cpuLoadMinDuringFreezeWindow = double.MaxValue;
+                _cpuLoadMaxDuringFreezeWindow = double.MinValue;
+                _lastCpuTempForFreezeCheck = sample.CpuTemperatureC;
+            }
+            
+            // Check GPU temperature for freeze
+            // v2.8.6: Use higher threshold when GPU is idle (load <10%) — idle GPUs legitimately maintain stable temps
+            var effectiveGpuFreezeThreshold = sample.GpuLoadPercent < 10 ? IdleGpuFreezeThreshold : FreezeThresholdReadings;
+            
+            if (Math.Abs(sample.GpuTemperatureC - _lastGpuTempForFreezeCheck) < TempFreezeEpsilon)
+            {
+                _consecutiveSameGpuTemp++;
+                if (sample.GpuLoadPercent < _gpuLoadMinDuringFreezeWindow) _gpuLoadMinDuringFreezeWindow = sample.GpuLoadPercent;
+                if (sample.GpuLoadPercent > _gpuLoadMaxDuringFreezeWindow) _gpuLoadMaxDuringFreezeWindow = sample.GpuLoadPercent;
+
+                if (_consecutiveSameGpuTemp >= effectiveGpuFreezeThreshold &&
+                    IsIdenticalTempSuspicious(_consecutiveSameGpuTemp, _gpuLoadMinDuringFreezeWindow, _gpuLoadMaxDuringFreezeWindow))
+                {
+                    gpuFrozen = true;
+                    if (!_gpuFreezeWarningLogged)
+                    {
+                        _logging.Warn($"🥶 GPU temperature appears frozen at {sample.GpuTemperatureC:F1}°C for {_consecutiveSameGpuTemp} readings (load={sample.GpuLoadPercent}%, load swing during hold={FreezeWindowLoadSwing(_gpuLoadMinDuringFreezeWindow, _gpuLoadMaxDuringFreezeWindow):F0}%)");
+                        _gpuFreezeWarningLogged = true;
+                    }
+                }
+            }
+            else
+            {
+                if (_gpuFreezeWarningLogged)
+                {
+                    _logging.Info($"✅ GPU temperature unfroze: {_lastGpuTempForFreezeCheck:F1}°C → {sample.GpuTemperatureC:F1}°C");
+                    ResetFreezeRestartGuards();
+                }
+                _consecutiveSameGpuTemp = 0;
+                _gpuLoadMinDuringFreezeWindow = double.MaxValue;
+                _gpuLoadMaxDuringFreezeWindow = double.MinValue;
+                _lastGpuTempForFreezeCheck = sample.GpuTemperatureC;
+                _gpuFreezeWarningLogged = false;
+            }
+            
+            // Try WMI BIOS fallback for frozen temps
+            if ((cpuFrozen || gpuFrozen) && _wmiBiosService != null)
+            {
+                try
+                {
+                    var wmiTemps = _wmiBiosService.GetBothTemperatures();
+                    if (wmiTemps.HasValue)
+                    {
+                        var (wmiCpu, wmiGpu) = wmiTemps.Value;
+                        
+                        // Only use WMI temps if they're different and reasonable
+                        if (cpuFrozen && wmiCpu > 0 && wmiCpu < 150 && 
+                            Math.Abs(wmiCpu - sample.CpuTemperatureC) > 1)
+                        {
+                            if (!_usingWmiFallback)
+                            {
+                                _logging.Info($"🔄 Using WMI BIOS for CPU temp: {sample.CpuTemperatureC:F1}°C → {wmiCpu:F1}°C");
+                                _usingWmiFallback = true;
+                            }
+                            sample.CpuTemperatureC = wmiCpu;
+                            _consecutiveSameCpuTemp = 0;
+                            _lastCpuTempForFreezeCheck = wmiCpu;
+                        }
+                        else if (cpuFrozen && wmiCpu > 0 && wmiCpu < 150)
+                        {
+                            _logging.Info($"✅ WMI BIOS confirms CPU temp is valid: sensor={sample.CpuTemperatureC:F1}°C, WMI={wmiCpu:F1}°C — not frozen, stable reading");
+                            _consecutiveSameCpuTemp = 0;
+                            _lastCpuTempForFreezeCheck = sample.CpuTemperatureC;
+                        }
+                        
+                        if (gpuFrozen && wmiGpu > 0 && wmiGpu < 150)
+                        {
+                            if (Math.Abs(wmiGpu - sample.GpuTemperatureC) > 1)
+                            {
+                                // WMI returns a DIFFERENT value — use it as substitute
+                                if (!_usingWmiFallback)
+                                {
+                                    _logging.Info($"🔄 Using WMI BIOS for GPU temp: {sample.GpuTemperatureC:F1}°C → {wmiGpu:F1}°C");
+                                    _usingWmiFallback = true;
+                                }
+                                sample.GpuTemperatureC = wmiGpu;
+                                _consecutiveSameGpuTemp = 0;
+                                _lastGpuTempForFreezeCheck = wmiGpu;
+                                _gpuFreezeWarningLogged = false;
+                            }
+                            else
+                            {
+                                // v2.8.6: WMI returns a SIMILAR value (within 1°C) — this CONFIRMS
+                                // the temperature is real, not frozen. The sensor is working correctly;
+                                // the GPU is genuinely at a stable temperature (e.g. idle).
+                                _logging.Info($"✅ WMI BIOS confirms GPU temp is valid: sensor={sample.GpuTemperatureC:F1}°C, WMI={wmiGpu:F1}°C — not frozen, GPU is idle/stable");
+                                _consecutiveSameGpuTemp = 0;
+                                _lastGpuTempForFreezeCheck = sample.GpuTemperatureC;
+                                _gpuFreezeWarningLogged = false;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logging.Debug($"WMI temp fallback failed: {ex.Message}");
+                }
+            }
+            
+            // Try to restart the bridge if both temps are frozen for too long
+            if (cpuFrozen && gpuFrozen && 
+                _consecutiveSameCpuTemp >= effectiveCpuFreezeThreshold * 2 && 
+                !_restartInProgress)
+            {
+                if (!TryAcquireFreezeRestartPermit(out var skipReason))
+                {
+                    _logging.Info($"[MonitorLoop] Freeze-recovery restart suppressed: {skipReason}");
+                    return sample;
+                }
+
+                _logging.Warn("🔄 Both CPU and GPU temps frozen for extended period - attempting bridge restart...");
+                _restartInProgress = true;
+                
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var restarted = await _bridge.TryRestartAsync();
+                        if (restarted)
+                        {
+                            _logging.Info("✅ Bridge restart successful after temp freeze detection");
+                            _consecutiveSameCpuTemp = 0;
+                            _consecutiveSameGpuTemp = 0;
+                        }
+                        else
+                        {
+                            _logging.Warn("[MonitorLoop] Bridge restart reported no recovery during temp-freeze handling");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logging.Error($"Bridge restart failed: {ex.Message}");
+                    }
+                    finally
+                    {
+                        _restartInProgress = false;
+                    }
+                });
+            }
+            
+            return sample;
+        }
+
+        /// <summary>
+        /// Diagnostic-only warning for GitHub #143. Does not read fan-mode/preset state and does
+        /// not touch fan control in any way - it only compares temperature against fan RPM already
+        /// present on the sample and logs once per sustained anomaly window. See the field
+        /// comments above <see cref="UnexpectedLowRpmHighTempThresholdC"/> for the reasoning.
+        /// </summary>
+        private void CheckForUnexpectedLowRpmAtHighTemp(MonitoringSample sample)
+        {
+            CheckOneFanForUnexpectedLowRpmAtHighTemp(
+                sample.CpuTemperatureC, sample.Fan1Rpm, sample.Fan1RpmState, "CPU",
+                ref _consecutiveCpuHighTempLowRpm, ref _cpuHighTempLowRpmWarningLogged);
+
+            CheckOneFanForUnexpectedLowRpmAtHighTemp(
+                sample.GpuTemperatureC, sample.Fan2Rpm, sample.Fan2RpmState, "GPU",
+                ref _consecutiveGpuHighTempLowRpm, ref _gpuHighTempLowRpmWarningLogged);
+        }
+
+        private void CheckOneFanForUnexpectedLowRpmAtHighTemp(
+            double temperatureC, int fanRpm, TelemetryDataState rpmState, string label,
+            ref int consecutiveCount, ref bool warningLogged)
+        {
+            // Only act on a Valid reading (a real, plausible positive RPM) - Zero/Stale/Unavailable/
+            // Invalid readings are not evidence either way and would just produce noise here.
+            var anomalous = temperatureC >= UnexpectedLowRpmHighTempThresholdC &&
+                rpmState == TelemetryDataState.Valid &&
+                fanRpm < UnexpectedLowRpmFloor;
+
+            if (!anomalous)
+            {
+                consecutiveCount = 0;
+                warningLogged = false;
+                return;
+            }
+
+            consecutiveCount++;
+            if (consecutiveCount >= UnexpectedLowRpmSustainedReadings && !warningLogged)
+            {
+                _logging.Warn(
+                    $"⚠️ {label} fan reads {fanRpm} RPM while {label} temperature is {temperatureC:F1}°C " +
+                    $"(>= {UnexpectedLowRpmHighTempThresholdC:F0}°C) for {consecutiveCount} consecutive readings - " +
+                    "unusually low for this temperature. If this is sustained, verify the requested fan mode " +
+                    "actually matches hardware behavior rather than trusting command-success alone (GitHub #143).");
+                warningLogged = true;
+            }
+        }
+
+        private void ResetFreezeDetectionState()
+        {
+            _consecutiveSameCpuTemp = 0;
+            _consecutiveSameGpuTemp = 0;
+            _lastCpuTempForFreezeCheck = 0;
+            _lastGpuTempForFreezeCheck = 0;
+            _gpuFreezeWarningLogged = false;
+            _usingWmiFallback = false;
+            ResetFreezeRestartGuards();
+        }
+
+        private bool TryAcquireFreezeRestartPermit(out string reason)
+        {
+            var nowUtc = DateTime.UtcNow;
+            lock (_freezeRestartGate)
+            {
+                var windowStart = nowUtc.AddMinutes(-FreezeRestartBudgetWindowMinutes);
+                while (_freezeRestartAttemptsUtc.Count > 0 && _freezeRestartAttemptsUtc.Peek() < windowStart)
+                {
+                    _freezeRestartAttemptsUtc.Dequeue();
+                }
+
+                if (nowUtc < _freezeRestartSuppressedUntilUtc)
+                {
+                    var remaining = _freezeRestartSuppressedUntilUtc - nowUtc;
+                    reason = $"cooldown active ({remaining.TotalSeconds:F0}s remaining)";
+                    return false;
+                }
+
+                if (_freezeRestartAttemptsUtc.Count >= FreezeRestartMaxAttemptsPerWindow)
+                {
+                    _freezeRestartSuppressedUntilUtc = nowUtc.AddMinutes(FreezeRestartBudgetWindowMinutes);
+                    reason = $"restart budget exceeded ({FreezeRestartMaxAttemptsPerWindow}/{FreezeRestartBudgetWindowMinutes}m)";
+                    return false;
+                }
+
+                _freezeRestartAttemptsUtc.Enqueue(nowUtc);
+                _freezeRestartSuppressedUntilUtc = nowUtc.AddSeconds(_freezeRestartCooldownSeconds);
+                _freezeRestartCooldownSeconds = Math.Min(_freezeRestartCooldownSeconds * 2, FreezeRestartMaxCooldownSeconds);
+                reason = string.Empty;
+                return true;
+            }
+        }
+
+        private void ResetFreezeRestartGuards()
+        {
+            lock (_freezeRestartGate)
+            {
+                _freezeRestartAttemptsUtc.Clear();
+                _freezeRestartSuppressedUntilUtc = DateTime.MinValue;
+                _freezeRestartCooldownSeconds = FreezeRestartBaseCooldownSeconds;
+            }
+        }
+
+        private async Task RecoverAfterResumeAsync()
+        {
+            if (_restartInProgress)
+            {
+                return;
+            }
+
+            _restartInProgress = true;
+            try
+            {
+                // Give drivers a generous window to settle after resume.
+                // 1000ms was too short — sensor stacks (LibreHardwareMonitor, NVAPI) can
+                // take 5–15 seconds to reinitialise after a long sleep.
+                await Task.Delay(5000);
+
+                var restarted = await _bridge.TryRestartAsync();
+                if (restarted)
+                {
+                    _logging.Info("[MonitorLoop] Bridge refresh successful after system resume");
+                    _resumeDiagnostics.RecordStep("monitoring", "Bridge refresh succeeded after resume");
+                    UpdateHealthStatus(MonitoringHealthStatus.Healthy);
+                }
+                else
+                {
+                    _logging.Warn("[MonitorLoop] Bridge refresh after resume did not report success; monitoring will continue and self-recover");
+                    _resumeDiagnostics.RecordStep("monitoring", "Bridge refresh after resume reported incomplete recovery");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"[MonitorLoop] Bridge refresh after resume failed: {ex.Message}");
+                _resumeDiagnostics.RecordStep("monitoring", $"Bridge refresh after resume failed: {ex.Message}");
+            }
+            finally
+            {
+                _restartInProgress = false;
+            }
+        }
+        
+        /// <summary>
+        /// Update the monitoring health status and fire event if changed.
+        /// Also checks for stale data based on last sample time.
+        /// </summary>
+        private void UpdateHealthStatus(MonitoringHealthStatus newStatus)
+        {
+            // Check for stale data (takes precedence over other statuses)
+            if (_lastSuccessfulSampleTime != DateTime.MinValue && 
+                (DateTime.Now - _lastSuccessfulSampleTime).TotalSeconds > StaleSampleThresholdSeconds)
+            {
+                newStatus = MonitoringHealthStatus.Stale;
+            }
+            
+            if (_healthStatus != newStatus)
+            {
+                var oldStatus = _healthStatus;
+                _healthStatus = newStatus;
+                _logging.Info($"Monitoring health status changed: {oldStatus} → {newStatus}");
+                
+                try
+                {
+                    HealthStatusChanged?.Invoke(this, newStatus);
+                }
+                catch (Exception ex)
+                {
+                    _logging.Error($"Error invoking HealthStatusChanged: {ex.Message}", ex);
+                }
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Monitoring health status for the hardware monitoring service.
+    /// </summary>
+    public enum MonitoringHealthStatus
+    {
+        /// <summary>Status not yet determined.</summary>
+        Unknown,
+        
+        /// <summary>Monitoring is working normally with fresh data.</summary>
+        Healthy,
+        
+        /// <summary>Experiencing timeouts or partial failures but still functional.</summary>
+        Degraded,
+        
+        /// <summary>Data is stale - no successful reads for extended period.</summary>
+        Stale
+    }
+
+    /// <summary>
+    /// Point-in-time record of a monitoring cadence transition.
+    /// </summary>
+    public sealed class MonitoringCadenceTransition
+    {
+        public DateTime TimestampUtc { get; set; }
+        public int CadenceMs { get; set; }
+        public string Reason { get; set; } = string.Empty;
+        public bool UiWindowActive { get; set; }
+        public bool TrayOnlyMode { get; set; }
+        public bool OverlayRealtimeMode { get; set; }
+        public bool LowOverheadMode { get; set; }
+    }
+
+    public class HardwareSensorReading
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Type { get; set; } = string.Empty;
+        public double Value { get; set; }
+        public double MinValue { get; set; }
+        public double MaxValue { get; set; }
+        public string Unit { get; set; } = string.Empty;
+    }
+}

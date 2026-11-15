@@ -1,0 +1,231 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Read VERSION
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION.txt | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "VERSION.txt must contain a version"
+          }
+          "value=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build installer artifacts
+        shell: pwsh
+        run: ./build-installer.ps1 -Configuration Release -Runtime win-x64 -SingleFile
+
+      - name: Verify Windows artifacts
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.value }}"
+          $expected = @(
+            "artifacts/OmenCore-$version-win-x64.zip",
+            "artifacts/OmenCore-$version-win-x64.zip.sha256",
+            "artifacts/OmenCoreSetup-$version.exe",
+            "artifacts/OmenCoreSetup-$version.exe.sha256"
+          )
+          foreach ($path in $expected) {
+            if (-not (Test-Path $path)) {
+              throw "Expected artifact was not created: $path"
+            }
+          }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-artifacts
+          path: |
+            artifacts/OmenCore-${{ steps.version.outputs.value }}-win-x64.zip
+            artifacts/OmenCore-${{ steps.version.outputs.value }}-win-x64.zip.sha256
+            artifacts/OmenCoreSetup-${{ steps.version.outputs.value }}.exe
+            artifacts/OmenCoreSetup-${{ steps.version.outputs.value }}.exe.sha256
+
+  build-linux:
+    runs-on: ubuntu-24.04 # pinned: ubuntu-latest moves to a newer image on 2026-10-19; move on purpose after a CI check
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Read VERSION
+        id: version
+        shell: bash
+        run: |
+          version=$(head -1 VERSION.txt | tr -d '\r\n ')
+          if [ -z "$version" ]; then
+            echo "VERSION.txt must contain a version" >&2
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build Linux artifacts
+        shell: pwsh
+        run: ./build-linux-package.ps1 -Configuration Release -Runtime linux-x64
+
+      - name: Verify Linux artifact
+        shell: bash
+        run: |
+          artifact="artifacts/OmenCore-${{ steps.version.outputs.value }}-linux-x64.zip"
+          if [ ! -f "$artifact" ]; then
+            echo "Expected artifact was not created: $artifact" >&2
+            exit 1
+          fi
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-artifacts
+          path: |
+            artifacts/OmenCore-${{ steps.version.outputs.value }}-linux-x64.zip
+            artifacts/OmenCore-${{ steps.version.outputs.value }}-linux-x64.zip.sha256
+            artifacts/version.json
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-24.04 # pinned: ubuntu-latest moves to a newer image on 2026-10-19; move on purpose after a CI check
+    permissions:
+      contents: write
+      id-token: write      # build provenance (WP-30): signs the attestation with this workflow's identity
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read VERSION
+        id: version
+        shell: bash
+        run: |
+          version=$(head -1 VERSION.txt | tr -d '\r\n ')
+          if [ -z "$version" ]; then
+            echo "VERSION.txt must contain a version" >&2
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-artifacts
+          path: artifacts
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: linux-artifacts
+          path: artifacts
+
+      - name: Read published hashes
+        # Reads the .sha256 sidecars generated alongside each artifact by build-installer.ps1 /
+        # build-linux-package.ps1 in THIS run, so the hashes below are guaranteed to match the
+        # exact bytes attached to this release - not a separate local build (see #194: release
+        # notes had previously been hand-copied from a local run that produced different bytes
+        # than what CI actually published).
+        id: hashes
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          win_zip_hash=$(cut -d' ' -f1 "artifacts/OmenCore-$version-win-x64.zip.sha256")
+          win_setup_hash=$(cut -d' ' -f1 "artifacts/OmenCoreSetup-$version.exe.sha256")
+          linux_zip_hash=$(cut -d' ' -f1 "artifacts/OmenCore-$version-linux-x64.zip.sha256")
+          echo "win_zip=$win_zip_hash" >> "$GITHUB_OUTPUT"
+          echo "win_setup=$win_setup_hash" >> "$GITHUB_OUTPUT"
+          echo "linux_zip=$linux_zip_hash" >> "$GITHUB_OUTPUT"
+
+      - name: Write SHA256SUMS
+        # One checksum file for every download, in the format `sha256sum -c` reads, built from the per-file sidecars
+        # this run produced (WP-30). The updater reads the per-file sidecar; people and scripts can use this.
+        shell: bash
+        run: |
+          # The sidecars are written without a trailing newline, so add one per file rather than `cat`-ing them together.
+          for f in artifacts/*.sha256; do tr -d '\r' < "$f"; echo; done | sed '/^$/d' > artifacts/SHA256SUMS
+          cat artifacts/SHA256SUMS
+
+      - name: Attest build provenance
+        # GitHub's signed statement that these exact files came from this workflow run on this commit.
+        # Check one with: gh attestation verify <file> --repo theantipopau/omencore
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            artifacts/OmenCore-${{ steps.version.outputs.value }}-win-x64.zip
+            artifacts/OmenCoreSetup-${{ steps.version.outputs.value }}.exe
+            artifacts/OmenCore-${{ steps.version.outputs.value }}-linux-x64.zip
+
+      - name: Write release notes
+        # The template, then this version's changelog (CRLF removed, title and roadmap line dropped), then the SHA256
+        # table the updater reads. The changelog is skipped if the repo has none for this version.
+        id: notes
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes" <<'NOTES'
+          ## OmenCore ${{ github.ref_name }}
+
+          ### Downloads
+          - **Windows Installer**: `OmenCoreSetup-${{ steps.version.outputs.value }}.exe` (recommended)
+          - **Windows Portable**: `OmenCore-${{ steps.version.outputs.value }}-win-x64.zip`
+          - **Linux (CLI + Avalonia GUI)**: `OmenCore-${{ steps.version.outputs.value }}-linux-x64.zip`
+
+          ### System Requirements
+          - **Windows**: Windows 10/11 (x64), .NET 8 runtime is bundled in shipped artifacts
+          - **Linux**: x64, kernel modules: `ec_sys` (write_support=1), `hp-wmi`
+          - HP OMEN or Victus gaming laptop
+
+          NOTES
+          changelog="docs/CHANGELOG_v$version.md"
+          if [ -f "$changelog" ]; then
+            echo "## What's new in $version" >> "$notes"
+            echo >> "$notes"
+            tr -d '\r' < "$changelog" | tail -n +2 | grep -v '^\*\*Roadmap:\*\*' | sed '/./,$!d' >> "$notes"
+            echo >> "$notes"
+          fi
+          cat >> "$notes" <<'NOTES'
+          ### SHA256 (computed by this workflow from the exact files attached above)
+          | Artifact | SHA256 |
+          |---|---|
+          | `OmenCoreSetup-${{ steps.version.outputs.value }}.exe` | `${{ steps.hashes.outputs.win_setup }}` |
+          | `OmenCore-${{ steps.version.outputs.value }}-win-x64.zip` | `${{ steps.hashes.outputs.win_zip }}` |
+          | `OmenCore-${{ steps.version.outputs.value }}-linux-x64.zip` | `${{ steps.hashes.outputs.linux_zip }}` |
+          NOTES
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            artifacts/OmenCore-${{ steps.version.outputs.value }}-win-x64.zip
+            artifacts/OmenCore-${{ steps.version.outputs.value }}-win-x64.zip.sha256
+            artifacts/OmenCoreSetup-${{ steps.version.outputs.value }}.exe
+            artifacts/OmenCoreSetup-${{ steps.version.outputs.value }}.exe.sha256
+            artifacts/OmenCore-${{ steps.version.outputs.value }}-linux-x64.zip
+            artifacts/OmenCore-${{ steps.version.outputs.value }}-linux-x64.zip.sha256
+            artifacts/SHA256SUMS
+          body_path: ${{ runner.temp }}/release-notes.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,370 @@
+using System;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using Microsoft.Win32;
+using OmenCore.Models;
+using OmenCore.Services;
+using OmenCore.Utils;
+
+namespace OmenCore.ViewModels
+{
+    /// <summary>
+    /// ViewModel for Game Profile Manager window.
+    /// </summary>
+    public class GameProfileManagerViewModel : INotifyPropertyChanged
+    {
+        private readonly GameProfileService _profileService;
+        private readonly LoggingService _logging;
+        private GameProfile? _selectedProfile;
+        private string _searchText = string.Empty;
+        private string? _validationError;
+
+        public ObservableCollection<GameProfile> FilteredProfiles { get; } = new();
+        
+        public GameProfile? SelectedProfile
+        {
+            get => _selectedProfile;
+            set
+            {
+                if (_selectedProfile != value)
+                {
+                    _selectedProfile = value;
+                    OnPropertyChanged();
+                    ValidateSelectedProfile();
+                }
+            }
+        }
+
+        public string SearchText
+        {
+            get => _searchText;
+            set
+            {
+                if (_searchText != value)
+                {
+                    _searchText = value;
+                    OnPropertyChanged();
+                    FilterProfiles();
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Current validation error message (null if valid).
+        /// </summary>
+        public string? ValidationError
+        {
+            get => _validationError;
+            private set
+            {
+                if (_validationError != value)
+                {
+                    _validationError = value;
+                    OnPropertyChanged();
+                    OnPropertyChanged(nameof(HasValidationError));
+                    OnPropertyChanged(nameof(IsProfileValid));
+                }
+            }
+        }
+        
+        /// <summary>
+        /// True if there's a validation error.
+        /// </summary>
+        public bool HasValidationError => !string.IsNullOrEmpty(ValidationError);
+        
+        /// <summary>
+        /// True if selected profile passes validation.
+        /// </summary>
+        public bool IsProfileValid => string.IsNullOrEmpty(ValidationError);
+
+        // Dropdown options
+        public ObservableCollection<string> FanPresets { get; } = new() { "Default", "Silent", "Balanced", "Performance", "Extreme" };
+        public ObservableCollection<string> PerformanceModes { get; } = new() { "Balanced", "Performance", "Comfort" };
+        public ObservableCollection<GpuSwitchMode> GpuModes { get; } = new()
+        {
+            GpuSwitchMode.Hybrid,
+            GpuSwitchMode.Discrete,
+            GpuSwitchMode.Integrated
+        };
+        public ObservableCollection<string> KeyboardProfiles { get; } = new() { "Default", "Game Mode", "Ambient", "Custom 1", "Custom 2" };
+        public ObservableCollection<string> PeripheralProfiles { get; } = new() { "Default", "RGB Wave", "Static Blue", "Breathing", "Reactive" };
+
+        // Commands
+        public ICommand CreateProfileCommand { get; }
+        public ICommand DuplicateProfileCommand { get; }
+        public ICommand DeleteProfileCommand { get; }
+        public ICommand ImportProfilesCommand { get; }
+        public ICommand ExportProfilesCommand { get; }
+        public ICommand BrowseExecutableCommand { get; }
+        public ICommand SaveCommand { get; }
+        public ICommand CancelCommand { get; }
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        public GameProfileManagerViewModel(GameProfileService profileService, LoggingService logging, GameProfile? initialProfile = null)
+        {
+            _profileService = profileService;
+            _logging = logging;
+
+            // Initialize commands
+            CreateProfileCommand = new RelayCommand(_ => CreateProfile());
+            DuplicateProfileCommand = new RelayCommand(_ => DuplicateProfile(), _ => SelectedProfile != null);
+            DeleteProfileCommand = new AsyncRelayCommand(_ => DeleteProfileAsync(), _ => SelectedProfile != null);
+            ImportProfilesCommand = new AsyncRelayCommand(_ => ImportProfilesAsync());
+            ExportProfilesCommand = new AsyncRelayCommand(_ => ExportProfilesAsync());
+            BrowseExecutableCommand = new RelayCommand(_ => BrowseExecutable(), _ => SelectedProfile != null);
+            SaveCommand = new AsyncRelayCommand(_ => SaveAsync());
+            CancelCommand = new RelayCommand(_ => Cancel());
+
+            // Load profiles
+            LoadProfiles();
+
+            if (initialProfile != null)
+            {
+                var selected = FilteredProfiles.FirstOrDefault(p => p.Id == initialProfile.Id)
+                    ?? FilteredProfiles.FirstOrDefault(p => ReferenceEquals(p, initialProfile));
+                if (selected != null)
+                {
+                    SelectedProfile = selected;
+                }
+            }
+        }
+
+        private void LoadProfiles()
+        {
+            FilteredProfiles.Clear();
+            foreach (var profile in _profileService.Profiles)
+            {
+                FilteredProfiles.Add(profile);
+            }
+
+            if (FilteredProfiles.Any())
+            {
+                SelectedProfile = FilteredProfiles.First();
+            }
+        }
+        
+        /// <summary>
+        /// Validates the selected profile and sets ValidationError.
+        /// </summary>
+        private void ValidateSelectedProfile()
+        {
+            ValidationError = ValidateProfile(SelectedProfile);
+        }
+
+        private static string? ValidateProfile(GameProfile? profile)
+        {
+            if (profile == null)
+                return null;
+
+            if (string.IsNullOrWhiteSpace(profile.Name))
+                return "Profile name is required";
+
+            if (profile.Name.Length > 100)
+                return "Profile name must be 100 characters or less";
+
+            if (string.IsNullOrWhiteSpace(profile.ExecutableName))
+                return "Executable name is required";
+
+            if (!profile.ExecutableName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                return "Executable must end with .exe";
+
+            if (profile.CpuCoreOffsetMv < -200 || profile.CpuCoreOffsetMv > 0)
+                return "CPU undervolt must be between -200 and 0 mV";
+
+            if (profile.Priority < 0 || profile.Priority > 100)
+                return "Priority must be between 0 and 100";
+
+            return null;
+        }
+
+        private void FilterProfiles()
+        {
+            FilteredProfiles.Clear();
+
+            var filtered = string.IsNullOrWhiteSpace(SearchText)
+                ? _profileService.Profiles
+                : _profileService.Profiles.Where(p =>
+                    p.Name.Contains(SearchText, StringComparison.OrdinalIgnoreCase) ||
+                    p.ExecutableName.Contains(SearchText, StringComparison.OrdinalIgnoreCase));
+
+            foreach (var profile in filtered)
+            {
+                FilteredProfiles.Add(profile);
+            }
+        }
+
+        private void CreateProfile()
+        {
+            var profile = _profileService.CreateProfile("New Game Profile", "game.exe");
+            FilterProfiles();
+            SelectedProfile = profile;
+            _logging.Info("Created new game profile");
+        }
+
+        private void DuplicateProfile()
+        {
+            if (SelectedProfile == null) return;
+
+            var duplicate = _profileService.DuplicateProfile(SelectedProfile);
+            FilterProfiles();
+            SelectedProfile = duplicate;
+            _logging.Info($"Duplicated profile: {SelectedProfile.Name}");
+        }
+
+        private async Task DeleteProfileAsync()
+        {
+            try
+            {
+                if (SelectedProfile == null) return;
+
+                var result = MessageBox.Show(
+                    $"Delete profile '{SelectedProfile.Name}'?",
+                    "Confirm Delete",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning);
+
+                if (result == MessageBoxResult.Yes)
+                {
+                    var toDelete = SelectedProfile;
+                    await _profileService.DeleteProfileAsync(toDelete);
+                    FilterProfiles();
+                    SelectedProfile = FilteredProfiles.FirstOrDefault();
+                    _logging.Info($"Deleted profile: {toDelete.Name}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.Error($"Failed to delete profile: {ex.Message}", ex);
+                MessageBox.Show($"Failed to delete profile: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private async Task ImportProfilesAsync()
+        {
+            try
+            {
+                var dialog = new OpenFileDialog
+                {
+                    Filter = "JSON Files (*.json)|*.json|All Files (*.*)|*.*",
+                    Title = "Import Game Profiles"
+                };
+
+                if (dialog.ShowDialog() == true)
+                {
+                    var count = await _profileService.ImportProfilesAsync(dialog.FileName);
+                    MessageBox.Show($"Imported {count} profile(s)", "Import Complete", MessageBoxButton.OK, MessageBoxImage.Information);
+                    FilterProfiles();
+                    _logging.Info($"Imported {count} profiles from {dialog.FileName}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.Error($"Failed to import profiles: {ex.Message}", ex);
+                MessageBox.Show($"Failed to import profiles: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private async Task ExportProfilesAsync()
+        {
+            try
+            {
+                var dialog = new SaveFileDialog
+                {
+                    Filter = "JSON Files (*.json)|*.json|All Files (*.*)|*.*",
+                    Title = "Export Game Profiles",
+                    FileName = $"omencore-profiles-{DateTime.Now:yyyy-MM-dd}.json"
+                };
+
+                if (dialog.ShowDialog() == true)
+                {
+                    await _profileService.ExportProfilesAsync(dialog.FileName);
+                    MessageBox.Show($"Exported {_profileService.Profiles.Count} profile(s)", "Export Complete", MessageBoxButton.OK, MessageBoxImage.Information);
+                    _logging.Info($"Exported profiles to {dialog.FileName}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.Error($"Failed to export profiles: {ex.Message}", ex);
+                MessageBox.Show($"Failed to export profiles: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void BrowseExecutable()
+        {
+            if (SelectedProfile == null) return;
+
+            var dialog = new OpenFileDialog
+            {
+                Filter = "Executable Files (*.exe)|*.exe|All Files (*.*)|*.*",
+                Title = "Select Game Executable"
+            };
+
+            if (dialog.ShowDialog() == true)
+            {
+                SelectedProfile.ExecutablePath = dialog.FileName;
+                SelectedProfile.ExecutableName = System.IO.Path.GetFileName(dialog.FileName);
+                OnPropertyChanged(nameof(SelectedProfile));
+            }
+        }
+
+        private async Task SaveAsync()
+        {
+            try
+            {
+                ValidateSelectedProfile();
+                if (!IsProfileValid)
+                {
+                    MessageBox.Show(ValidationError, "Invalid Game Profile", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                if (SelectedProfile != null)
+                {
+                    await _profileService.UpdateProfileAsync(SelectedProfile);
+                }
+                else
+                {
+                    await _profileService.SaveProfilesAsync();
+                }
+                _logging.Info("Saved game profiles");
+                CloseWindow();
+            }
+            catch (Exception ex)
+            {
+                _logging.Error($"Failed to save profiles: {ex.Message}", ex);
+                MessageBox.Show($"Failed to save profiles: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void Cancel()
+        {
+            // Reload profiles to discard changes
+            _ = _profileService.LoadProfilesAsync();
+            CloseWindow();
+        }
+
+        private void CloseWindow()
+        {
+            // Find the window and close it
+            foreach (Window window in Application.Current.Windows)
+            {
+                if (window.DataContext == this)
+                {
+                    window.Close();
+                    break;
+                }
+            }
+        }
+
+        protected void OnPropertyChanged([CallerMemberName] string? propertyName = null)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        }
+    }
+}

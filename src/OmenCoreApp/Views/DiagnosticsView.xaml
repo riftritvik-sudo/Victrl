@@ -1,0 +1,470 @@
+<UserControl x:Class="OmenCore.Views.DiagnosticsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" 
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:views="clr-namespace:OmenCore.Views"
+             xmlns:utils="clr-namespace:OmenCore.Utils"
+             mc:Ignorable="d" 
+             d:DesignHeight="800" d:DesignWidth="1200">
+    <ScrollViewer Style="{StaticResource SmoothScrollViewer}" 
+                  Padding="0,0,12,0">
+        <StackPanel Margin="20,20,20,40">
+            <!-- Header -->
+            <StackPanel Margin="0,0,0,24">
+                <TextBlock Text="System Diagnostics" Style="{StaticResource Heading1}"/>
+                <TextBlock Text="Hardware testing and validation tools" 
+                           Style="{StaticResource Caption}"
+                           Opacity="0.9"/>
+            </StackPanel>
+
+            <!-- Side-by-side diagnostics panels (GitHub #48 - kg290: combine diagnostics side-by-side) -->
+            <Grid Margin="0,0,0,20">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="16"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <!-- Fan Diagnostics (Left) -->
+                <GroupBox Grid.Column="0" Header="Fan Diagnostics" Style="{StaticResource ModernGroupBox}">
+                    <views:FanDiagnosticsView DataContext="{Binding FanDiagnostics}" />
+                </GroupBox>
+
+                <!-- Keyboard Lighting Diagnostics (Right) -->
+                <GroupBox Grid.Column="2" Header="Keyboard Lighting Diagnostics" Style="{StaticResource ModernGroupBox}">
+                    <views:KeyboardDiagnosticsView DataContext="{Binding KeyboardDiagnostics}" />
+                </GroupBox>
+            </Grid>
+
+            <!-- Monitoring Diagnostics (new for v3.0.0) -->
+            <GroupBox Header="Monitoring Diagnostics" Style="{StaticResource ModernGroupBox}" Margin="0,12,0,0">
+                <Grid Margin="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="280" />
+                    </Grid.ColumnDefinitions>
+
+                    <StackPanel Grid.Column="0" VerticalAlignment="Top">
+                        <TextBlock Text="Health:" FontWeight="SemiBold" Foreground="{StaticResource TextPrimaryBrush}" Margin="0,0,0,6" />
+                        <TextBlock Text="{Binding Dashboard.MonitoringHealthStatusText}" FontSize="13" Margin="0,0,0,6" />
+
+                        <TextBlock Text="Source:" FontWeight="SemiBold" Foreground="{StaticResource TextPrimaryBrush}" Margin="0,8,0,0"/>
+                        <TextBlock Text="{Binding Dashboard.MonitoringSourceText}" FontSize="13" Margin="0,0,0,6" />
+
+                        <TextBlock Text="Last sample age:" FontWeight="SemiBold" Foreground="{StaticResource TextPrimaryBrush}" Margin="0,8,0,0"/>
+                        <TextBlock Text="{Binding Dashboard.LastSampleAge}" FontSize="13" Margin="0,0,0,6" />
+
+                        <TextBlock Text="Consecutive timeouts:" FontWeight="SemiBold" Foreground="{StaticResource TextPrimaryBrush}" Margin="0,8,0,0"/>
+                        <TextBlock Text="{Binding HardwareMonitoringService.ConsecutiveTimeouts}" FontSize="13" Margin="0,0,0,6" />
+
+                        <TextBlock Text="CPU temp override:" FontWeight="SemiBold" Foreground="{StaticResource TextPrimaryBrush}" Margin="0,8,0,0"/>
+                        <TextBlock Text="{Binding CpuTempOverrideDiagnosticText}" FontSize="13" Margin="0,0,0,6" TextWrapping="Wrap" />
+
+                        <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                            <Button Content="Export diagnostics" Command="{Binding Settings.ExportDiagnosticsCommand}" Style="{StaticResource AccentButtonSmall}" Margin="0,0,8,0"
+                                    ToolTip="Save the full core-control-readiness report to a file for troubleshooting or a bug report"
+                                    AutomationProperties.Name="Export full diagnostics report" />
+                            <Button Content="Export telemetry" Command="{Binding ExportTelemetryCommand}" Style="{StaticResource AccentButtonSmall}" Margin="0,0,8,0" ToolTip="Create a copy of the telemetry JSON for upload"
+                                    AutomationProperties.Name="Export telemetry JSON" />
+                            <Button Content="Report model" Command="{Binding ReportModelCommand}" Style="{StaticResource OutlineButtonSmall}" ToolTip="Create diagnostics bundle and copy model info to clipboard"
+                                    AutomationProperties.Name="Report this model to the maintainer" />
+                        </StackPanel>
+                    </StackPanel>
+
+                    <StackPanel Grid.Column="1" VerticalAlignment="Top" Margin="12,0,0,0">
+                        <TextBlock Text="Active alerts" FontWeight="SemiBold" Foreground="{StaticResource TextPrimaryBrush}" />
+                        <TextBlock Text="Backend:" FontWeight="SemiBold" Foreground="{StaticResource TextPrimaryBrush}" />
+                        <TextBlock Text="{Binding HardwareMonitoringService.MonitoringSource}" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}" />
+
+                        <TextBlock Text="Worker timeouts:" FontWeight="SemiBold" Margin="0,8,0,0"/>
+                        <TextBlock Text="{Binding HardwareMonitoringService.ConsecutiveTimeouts}" FontSize="12" Foreground="{StaticResource TextSecondaryBrush}" />
+
+                        <TextBlock Text="Quick actions" FontWeight="SemiBold" Margin="0,12,0,0"/>
+                        <Button Content="Open app logs folder" Click="OpenDiagnosticsFolder_Click" Style="{StaticResource OutlineButtonSmall}" Margin="0,0,0,8"
+                                ToolTip="Open the folder containing OmenCore's log files in File Explorer"
+                                AutomationProperties.Name="Open app logs folder" />
+                        <Button Content="Open OmenCore data folder" Click="OpenOmenCoreDataFolder_Click" Style="{StaticResource OutlineButtonSmall}"
+                                ToolTip="Open the folder containing OmenCore's config and saved data in File Explorer"
+                                AutomationProperties.Name="Open OmenCore data folder" />
+                    </StackPanel>
+                </Grid>
+            </GroupBox>
+
+            <!-- Temperature Source Comparison: "does this temperature look right?" A user with a
+                 wrong-looking reading previously had no way to see WMI BIOS / ACPI Thermal Zone /
+                 LibreHardwareMonitor side by side without a maintainer reading raw logs by hand. -->
+            <GroupBox Header="Temperature Source Comparison" Style="{StaticResource ModernGroupBox}" Margin="0,12,0,0"
+                      Visibility="{Binding TemperatureSourceDiagnostics.IsAvailable, Converter={StaticResource BoolToVisibility}}">
+                <StackPanel Margin="8">
+                    <TextBlock Text="Reads every CPU temperature source OmenCore knows about at once and reports whether they agree. Doesn't change which source is trusted — read-only."
+                               FontSize="11" Foreground="{StaticResource TextTertiaryBrush}" TextWrapping="Wrap" Margin="0,0,0,10"/>
+
+                    <Button Content="{Binding TemperatureSourceDiagnostics.RunButtonLabel}"
+                            Command="{Binding TemperatureSourceDiagnostics.RunComparisonCommand}"
+                            Style="{StaticResource OutlineButtonSmall}" HorizontalAlignment="Left"
+                            ToolTip="Read WMI BIOS, ACPI, and LibreHardwareMonitor CPU temperature sources side by side. Read-only, does not change anything."
+                            AutomationProperties.Name="Run temperature source comparison"/>
+
+                    <Border Background="#2D2D1F" BorderBrush="{StaticResource WarningBrush}" BorderThickness="1"
+                            CornerRadius="6" Padding="10,8" Margin="0,10,0,0"
+                            Visibility="{Binding TemperatureSourceDiagnostics.SourcesDisagree, Converter={StaticResource BoolToVisibility}}">
+                        <TextBlock Text="{Binding TemperatureSourceDiagnostics.Result}" FontSize="12" FontFamily="{StaticResource MonospaceFontFamily}"
+                                   Foreground="{StaticResource TextPrimaryBrush}" TextWrapping="Wrap"/>
+                    </Border>
+                    <TextBlock Text="{Binding TemperatureSourceDiagnostics.Result}" FontSize="12" FontFamily="{StaticResource MonospaceFontFamily}"
+                               Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap" Margin="0,10,0,0"
+                               Visibility="{Binding TemperatureSourceDiagnostics.SourcesDisagree, Converter={StaticResource InverseBoolToVisibility}}"/>
+                </StackPanel>
+            </GroupBox>
+
+            <!-- Power adapter (Legacy 0x0F). Hidden entirely on boards that don't report it, rather
+                 than shown empty. Read-only: nothing here writes to the firmware. -->
+            <GroupBox Header="Power Adapter" Style="{StaticResource ModernGroupBox}" Margin="0,12,0,0"
+                      Visibility="{Binding GpuClamp.HasPowerAdapterInfo, Converter={StaticResource BoolToVisibility}}">
+                <StackPanel Margin="8">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0">
+                            <TextBlock Text="Connected adapter" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}"/>
+                            <TextBlock Text="{Binding GpuClamp.PowerAdapterSummary}" FontSize="14" FontWeight="SemiBold"
+                                       Foreground="{StaticResource TextPrimaryBrush}" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="16,0,0,0">
+                            <TextBlock Text="Shipped with" FontSize="11" Foreground="{StaticResource TextTertiaryBrush}"
+                                       HorizontalAlignment="Right"/>
+                            <TextBlock Text="{Binding GpuClamp.PowerAdapterRequirement}" FontSize="14" FontWeight="SemiBold"
+                                       Foreground="{StaticResource TextSecondaryBrush}" HorizontalAlignment="Right" Margin="0,2,0,0"/>
+                        </StackPanel>
+                    </Grid>
+
+                    <Border Background="#2D2D1F" BorderBrush="{StaticResource WarningBrush}" BorderThickness="1"
+                            CornerRadius="6" Padding="10,8" Margin="0,12,0,0"
+                            Visibility="{Binding GpuClamp.HasPowerAdapterExplanation, Converter={StaticResource BoolToVisibility}}">
+                        <TextBlock Text="{Binding GpuClamp.PowerAdapterExplanation}" FontSize="11"
+                                   Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"/>
+                    </Border>
+
+                    <!-- The override. Offered only on an under-rated supply, because on one that meets
+                         the requirement there is no clamp to discard and this would cost a black
+                         screen for nothing. Confirmation lives in the click handler, not here. -->
+                    <StackPanel Margin="0,12,0,0"
+                                Visibility="{Binding GpuClamp.CanOfferAdapterOverride, Converter={StaticResource BoolToVisibility}}">
+                        <Separator Margin="0,0,0,10"/>
+
+                        <!-- The reading goes above the button, not below it: the point is to answer
+                             "is anything actually clamped here" before someone pays a black screen
+                             to find out. -->
+                        <TextBlock Text="Current GPU power limit" FontSize="11"
+                                   Foreground="{StaticResource TextTertiaryBrush}"/>
+                        <TextBlock Text="{Binding GpuClamp.GpuPowerLimitSummary}" FontSize="14" FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextPrimaryBrush}" TextWrapping="Wrap" Margin="0,2,0,0"
+                                   Visibility="{Binding GpuClamp.HasGpuPowerLimitReading, Converter={StaticResource BoolToVisibility}}"/>
+                        <TextBlock Text="{Binding GpuClamp.GpuPowerLimitAttribution}" FontSize="11" Margin="0,4,0,0"
+                                   Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"
+                                   Visibility="{Binding GpuClamp.HasGpuPowerLimitAttribution, Converter={StaticResource BoolToVisibility}}"/>
+                        <TextBlock Text="{Binding GpuClamp.GpuPowerLimitPrompt}" FontSize="11" Margin="0,4,0,0"
+                                   Foreground="{StaticResource TextTertiaryBrush}" TextWrapping="Wrap"
+                                   Visibility="{Binding GpuClamp.HasGpuPowerLimitPrompt, Converter={StaticResource BoolToVisibility}}"/>
+                        <Button Content="{Binding GpuClamp.CheckGpuPowerLimitLabel}"
+                                Command="{Binding GpuClamp.CheckGpuPowerLimitCommand}"
+                                Style="{StaticResource OutlineButtonSmall}" Margin="0,8,0,0"
+                                HorizontalAlignment="Left"
+                                ToolTip="Read the GPU's current power limit directly from the driver. Read-only, does not change anything."
+                                AutomationProperties.Name="Check current GPU power limit"/>
+
+                        <Separator Margin="0,12,0,10"/>
+
+                        <TextBlock Text="Drop the adapter power clamp" FontSize="12" FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextPrimaryBrush}"/>
+                        <TextBlock TextWrapping="Wrap" FontSize="11" Margin="0,4,0,0"
+                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                   Text="The firmware tells the GPU driver about the adapter once, when it evaluates it, and the driver has no way to ask. A driver that has just started has not been told, so restarting the device clears the clamp - and only another notification puts it back. Changing supply does that, and so does a reboot."/>
+                        <TextBlock TextWrapping="Wrap" FontSize="11" Margin="0,4,0,0"
+                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                   Text="The same supply clamps the CPU by a different route: three of the four AMD SMU power limits pinned low, which no device restart touches. Those are written directly, and put back after a resume or a change of supply - the events that take them away."/>
+                        <TextBlock Text="{Binding GpuClamp.AdapterOverrideScope}" TextWrapping="Wrap" FontSize="11" Margin="0,6,0,0"
+                                   Foreground="{StaticResource TextPrimaryBrush}"
+                                   Visibility="{Binding GpuClamp.HasAdapterOverrideScope, Converter={StaticResource BoolToVisibility}}"/>
+                        <TextBlock TextWrapping="Wrap" FontSize="11" Margin="0,6,0,0"
+                                   Foreground="{StaticResource WarningBrush}"
+                                   Text="Your screens will go black for a few seconds and anything using the GPU will lose it. Do not do this with a game or a render running."/>
+
+                        <Button Content="Drop the clamp"
+                                Click="ApplyAdapterOverride_Click"
+                                IsEnabled="{Binding GpuClamp.CanApplyAdapterOverride}"
+                                Style="{StaticResource OutlineButtonSmall}" Margin="0,10,0,0"
+                                HorizontalAlignment="Left"
+                                ToolTip="Restarts the GPU device to force the driver to re-read your adapter's power capability. Screens go black for a few seconds - do not use this with a game or render running."
+                                AutomationProperties.Name="Drop the adapter power clamp"/>
+
+                        <TextBlock Text="{Binding GpuClamp.ApuClampStatus}" FontSize="11" Margin="0,8,0,0"
+                                   Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"
+                                   Visibility="{Binding GpuClamp.HasApuClampStatus, Converter={StaticResource BoolToVisibility}}"/>
+
+                        <Button Content="Stop holding the CPU limits"
+                                Command="{Binding GpuClamp.ReleaseApuClampCommand}"
+                                Style="{StaticResource OutlineButtonSmall}" Margin="0,8,0,0"
+                                HorizontalAlignment="Left"
+                                Visibility="{Binding GpuClamp.IsApuClampHeld, Converter={StaticResource BoolToVisibility}}"
+                                ToolTip="Release the AMD SMU power limits OmenCore is currently holding pinned low to work around the adapter clamp"
+                                AutomationProperties.Name="Stop holding the CPU power limits"/>
+
+                        <!-- Doing it without being asked every boot. Both off by default; the GPU one
+                             carries its condition in the label, because that condition is the only
+                             reason it can be automatic at all. -->
+                        <Separator Margin="0,12,0,10"/>
+
+                        <TextBlock Text="Do this on its own" FontSize="12" FontWeight="SemiBold"
+                                   Foreground="{StaticResource TextPrimaryBrush}"/>
+
+                        <CheckBox IsChecked="{Binding GpuClamp.AutoLiftCpuLimits}" Margin="0,8,0,0"
+                                  Content="Keep the CPU power limits raised"
+                                  Foreground="{StaticResource TextSecondaryBrush}"/>
+                        <TextBlock TextWrapping="Wrap" FontSize="11" Margin="22,2,0,0"
+                                   Foreground="{StaticResource TextTertiaryBrush}"
+                                   Text="Applied at startup, after a resume, and when the supply changes - the events that take these limits away. Nothing is written in between, and nothing is taken away from anything that is running."/>
+
+                        <CheckBox IsChecked="{Binding GpuClamp.AutoLiftGpuWhenParked}" Margin="0,10,0,0"
+                                  Content="Restart the GPU to drop its clamp - but only while it is asleep"
+                                  Foreground="{StaticResource TextSecondaryBrush}"/>
+                        <TextBlock TextWrapping="Wrap" FontSize="11" Margin="22,2,0,0"
+                                   Foreground="{StaticResource TextTertiaryBrush}"
+                                   Text="Only when the driver has parked the GPU and the display is running on the integrated one, so there is nothing to interrupt and no screen to black out. If it is awake when the moment comes, it is left alone and you are told - use the button above instead."/>
+
+                        <TextBlock Text="{Binding GpuClamp.AutoClampLiftStatus}" FontSize="11" Margin="0,10,0,0"
+                                   Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"
+                                   Visibility="{Binding GpuClamp.HasAutoClampLiftStatus, Converter={StaticResource BoolToVisibility}}"/>
+
+                        <TextBlock Text="{Binding GpuClamp.AdapterOverrideBlockedReason}" FontSize="11" Margin="0,6,0,0"
+                                   Foreground="{StaticResource TextTertiaryBrush}" TextWrapping="Wrap"
+                                   Visibility="{Binding GpuClamp.HasAdapterOverrideBlockedReason, Converter={StaticResource BoolToVisibility}}"/>
+
+                        <TextBlock Text="{Binding GpuClamp.AdapterOverrideStatus}" FontSize="11" Margin="0,8,0,0"
+                                   Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"
+                                   Visibility="{Binding GpuClamp.HasAdapterOverrideStatus, Converter={StaticResource BoolToVisibility}}"/>
+                    </StackPanel>
+
+                    <TextBlock Text="Read from the BIOS each time this tab is opened. This is the machine's own view of the supply attached to it, not a measurement."
+                               FontSize="11" Foreground="{StaticResource TextTertiaryBrush}" TextWrapping="Wrap" Margin="0,10,0,0"/>
+
+                    <!-- The board-8D87-only GPU TGP unlock. A different, higher-risk mechanism from
+                         the adapter override above (EC bits the firmware actively reasserts, not a
+                         driver restart), so it gets its own, more explicit risk block rather than
+                         living inside the section above it. Not confirmed on real hardware. -->
+                    <StackPanel Margin="0,16,0,0"
+                                Visibility="{Binding GpuClamp.CanOfferGpuTgpUnlock, Converter={StaticResource BoolToVisibility}}">
+                        <Separator Margin="0,0,0,10"/>
+                        <TextBlock Text="GPU power unlock (experimental, board 8D87 only)" FontSize="12" FontWeight="SemiBold"
+                                   Foreground="{StaticResource WarningBrush}"/>
+                        <TextBlock TextWrapping="Wrap" FontSize="11" Margin="0,4,0,0"
+                                   Foreground="{StaticResource TextSecondaryBrush}"
+                                   Text="This board's GPU is held under its full 175 W rating by two firmware gates that OMEN Gaming Hub normally holds open. This pins them open for one moment and asks the driver to re-read them - not an overclock, and not persistent: the firmware takes both gates back on the next resume, adapter change, or reboot."/>
+                        <TextBlock TextWrapping="Wrap" FontSize="11" Margin="0,6,0,0"
+                                   Foreground="{StaticResource WarningBrush}" FontWeight="SemiBold"
+                                   Text="Not confirmed on real hardware. Forcing this on an undersized power adapter has been observed, during the investigation this is built from, to leave the GPU in a degraded state that only cleared after a reboot - on a machine with a history of GPU-driver crashes. This is why it only offers itself on an adapter well above this machine's rated requirement."/>
+                        <TextBlock Text="{Binding GpuClamp.GpuTgpUnlockStatus}" FontSize="11" Margin="0,8,0,0"
+                                   Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"
+                                   Visibility="{Binding GpuClamp.HasGpuTgpUnlockStatus, Converter={StaticResource BoolToVisibility}}"/>
+                        <Button Content="Try the GPU power unlock"
+                                Click="EngageGpuTgpUnlock_Click"
+                                IsEnabled="{Binding GpuClamp.CanEngageGpuTgpUnlock}"
+                                Style="{StaticResource OutlineButtonSmall}" Margin="0,10,0,0"
+                                HorizontalAlignment="Left"
+                                ToolTip="Experimental. Pins two EC bits and fires one WMI command, then verifies by measured GPU power. Not confirmed on real hardware - see the text above."
+                                AutomationProperties.Name="Try the GPU power unlock (experimental)"/>
+                    </StackPanel>
+                </StackPanel>
+            </GroupBox>
+
+            <!-- Model Capabilities (what this specific detected model does/doesn't support) -->
+            <GroupBox Header="Model Capabilities" Style="{StaticResource ModernGroupBox}" Margin="0,12,0,0">
+                <StackPanel Margin="8">
+                    <Grid Margin="0,0,0,12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0">
+                            <TextBlock FontSize="14" FontWeight="SemiBold" Foreground="{StaticResource TextPrimaryBrush}"
+                                       Text="{Binding DetectedCapabilities.ModelConfig.ModelName, FallbackValue='Unknown model'}"/>
+                            <TextBlock FontSize="11" Foreground="{StaticResource TextTertiaryBrush}" Margin="0,2,0,0">
+                                <Run Text="Product ID: "/>
+                                <Run Text="{Binding DetectedCapabilities.ProductId, FallbackValue='?'}"/>
+                            </TextBlock>
+                        </StackPanel>
+                        <Border Grid.Column="1" CornerRadius="6" Padding="10,4" VerticalAlignment="Center"
+                                Background="#1A00FF88"
+                                Visibility="{Binding DetectedCapabilities.ModelConfig.UserVerified, Converter={StaticResource BoolToVisibility}}">
+                            <TextBlock Text="✓ User-verified profile" FontSize="10" FontWeight="SemiBold" Foreground="{StaticResource SuccessBrush}"/>
+                        </Border>
+                        <Border Grid.Column="1" CornerRadius="6" Padding="10,4" VerticalAlignment="Center"
+                                Background="#1AFF9800"
+                                Visibility="{Binding DetectedCapabilities.ModelConfig.UserVerified, Converter={StaticResource InverseBoolToVisibility}}">
+                            <TextBlock Text="⚠ Inferred, not yet verified" FontSize="10" FontWeight="SemiBold" Foreground="{StaticResource WarningBrush}"/>
+                        </Border>
+                    </Grid>
+
+                    <!-- Notes / quirks for this model, when present -->
+                    <Border Background="#2D2D1F" BorderBrush="{StaticResource WarningBrush}" BorderThickness="1" CornerRadius="6" Padding="10,8" Margin="0,0,0,12"
+                            Visibility="{Binding DetectedCapabilities.ModelConfig.Notes, Converter={StaticResource NullToVisibilityConverter}, FallbackValue=Collapsed}">
+                        <TextBlock Text="{Binding DetectedCapabilities.ModelConfig.Notes}" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}" TextWrapping="Wrap"/>
+                    </Border>
+
+                    <TextBlock Text="This reflects what OmenCore's model database knows about the specific board detected on this machine — a feature showing &quot;Not supported&quot; may be a real hardware/firmware limitation rather than an OmenCore bug. These entries describe advanced features (custom curves, independent zones, GPU power boost); basic Auto/Performance/Max fan modes on the General tab are controlled separately and aren't affected by this list. If your model shows unverified and something below looks wrong, please report it."
+                               FontSize="11" Foreground="{StaticResource TextTertiaryBrush}" TextWrapping="Wrap" Margin="0,0,0,12"/>
+
+                    <UniformGrid Columns="2">
+                        <Border Background="#0D0D0F" CornerRadius="6" Padding="10,8" Margin="0,0,6,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Custom fan curves" FontSize="12" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <TextBlock Text="✓ Supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource SuccessBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.SupportsFanCurves, Converter={StaticResource BoolToVisibility}}"/>
+                                    <TextBlock Text="✗ Not supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextTertiaryBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.SupportsFanCurves, Converter={StaticResource InverseBoolToVisibility}}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                        <Border Background="#0D0D0F" CornerRadius="6" Padding="10,8" Margin="0,0,0,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Independent CPU/GPU fan curves" FontSize="12" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <TextBlock Text="✓ Supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource SuccessBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.SupportsIndependentFanCurves, Converter={StaticResource BoolToVisibility}}"/>
+                                    <TextBlock Text="✗ Not supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextTertiaryBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.SupportsIndependentFanCurves, Converter={StaticResource InverseBoolToVisibility}}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                        <Border Background="#0D0D0F" CornerRadius="6" Padding="10,8" Margin="0,0,6,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Real fan RPM readback" FontSize="12" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <TextBlock Grid.Column="1" Text="{Binding RpmReadbackLabel}" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextTertiaryBrush}"/>
+                            </Grid>
+                        </Border>
+                        <Border Background="#0D0D0F" CornerRadius="6" Padding="10,8" Margin="0,0,0,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="GPU MUX switch" FontSize="12" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <TextBlock Text="✓ Present" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource SuccessBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.HasMuxSwitch, Converter={StaticResource BoolToVisibility}}"/>
+                                    <TextBlock Text="✗ Not present" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextTertiaryBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.HasMuxSwitch, Converter={StaticResource InverseBoolToVisibility}}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                        <Border Background="#0D0D0F" CornerRadius="6" Padding="10,8" Margin="0,0,6,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="GPU power boost (TGP)" FontSize="12" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <TextBlock Text="✓ Supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource SuccessBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.SupportsGpuPowerBoost, Converter={StaticResource BoolToVisibility}}"/>
+                                    <TextBlock Text="✗ Not supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextTertiaryBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.SupportsGpuPowerBoost, Converter={StaticResource InverseBoolToVisibility}}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                        <Border Background="#0D0D0F" CornerRadius="6" Padding="10,8" Margin="0,0,0,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Advanced Optimus GPU switching" FontSize="12" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <TextBlock Text="✓ Supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource SuccessBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.SupportsAdvancedOptimus, Converter={StaticResource BoolToVisibility}}"/>
+                                    <TextBlock Text="✗ Not supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextTertiaryBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.SupportsAdvancedOptimus, Converter={StaticResource InverseBoolToVisibility}}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                        <Border Background="#0D0D0F" CornerRadius="6" Padding="10,8" Margin="0,0,6,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="4-zone keyboard RGB" FontSize="12" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <TextBlock Text="✓ Supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource SuccessBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.HasFourZoneRgb, Converter={StaticResource BoolToVisibility}}"/>
+                                    <TextBlock Text="✗ Not supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextTertiaryBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.HasFourZoneRgb, Converter={StaticResource InverseBoolToVisibility}}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                        <Border Background="#0D0D0F" CornerRadius="6" Padding="10,8" Margin="0,0,0,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Per-key RGB" FontSize="12" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <TextBlock Text="✓ Supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource SuccessBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.HasPerKeyRgb, Converter={StaticResource BoolToVisibility}}"/>
+                                    <TextBlock Text="✗ Not supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextTertiaryBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.HasPerKeyRgb, Converter={StaticResource InverseBoolToVisibility}}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                        <Border Background="#0D0D0F" CornerRadius="6" Padding="10,8" Margin="0,0,6,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Light bar" FontSize="12" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <TextBlock Text="✓ Present" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource SuccessBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.HasLightBar, Converter={StaticResource BoolToVisibility}}"/>
+                                    <TextBlock Text="✗ Not present" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextTertiaryBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.HasLightBar, Converter={StaticResource InverseBoolToVisibility}}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                        <Border Background="#0D0D0F" CornerRadius="6" Padding="10,8" Margin="0,0,0,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="CPU undervolting" FontSize="12" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <TextBlock Text="✓ Supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource SuccessBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.SupportsUndervolt, Converter={StaticResource BoolToVisibility}}"/>
+                                    <TextBlock Text="✗ Not supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextTertiaryBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.SupportsUndervolt, Converter={StaticResource InverseBoolToVisibility}}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                        <Border Background="#0D0D0F" CornerRadius="6" Padding="10,8" Margin="0,0,6,0">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Power limit (PL1/PL2) adjustment" FontSize="12" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <TextBlock Grid.Column="1" Text="{Binding PowerLimitReadbackLabel}" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextPrimaryBrush}"/>
+                            </Grid>
+                        </Border>
+                        <Border Background="#0D0D0F" CornerRadius="6" Padding="10,8" Margin="0,0,0,0">
+                            <Grid>
+                                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Overboost mode" FontSize="12" Foreground="{StaticResource TextPrimaryBrush}" VerticalAlignment="Center"/>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <TextBlock Text="✓ Supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource SuccessBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.SupportsOverboost, Converter={StaticResource BoolToVisibility}}"/>
+                                    <TextBlock Text="✗ Not supported" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextTertiaryBrush}" Visibility="{Binding DetectedCapabilities.ModelConfig.SupportsOverboost, Converter={StaticResource InverseBoolToVisibility}}"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+                    </UniformGrid>
+                </StackPanel>
+            </GroupBox>
+
+            <!-- Info Box -->
+            <Border Background="{StaticResource SurfaceDarkBrush}"
+                    CornerRadius="8"
+                    Padding="16"
+                    Margin="0,8,0,0"
+                    BorderBrush="{StaticResource AccentBlueBrush}"
+                    BorderThickness="1">
+                <StackPanel>
+                    <TextBlock Text="ℹ️ About Diagnostics" 
+                               FontSize="14" 
+                               FontWeight="SemiBold" 
+                               Foreground="{StaticResource AccentBlueBrush}" 
+                               Margin="0,0,0,8"/>
+                    <TextBlock TextWrapping="Wrap" 
+                               FontSize="12" 
+                               Foreground="{StaticResource TextSecondaryBrush}">
+                        <Run Text="• "/>
+                        <Run Text="Fan Diagnostics:" FontWeight="SemiBold"/>
+                        <Run Text=" Verify fan control responsiveness, test different speed levels, and validate RPM readings"/>
+                        <LineBreak/><LineBreak/>
+                        <Run Text="• "/>
+                        <Run Text="Keyboard Diagnostics:" FontWeight="SemiBold"/>
+                        <Run Text=" Test individual key backlighting, verify RGB zones, and troubleshoot keyboard lighting issues"/>
+                        <LineBreak/><LineBreak/>
+                        <Run Text="• "/>
+                        <Run Text="Diagnostic tools are for troubleshooting only - they temporarily override your normal settings"/>
+                    </TextBlock>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

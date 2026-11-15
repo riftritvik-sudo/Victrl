@@ -1,0 +1,1169 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using Microsoft.Win32;
+using OmenCore;
+using OmenCore.Models;
+using OmenCore.Services;
+using OmenCore.Utils;
+
+namespace OmenCore.Controls
+{
+    /// <summary>
+    /// Control for exporting diagnostic data to help troubleshoot issues.
+    /// </summary>
+    public partial class DiagnosticExportControl : UserControl
+    {
+        private readonly LoggingService _logging;
+        private readonly HardwareMonitoringService? _hardwareService;
+        private readonly PerformanceModeService? _performanceService;
+        private readonly FanCalibrationStorageService? _calibrationService;
+        private readonly FanService? _fanService;
+        private readonly KeyboardLightingService? _keyboardLightingService;
+        private readonly ConfigurationService? _configService;
+        private readonly HotkeyService? _hotkeyService;
+        private readonly OmenKeyService? _omenKeyService;
+
+        private CancellationTokenSource? _exportCts;
+        private string? _lastExportPath;
+
+        public DiagnosticExportControl()
+        {
+            InitializeComponent();
+
+            // Get services from dependency injection
+            var serviceProvider = App.ServiceProvider ?? throw new InvalidOperationException("ServiceProvider not initialized");
+            _logging = serviceProvider.GetService(typeof(LoggingService)) as LoggingService
+                      ?? throw new InvalidOperationException("LoggingService not available");
+
+            // Optional services
+            _hardwareService = serviceProvider.GetService(typeof(HardwareMonitoringService)) as HardwareMonitoringService;
+            _performanceService = serviceProvider.GetService(typeof(PerformanceModeService)) as PerformanceModeService;
+            _calibrationService = new FanCalibrationStorageService(_logging);
+
+            // Optional fan service for verification
+            _fanService = serviceProvider.GetService(typeof(FanService)) as FanService;
+            _keyboardLightingService = serviceProvider.GetService(typeof(KeyboardLightingService)) as KeyboardLightingService;
+            _configService = serviceProvider.GetService(typeof(ConfigurationService)) as ConfigurationService;
+            _hotkeyService = serviceProvider.GetService(typeof(HotkeyService)) as HotkeyService;
+            _omenKeyService = serviceProvider.GetService(typeof(OmenKeyService)) as OmenKeyService;
+        }
+
+        private async void ExportButton_Click(object sender, RoutedEventArgs e)
+        {
+            var saveDialog = new SaveFileDialog
+            {
+                Title = "Save Diagnostic Export",
+                Filter = GetFileFilter(),
+                FileName = $"OmenCore_Diagnostics_{DateTime.Now:yyyyMMdd_HHmmss}",
+                DefaultExt = GetDefaultExtension()
+            };
+
+            if (saveDialog.ShowDialog() != true)
+                return;
+
+            await StartExportAsync(saveDialog.FileName);
+        }
+
+        private async Task StartExportAsync(string filePath)
+        {
+            _exportCts = new CancellationTokenSource();
+
+            try
+            {
+                // Update UI
+                ExportButton.Visibility = Visibility.Collapsed;
+                CancelExportButton.Visibility = Visibility.Visible;
+                ProgressGroup.Visibility = Visibility.Visible;
+                ResultsGroup.Visibility = Visibility.Collapsed;
+                OpenExportFolderButton.Visibility = Visibility.Collapsed;
+                CopyPathButton.Visibility = Visibility.Collapsed;
+
+                ExportProgress.Value = 0;
+                ProgressText.Text = "Starting diagnostic export...";
+
+                // Perform export
+                var exportResult = await PerformDiagnosticExportAsync(filePath, _exportCts.Token);
+
+                // Update progress
+                ExportProgress.Value = 100;
+                ProgressText.Text = "Export completed";
+
+                // Show results
+                DisplayExportResults(exportResult);
+
+                _lastExportPath = filePath;
+                _logging.Info($"Diagnostic export completed: {filePath}");
+            }
+            catch (OperationCanceledException)
+            {
+                ProgressText.Text = "Export cancelled";
+                _logging.Info("Diagnostic export cancelled by user");
+            }
+            catch (Exception ex)
+            {
+                ProgressText.Text = $"Export failed: {ex.Message}";
+                _logging.Error($"Diagnostic export failed: {ex.Message}", ex);
+                MessageBox.Show($"Export failed: {ex.Message}", "Export Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                // Reset UI
+                ExportButton.Visibility = Visibility.Visible;
+                CancelExportButton.Visibility = Visibility.Collapsed;
+                _exportCts?.Dispose();
+                _exportCts = null;
+            }
+        }
+
+        private async Task<DiagnosticExportResult> PerformDiagnosticExportAsync(string filePath, CancellationToken ct)
+        {
+            var result = new DiagnosticExportResult
+            {
+                ExportPath = filePath,
+                StartTime = DateTime.Now,
+                Sections = new List<string>()
+            };
+
+            try
+            {
+                var diagnosticData = new DiagnosticData
+                {
+                    ExportTimestamp = DateTime.Now,
+                    OmenCoreVersion = GetOmenCoreVersion(),
+                    Sections = new Dictionary<string, object>()
+                };
+
+                // Collect system information
+                if (IncludeSystemInfoCheck.IsChecked == true)
+                {
+                    UpdateProgress("Collecting system information...", 10);
+                    diagnosticData.Sections["SystemInfo"] = await CollectSystemInfoAsync(ct);
+                    result.Sections.Add("System Information");
+                }
+
+                // Collect hardware data
+                if (IncludeHardwareDataCheck.IsChecked == true)
+                {
+                    UpdateProgress("Collecting hardware monitoring data...", 30);
+                    diagnosticData.Sections["HardwareData"] = await CollectHardwareDataAsync(ct);
+                    result.Sections.Add("Hardware Monitoring Data");
+                }
+
+                // Collect logs
+                if (IncludeLogsCheck.IsChecked == true)
+                {
+                    UpdateProgress("Collecting application logs...", 50);
+                    diagnosticData.Sections["Logs"] = await CollectLogsAsync(ct);
+                    result.Sections.Add("Application Logs");
+                }
+
+                // Collect settings
+                if (IncludeSettingsCheck.IsChecked == true)
+                {
+                    UpdateProgress("Collecting settings and configuration...", 70);
+                    diagnosticData.Sections["Settings"] = CollectSettings();
+                    result.Sections.Add("Settings & Configuration");
+                }
+
+                // Collect performance data
+                if (IncludePerformanceDataCheck.IsChecked == true)
+                {
+                    UpdateProgress("Collecting performance mode data...", 85);
+                    diagnosticData.Sections["PerformanceData"] = CollectPerformanceData();
+                    result.Sections.Add("Performance Mode Data");
+                }
+
+                UpdateProgress("Collecting core control readiness...", 90);
+                diagnosticData.Sections["CoreControlReadiness"] = CollectCoreControlReadinessData();
+                result.Sections.Add("Core Control Readiness");
+
+                // Collect fan calibration
+                if (IncludeFanCalibrationCheck.IsChecked == true)
+                {
+                    UpdateProgress("Collecting fan calibration data...", 95);
+                    diagnosticData.Sections["FanCalibration"] = CollectFanCalibrationData();
+                    result.Sections.Add("Fan Calibration Data");
+                }
+
+                // Optional: Run quick fan verification to check 'Max' preset application
+                if (IncludeFanVerificationCheck.IsChecked == true)
+                {
+                    UpdateProgress("Running fan Max verification...", 96);
+                    try
+                    {
+                        if (_fanService != null)
+                        {
+                            var (success, details) = _fanService.VerifyMaxApplied();
+                            diagnosticData.Sections["FanVerification"] = new FanVerificationData
+                            {
+                                CollectionTimestamp = DateTime.Now,
+                                Success = success,
+                                Details = details
+                            };
+                            result.Sections.Add("Fan Verification");
+                        }
+                        else
+                        {
+                            diagnosticData.Sections["FanVerification"] = new FanVerificationData
+                            {
+                                CollectionTimestamp = DateTime.Now,
+                                Success = false,
+                                Details = "Fan service not available"
+                            };
+                            result.Sections.Add("Fan Verification");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        diagnosticData.Sections["FanVerification"] = new FanVerificationData
+                        {
+                            CollectionTimestamp = DateTime.Now,
+                            Success = false,
+                            Details = $"Verification failed: {ex.Message}"
+                        };
+                        result.Sections.Add("Fan Verification");
+                    }
+                }
+
+                // Anonymize if requested
+                if (AnonymizeDataCheck.IsChecked == true)
+                {
+                    UpdateProgress("Anonymizing data...", 98);
+                    AnonymizeData(diagnosticData);
+                }
+
+                // Save to file
+                UpdateProgress("Saving diagnostic file...", 99);
+                await SaveDiagnosticDataAsync(diagnosticData, filePath, ct);
+
+                result.EndTime = DateTime.Now;
+                result.Success = true;
+                result.FileSize = new FileInfo(filePath).Length;
+
+                UpdateProgress("Export completed successfully", 100);
+            }
+            catch (Exception ex)
+            {
+                result.Success = false;
+                result.ErrorMessage = ex.Message;
+                throw;
+            }
+
+            return result;
+        }
+
+        private void UpdateProgress(string message, int percentage)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                ProgressText.Text = message;
+                ExportProgress.Value = percentage;
+            });
+        }
+
+        private Task<SystemInfoData> CollectSystemInfoAsync(CancellationToken ct)
+        {
+            var systemInfo = new SystemInfoData();
+
+            try
+            {
+                // OS Information
+                systemInfo.OperatingSystem = Environment.OSVersion.ToString();
+                systemInfo.Platform = RuntimeInformation.OSDescription;
+                systemInfo.Is64Bit = Environment.Is64BitOperatingSystem;
+
+                // Hardware Information
+                systemInfo.ProcessorCount = Environment.ProcessorCount;
+                systemInfo.MachineName = AnonymizeDataCheck.IsChecked == true ? "[REDACTED]" : Environment.MachineName;
+                systemInfo.UserName = AnonymizeDataCheck.IsChecked == true ? "[REDACTED]" : Environment.UserName;
+
+                // .NET Information
+                systemInfo.DotNetVersion = RuntimeInformation.FrameworkDescription;
+                systemInfo.RuntimeIdentifier = RuntimeInformation.RuntimeIdentifier;
+
+                // Process Information
+                var currentProcess = Process.GetCurrentProcess();
+                systemInfo.ProcessId = currentProcess.Id;
+                systemInfo.ProcessStartTime = currentProcess.StartTime;
+                systemInfo.WorkingSet = currentProcess.WorkingSet64;
+
+                // Drive Information
+                var drives = DriveInfo.GetDrives();
+                systemInfo.Drives = drives.Select(d => new DriveData
+                {
+                    Name = d.Name,
+                    DriveType = d.DriveType.ToString(),
+                    TotalSize = d.TotalSize,
+                    AvailableFreeSpace = d.AvailableFreeSpace,
+                    IsReady = d.IsReady
+                }).ToList();
+
+                // Environment Variables (filtered for privacy)
+                var safeEnvVars = new[] { "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "NUMBER_OF_PROCESSORS" };
+                systemInfo.EnvironmentVariables = Environment.GetEnvironmentVariables()
+                    .Cast<System.Collections.DictionaryEntry>()
+                    .Where(e => safeEnvVars.Contains(e.Key.ToString()))
+                    .ToDictionary(e => e.Key.ToString()!, e => e.Value?.ToString() ?? "");
+
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to collect system info: {ex.Message}");
+                systemInfo.ErrorMessage = ex.Message;
+            }
+
+            return Task.FromResult(systemInfo);
+        }
+
+        private async Task<HardwareData> CollectHardwareDataAsync(CancellationToken ct)
+        {
+            var hardwareData = new HardwareData
+            {
+                CollectionTimestamp = DateTime.Now,
+                Sensors = new List<SensorData>()
+            };
+
+            try
+            {
+                if (_hardwareService != null)
+                {
+                    // Collect current sensor readings
+                    var sensors = await _hardwareService.GetAllSensorDataAsync();
+
+                    foreach (var sensor in sensors)
+                    {
+                        hardwareData.Sensors.Add(new SensorData
+                        {
+                            Name = sensor.Name,
+                            Type = sensor.Type.ToString(),
+                            Value = (float)sensor.Value,
+                            MinValue = (float)sensor.MinValue,
+                            MaxValue = (float)sensor.MaxValue,
+                            Unit = sensor.Unit
+                        });
+                    }
+                }
+                else
+                {
+                    hardwareData.ErrorMessage = "Hardware monitoring service not available";
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to collect hardware data: {ex.Message}");
+                hardwareData.ErrorMessage = ex.Message;
+            }
+
+            return hardwareData;
+        }
+
+        private Task<LogData> CollectLogsAsync(CancellationToken ct)
+        {
+            var logData = new LogData
+            {
+                CollectionTimestamp = DateTime.Now,
+                Entries = new List<LogEntry>()
+            };
+
+            try
+            {
+                var logDir = _logging.LogDirectory;
+                if (!Directory.Exists(logDir))
+                {
+                    logData.ErrorMessage = $"Log directory not found: {logDir}";
+                    return Task.FromResult(logData);
+                }
+
+                // Collect up to 1000 lines from the most recent log files
+                var logFiles = Directory.GetFiles(logDir, "OmenCore*.log")
+                    .OrderByDescending(f => File.GetLastWriteTime(f))
+                    .Take(3)
+                    .ToList();
+
+                const int maxLines = 1000;
+                var lines = new List<string>(maxLines);
+
+                foreach (var file in logFiles)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    try
+                    {
+                        // FileShare.ReadWrite allows reading while logger is still writing
+                        using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                        using var reader = new StreamReader(fs);
+                        var fileLines = new List<string>();
+                        string? line;
+                        while ((line = reader.ReadLine()) != null)
+                            fileLines.Add(line);
+                        // Newest file first — prepend its lines
+                        lines.InsertRange(0, fileLines);
+                        if (lines.Count >= maxLines) break;
+                    }
+                    catch (IOException)
+                    {
+                        // Skip locked or inaccessible files
+                    }
+                }
+
+                // Keep only the last maxLines lines
+                var trimmed = lines.Count > maxLines ? lines.Skip(lines.Count - maxLines).ToList() : lines;
+
+                foreach (var raw in trimmed)
+                {
+                    // Format: "2026-03-01T14:23:45.1234567+00:00 [INFO] message"
+                    var entry = new LogEntry { Level = "INFO", Message = raw };
+                    var bracketIdx = raw.IndexOf(" [", StringComparison.Ordinal);
+                    if (bracketIdx > 0 && DateTime.TryParse(raw[..bracketIdx], out var ts))
+                    {
+                        entry.Timestamp = ts;
+                        var closeIdx = raw.IndexOf(']', bracketIdx + 2);
+                        if (closeIdx > bracketIdx)
+                        {
+                            entry.Level = raw.Substring(bracketIdx + 2, closeIdx - bracketIdx - 2);
+                            entry.Message = closeIdx + 2 < raw.Length ? raw[(closeIdx + 2)..] : string.Empty;
+                        }
+                    }
+                    logData.Entries.Add(entry);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to collect logs: {ex.Message}");
+                logData.ErrorMessage = ex.Message;
+            }
+
+            return Task.FromResult(logData);
+        }
+
+        private SettingsData CollectSettings()
+        {
+            var settingsData = new SettingsData
+            {
+                CollectionTimestamp = DateTime.Now,
+                Settings = new Dictionary<string, object>()
+            };
+
+            try
+            {
+                // Collect basic settings - this would need access to the actual settings storage
+                settingsData.Settings["ExportTimestamp"] = DateTime.Now;
+                settingsData.Settings["Anonymized"] = AnonymizeDataCheck.IsChecked ?? false;
+                settingsData.Settings["IncludedSections"] = new[]
+                {
+                    IncludeSystemInfoCheck.IsChecked ?? false,
+                    IncludeHardwareDataCheck.IsChecked ?? false,
+                    IncludeLogsCheck.IsChecked ?? false,
+                    IncludeSettingsCheck.IsChecked ?? false,
+                    IncludePerformanceDataCheck.IsChecked ?? false,
+                    IncludeFanCalibrationCheck.IsChecked ?? false
+                };
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to collect settings: {ex.Message}");
+                settingsData.ErrorMessage = ex.Message;
+            }
+
+            return settingsData;
+        }
+
+        private PerformanceData CollectPerformanceData()
+        {
+            var performanceData = new PerformanceData
+            {
+                CollectionTimestamp = DateTime.Now
+            };
+
+            try
+            {
+                if (_performanceService != null)
+                {
+                    performanceData.CurrentMode = _performanceService.CurrentMode?.ToString() ?? "Unknown";
+                    performanceData.AvailableModes = _performanceService.GetAvailableModes()
+                        .Select(m => m.ToString())
+                        .ToArray();
+                }
+                else
+                {
+                    performanceData.ErrorMessage = "Performance mode service not available";
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to collect performance data: {ex.Message}");
+                performanceData.ErrorMessage = ex.Message;
+            }
+
+            return performanceData;
+        }
+
+        private CoreControlReadinessData CollectCoreControlReadinessData()
+        {
+            var data = new CoreControlReadinessData
+            {
+                CollectionTimestamp = DateTime.Now
+            };
+
+            try
+            {
+                data.Fan = CollectFanReadinessData();
+                data.Rgb = CollectRgbReadinessData();
+                data.Tuning = CollectTuningReadinessData();
+                data.Monitoring = CollectMonitoringReadinessData();
+                data.Hotkeys = CollectHotkeyReadinessData();
+                data.SuggestedValidationActions = BuildSuggestedValidationActions(data);
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to collect core control readiness: {ex.Message}");
+                data.ErrorMessage = ex.Message;
+            }
+
+            return data;
+        }
+
+        private FanReadinessData CollectFanReadinessData()
+        {
+            var data = new FanReadinessData();
+
+            if (_fanService == null)
+            {
+                data.Status = "Fan service unavailable";
+                return data;
+            }
+
+            var history = _fanService.GetCommandHistorySnapshot();
+            var last = history.LastOrDefault();
+
+            data.Status = _fanService.FanWritesAvailable ? "Fan writes available" : "Fan writes unavailable";
+            data.Backend = _fanService.Backend;
+            data.WritesAvailable = _fanService.FanWritesAvailable;
+            data.ManualDirectAvailable = _fanService.ManualFanControlAvailable;
+            data.CurvesAvailable = _fanService.FanCurvesAvailable;
+            data.CurrentMode = _fanService.GetCurrentFanMode() ?? "Unknown";
+            data.ActivePreset = _fanService.ActivePresetName ?? "None";
+            data.CurveActive = _fanService.IsCurveActive;
+            data.HoldActive = _fanService.IsHoldActive;
+            data.DiagnosticModeActive = _fanService.IsDiagnosticModeActive;
+            data.ThermalProtectionActive = _fanService.IsThermalProtectionActive;
+            data.CommandHistoryCount = history.Count;
+
+            if (last != null)
+            {
+                data.LastCommand = $"{last.TimestampUtc:O} | {(last.Success ? "OK" : "FAIL")} | {last.Command} -> {last.Target}";
+                data.LastCommandDetail = last.Details;
+                data.LastCommandModel = $"{FormatDiagnosticValue(last.ModelName)} ({FormatDiagnosticValue(last.ProductId)})";
+                data.LastCommandGates = $"writes={FormatDiagnosticBool(last.FanWritesAvailable)}; curves={FormatDiagnosticBool(last.FanCurvesAvailable)}; manual={FormatDiagnosticBool(last.ManualFanControlAvailable)}; desktopBlocked={FormatDiagnosticBool(last.DesktopFanWritesBlocked)}";
+                data.LastCommandReadback = $"{FormatDiagnosticValue(last.TelemetrySummary)}; rawPrimaryRpm={FormatDiagnosticNullableInt(last.RawPrimaryFanRpm)}; reportedPrimaryDuty={FormatDiagnosticNullableInt(last.ReportedPrimaryFanDutyPercent)}";
+            }
+
+            return data;
+        }
+
+        private static string FormatDiagnosticBool(bool value) => value ? "yes" : "no";
+
+        private static string FormatDiagnosticValue(string? value) =>
+            string.IsNullOrWhiteSpace(value) ? "not set" : value.Trim();
+
+        private static string FormatDiagnosticDate(DateTime? value) =>
+            value.HasValue ? value.Value.ToUniversalTime().ToString("O") : "never";
+
+        private static string FormatDiagnosticNullableInt(int? value) =>
+            value.HasValue ? value.Value.ToString() : "not set";
+
+        private RgbReadinessData CollectRgbReadinessData()
+        {
+            var observed = _configService?.Config?.KeyboardLighting ?? new KeyboardLightingSettings();
+            if (_keyboardLightingService == null)
+            {
+                return new RgbReadinessData
+                {
+                    Status = "Keyboard lighting service unavailable",
+                    ObservedSurface = FormatDiagnosticValue(observed.ObservedSurface),
+                    ObservedAtUtc = FormatDiagnosticDate(observed.ObservedAtUtc),
+                    ObservedProbeColor = FormatDiagnosticValue(observed.ObservedProbeColorHex),
+                    ObservedBackend = FormatDiagnosticValue(observed.ObservedBackend),
+                    ObservedApplyStatus = FormatDiagnosticValue(observed.ObservedApplyStatus)
+                };
+            }
+
+            return new RgbReadinessData
+            {
+                Status = _keyboardLightingService.IsAvailable ? "Keyboard lighting backend available" : "Keyboard lighting unavailable",
+                HpKeyboardAvailable = _keyboardLightingService.IsAvailable,
+                HpKeyboardBackend = _keyboardLightingService.BackendType,
+                HpKeyboardPerKeyActive = _keyboardLightingService.IsPerKey,
+                HpKeyboardPerKeyCapableHardware = _keyboardLightingService.IsPerKeyCapableHardware,
+                LastApplySurface = _keyboardLightingService.LastApplySurface,
+                LastApplyStatus = _keyboardLightingService.LastApplyStatus,
+                ObservedSurface = FormatDiagnosticValue(observed.ObservedSurface),
+                ObservedAtUtc = FormatDiagnosticDate(observed.ObservedAtUtc),
+                ObservedProbeColor = FormatDiagnosticValue(observed.ObservedProbeColorHex),
+                ObservedBackend = FormatDiagnosticValue(observed.ObservedBackend),
+                ObservedApplyStatus = FormatDiagnosticValue(observed.ObservedApplyStatus),
+                ProbeGuidance = "Apply one safe static test color and record whether keyboard zones, per-key keys, light bar, or only backlight changed."
+            };
+        }
+
+        private TuningReadinessData CollectTuningReadinessData()
+        {
+            var data = new TuningReadinessData();
+
+            if (_performanceService == null)
+            {
+                data.Status = "Performance/tuning service unavailable";
+                return data;
+            }
+
+            try
+            {
+                var trace = _performanceService.GetApplyTraceSnapshot();
+                data.Status = "Performance mode service available";
+                data.CurrentMode = _performanceService.CurrentMode?.ToString() ?? "Unknown";
+                data.AvailableModes = _performanceService.GetAvailableModes()
+                    .Select(m => m.ToString())
+                    .ToArray();
+                data.ApplyTraceCount = trace.Count;
+                data.RecentApplyTrace = trace
+                    .TakeLast(5)
+                    .Select(entry => $"{entry.TimestampUtc:O} | requested={entry.RequestedModeName} | effective={entry.EffectiveModeName} | ecPowerApplied={entry.EcPowerLimitApplied} | wmiFallbackApplied={entry.WmiPolicyFallbackApplied} | fanAction={entry.FanPolicyAction} | evidence={entry.ApplicationEvidence}")
+                    .ToArray();
+                data.ReadbackRule = "Treat tuning as verified only when requested value, readback value, and locked/unsupported state are visible after apply.";
+            }
+            catch (Exception ex)
+            {
+                data.Status = "Performance/tuning readiness failed";
+                data.ErrorMessage = ex.Message;
+            }
+
+            return data;
+        }
+
+        private MonitoringReadinessData CollectMonitoringReadinessData()
+        {
+            if (_hardwareService == null)
+            {
+                return new MonitoringReadinessData
+                {
+                    Status = "Hardware monitoring service unavailable"
+                };
+            }
+
+            return new MonitoringReadinessData
+            {
+                Status = _hardwareService.HealthStatus.ToString(),
+                Source = _hardwareService.MonitoringSource,
+                LastSampleAgeSeconds = double.IsInfinity(_hardwareService.LastSampleAge.TotalSeconds)
+                    ? "never"
+                    : _hardwareService.LastSampleAge.TotalSeconds.ToString("F1"),
+                CadenceReason = _hardwareService.CurrentCadenceReason,
+                LowOverheadMode = _hardwareService.LowOverheadMode
+            };
+        }
+
+        private HotkeyReadinessData CollectHotkeyReadinessData()
+        {
+            var data = new HotkeyReadinessData();
+
+            if (_hotkeyService == null)
+            {
+                data.HotkeyStatus = "Hotkey service unavailable";
+            }
+            else
+            {
+                var hotkeys = _hotkeyService.GetDiagnosticSnapshot();
+                data.HotkeyStatus = hotkeys.Enabled ? "Hotkeys enabled" : "Hotkeys disabled";
+                data.WindowHandleReady = hotkeys.WindowHandleReady;
+                data.RegisteredHotkeyCount = hotkeys.RegisteredCount;
+                data.PendingHotkeyCount = hotkeys.PendingCount;
+                data.RegisteredHotkeys = hotkeys.RegisteredBindings
+                    .Select(binding => $"{binding.Action}: {binding.Chord}")
+                    .ToArray();
+                data.PendingHotkeys = hotkeys.PendingBindings
+                    .Select(binding => $"{binding.Action}: {binding.Chord}")
+                    .ToArray();
+            }
+
+            if (_omenKeyService == null)
+            {
+                data.OmenKeyStatus = "OMEN key service unavailable";
+            }
+            else
+            {
+                var omenKey = _omenKeyService.GetDiagnosticSnapshot();
+                data.OmenKeyStatus = omenKey.Enabled ? "OMEN key interception enabled" : "OMEN key interception disabled";
+                data.OmenKeyAction = omenKey.Action.ToString();
+                data.OmenKeyHookActive = omenKey.HookActive;
+                data.OmenKeyWmiWatcherActive = omenKey.WmiWatcherActive;
+                data.OmenKeyStrictMode = omenKey.StrictMode;
+                data.FirmwareFnPProfileCycleEnabled = omenKey.FirmwareFnPProfileCycleEnabled;
+                data.LastNeverInterceptKey = omenKey.LastNeverInterceptAgeMs.HasValue
+                    ? $"vk=0x{omenKey.LastNeverInterceptVkCode:X2}; scan=0x{omenKey.LastNeverInterceptScanCode:X4}; ageMs={omenKey.LastNeverInterceptAgeMs.Value:F0}"
+                    : "None";
+            }
+
+            data.ValidationGuidance = "Press the physical OMEN key and profile-cycle hotkey once, then verify the expected hook/WMI source appears in logs.";
+            return data;
+        }
+
+        private static string[] BuildSuggestedValidationActions(CoreControlReadinessData data)
+        {
+            var actions = new List<string>();
+
+            actions.Add(data.Fan.WritesAvailable
+                ? "Fan: Restore OEM Auto, then test Max, Direct 40/60/80%, Auto, and a curve ramp while watching RPM/level readback."
+                : "Fan: export model identity/backend status before enabling manual or curve controls.");
+            actions.Add("RGB: apply one safe obvious static color and record which physical surface changed.");
+            actions.Add("Tuning: apply one setting at a time and capture requested/readback/locked state after each apply.");
+            actions.Add("Hotkeys: test Ctrl+Shift profile/fan hotkeys plus the physical OMEN key and confirm hook/WMI source.");
+            actions.Add("Startup restore: keep disabled until manual readback passes for fan/performance/RGB/tuning on this model.");
+
+            return actions.ToArray();
+        }
+
+        private FanCalibrationData CollectFanCalibrationData()
+        {
+            var calibrationData = new FanCalibrationData
+            {
+                CollectionTimestamp = DateTime.Now,
+                CalibratedModels = new List<string>()
+            };
+
+            try
+            {
+                if (_calibrationService != null)
+                {
+                    calibrationData.CalibratedModels = _calibrationService.GetCalibratedModels().ToList();
+                    calibrationData.HasCalibrations = calibrationData.CalibratedModels.Count > 0;
+                }
+                else
+                {
+                    calibrationData.ErrorMessage = "Fan calibration service not available";
+                }
+            }
+            catch (Exception ex)
+            {
+                _logging.Warn($"Failed to collect fan calibration data: {ex.Message}");
+                calibrationData.ErrorMessage = ex.Message;
+            }
+
+            return calibrationData;
+        }
+
+        private void AnonymizeData(DiagnosticData data)
+        {
+            // Remove or redact sensitive information
+            if (data.Sections.ContainsKey("SystemInfo"))
+            {
+                var systemInfo = data.Sections["SystemInfo"] as SystemInfoData;
+                if (systemInfo != null)
+                {
+                    systemInfo.MachineName = "[REDACTED]";
+                    systemInfo.UserName = "[REDACTED]";
+                }
+            }
+        }
+
+        private async Task SaveDiagnosticDataAsync(DiagnosticData data, string filePath, CancellationToken ct)
+        {
+            if (CompressedFormatRadio.IsChecked == true)
+            {
+                // Save as compressed JSON
+                var json = JsonSerializer.Serialize(data, new JsonSerializerOptions
+                {
+                    WriteIndented = true
+                });
+
+                // For now, just save as JSON - compression would require additional libraries
+                await File.WriteAllTextAsync(filePath + ".json", json, ct);
+            }
+            else if (TextFormatRadio.IsChecked == true)
+            {
+                // Save as human-readable text
+                var textContent = GenerateTextReport(data);
+                await File.WriteAllTextAsync(filePath + ".txt", textContent, ct);
+            }
+            else
+            {
+                // Save as JSON (default)
+                var json = JsonSerializer.Serialize(data, new JsonSerializerOptions
+                {
+                    WriteIndented = true
+                });
+                await File.WriteAllTextAsync(filePath + ".json", json, ct);
+            }
+        }
+
+        private string GenerateTextReport(DiagnosticData data)
+        {
+            var report = new System.Text.StringBuilder();
+            report.AppendLine("==================================================");
+            report.AppendLine("OmenCore Diagnostic Report");
+            report.AppendLine($"Generated : {data.ExportTimestamp:O}");
+            report.AppendLine($"Version   : {data.OmenCoreVersion}");
+            report.AppendLine("==================================================");
+            report.AppendLine();
+
+            foreach (var kvp in data.Sections)
+            {
+                report.AppendLine($"--- {kvp.Key} ---");
+                try
+                {
+                    // Re-serialize the section value for readable text output
+                    var json = JsonSerializer.Serialize(kvp.Value, new JsonSerializerOptions { WriteIndented = true });
+                    report.AppendLine(json);
+                }
+                catch
+                {
+                    report.AppendLine(kvp.Value?.ToString() ?? "(null)");
+                }
+                report.AppendLine();
+            }
+
+            return report.ToString();
+        }
+
+        private void DisplayExportResults(DiagnosticExportResult result)
+        {
+            ResultsGroup.Visibility = Visibility.Visible;
+            OpenExportFolderButton.Visibility = Visibility.Visible;
+            CopyPathButton.Visibility = Visibility.Visible;
+
+            if (result.Success)
+            {
+                ResultsText.Text = "Export completed successfully";
+                ResultsText.Foreground = System.Windows.Media.Brushes.Green;
+                FilePathText.Text = $"File saved to: {result.ExportPath}";
+                FileSizeText.Text = $"File size: {FormatFileSize(result.FileSize)}";
+                ExportSummaryText.Text = $"Contains: {string.Join(", ", result.Sections)}";
+            }
+            else
+            {
+                ResultsText.Text = $"Export failed: {result.ErrorMessage}";
+                ResultsText.Foreground = System.Windows.Media.Brushes.Red;
+            }
+        }
+
+        private string GetFileFilter()
+        {
+            if (CompressedFormatRadio.IsChecked == true)
+                return "ZIP files (*.zip)|*.zip";
+            else if (TextFormatRadio.IsChecked == true)
+                return "Text files (*.txt)|*.txt";
+            else
+                return "JSON files (*.json)|*.json";
+        }
+
+        private string GetDefaultExtension()
+        {
+            if (CompressedFormatRadio.IsChecked == true)
+                return ".zip";
+            else if (TextFormatRadio.IsChecked == true)
+                return ".txt";
+            else
+                return ".json";
+        }
+
+        private string GetOmenCoreVersion()
+        {
+            return AppVersionProvider.GetVersionString();
+        }
+
+        private static string FormatFileSize(long bytes)
+        {
+            string[] sizes = { "B", "KB", "MB", "GB" };
+            int order = 0;
+            double size = bytes;
+
+            while (size >= 1024 && order < sizes.Length - 1)
+            {
+                order++;
+                size /= 1024;
+            }
+
+            return $"{size:F1} {sizes[order]}";
+        }
+
+        private void CancelExportButton_Click(object sender, RoutedEventArgs e)
+        {
+            _exportCts?.Cancel();
+        }
+
+        private void OpenExportFolderButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (!string.IsNullOrEmpty(_lastExportPath))
+            {
+                var directory = Path.GetDirectoryName(_lastExportPath);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = directory,
+                        UseShellExecute = true
+                    });
+                }
+            }
+        }
+
+        private void CopyPathButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (!string.IsNullOrEmpty(_lastExportPath))
+            {
+                Clipboard.SetText(_lastExportPath);
+                MessageBox.Show("File path copied to clipboard", "Copied", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+
+        private void CreateGitHubIssueButton_Click(object sender, RoutedEventArgs e)
+        {
+            var issueUrl = "https://github.com/theantipopau/omencore/issues/new?" +
+                "title=" + Uri.EscapeDataString("[BUG] Issue with OmenCore") +
+                "&body=" + Uri.EscapeDataString(GenerateGitHubIssueTemplate());
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = issueUrl,
+                UseShellExecute = true
+            });
+        }
+
+        private string GenerateGitHubIssueTemplate()
+        {
+            return $@"**Describe the issue**
+A clear and concise description of what the problem is.
+
+**Steps to reproduce**
+1. Go to '...'
+2. Click on '....'
+3. See error
+
+**Expected behavior**
+A clear and concise description of what you expected to happen.
+
+**Screenshots**
+If applicable, add screenshots to help explain your problem.
+
+**Diagnostic Information**
+Please attach a diagnostic export file created using OmenCore's diagnostic export feature.
+
+**System Information**
+- OmenCore Version: {GetOmenCoreVersion()}
+- OS: {Environment.OSVersion}
+- Hardware: [Your laptop model]
+
+**Additional context**
+Add any other context about the problem here.
+
+---
+*This issue was created using OmenCore's diagnostic export feature.*";
+        }
+    }
+
+    // Data classes for diagnostic export
+    public class DiagnosticData
+    {
+        public DateTime ExportTimestamp { get; set; }
+        public string OmenCoreVersion { get; set; } = "";
+        public Dictionary<string, object> Sections { get; set; } = new();
+    }
+
+    public class DiagnosticExportResult
+    {
+        public string ExportPath { get; set; } = "";
+        public DateTime StartTime { get; set; }
+        public DateTime EndTime { get; set; }
+        public bool Success { get; set; }
+        public long FileSize { get; set; }
+        public List<string> Sections { get; set; } = new();
+        public string? ErrorMessage { get; set; }
+    }
+
+    public class SystemInfoData
+    {
+        public string OperatingSystem { get; set; } = "";
+        public string Platform { get; set; } = "";
+        public bool Is64Bit { get; set; }
+        public int ProcessorCount { get; set; }
+        public string MachineName { get; set; } = "";
+        public string UserName { get; set; } = "";
+        public string DotNetVersion { get; set; } = "";
+        public string RuntimeIdentifier { get; set; } = "";
+        public int ProcessId { get; set; }
+        public DateTime ProcessStartTime { get; set; }
+        public long WorkingSet { get; set; }
+        public List<DriveData> Drives { get; set; } = new();
+        public Dictionary<string, string> EnvironmentVariables { get; set; } = new();
+        public string? ErrorMessage { get; set; }
+    }
+
+    public class DriveData
+    {
+        public string Name { get; set; } = "";
+        public string DriveType { get; set; } = "";
+        public long TotalSize { get; set; }
+        public long AvailableFreeSpace { get; set; }
+        public bool IsReady { get; set; }
+    }
+
+    public class HardwareData
+    {
+        public DateTime CollectionTimestamp { get; set; }
+        public List<SensorData> Sensors { get; set; } = new();
+        public string? ErrorMessage { get; set; }
+    }
+
+    public class SensorData
+    {
+        public string Name { get; set; } = "";
+        public string Type { get; set; } = "";
+        public float Value { get; set; }
+        public float MinValue { get; set; }
+        public float MaxValue { get; set; }
+        public string Unit { get; set; } = "";
+    }
+
+    public class LogData
+    {
+        public DateTime CollectionTimestamp { get; set; }
+        public List<LogEntry> Entries { get; set; } = new();
+        public string? ErrorMessage { get; set; }
+    }
+
+    public class LogEntry
+    {
+        public DateTime Timestamp { get; set; }
+        public string Level { get; set; } = "";
+        public string Message { get; set; } = "";
+    }
+
+    public class SettingsData
+    {
+        public DateTime CollectionTimestamp { get; set; }
+        public Dictionary<string, object> Settings { get; set; } = new();
+        public string? ErrorMessage { get; set; }
+    }
+
+    public class PerformanceData
+    {
+        public DateTime CollectionTimestamp { get; set; }
+        public string CurrentMode { get; set; } = "";
+        public string[] AvailableModes { get; set; } = Array.Empty<string>();
+        public string? ErrorMessage { get; set; }
+    }
+
+    public class FanCalibrationData
+    {
+        public DateTime CollectionTimestamp { get; set; }
+        public List<string> CalibratedModels { get; set; } = new();
+        public bool HasCalibrations { get; set; }
+        public string? ErrorMessage { get; set; }
+    }
+
+    public class CoreControlReadinessData
+    {
+        public DateTime CollectionTimestamp { get; set; }
+        public FanReadinessData Fan { get; set; } = new();
+        public RgbReadinessData Rgb { get; set; } = new();
+        public TuningReadinessData Tuning { get; set; } = new();
+        public MonitoringReadinessData Monitoring { get; set; } = new();
+        public HotkeyReadinessData Hotkeys { get; set; } = new();
+        public string[] SuggestedValidationActions { get; set; } = Array.Empty<string>();
+        public string? ErrorMessage { get; set; }
+    }
+
+    public class FanReadinessData
+    {
+        public string Status { get; set; } = "";
+        public string Backend { get; set; } = "";
+        public bool WritesAvailable { get; set; }
+        public bool ManualDirectAvailable { get; set; }
+        public bool CurvesAvailable { get; set; }
+        public string CurrentMode { get; set; } = "";
+        public string ActivePreset { get; set; } = "";
+        public bool CurveActive { get; set; }
+        public bool HoldActive { get; set; }
+        public bool DiagnosticModeActive { get; set; }
+        public bool ThermalProtectionActive { get; set; }
+        public int CommandHistoryCount { get; set; }
+        public string LastCommand { get; set; } = "None";
+        public string LastCommandDetail { get; set; } = "";
+        public string LastCommandModel { get; set; } = "not set";
+        public string LastCommandGates { get; set; } = "";
+        public string LastCommandReadback { get; set; } = "";
+    }
+
+    public class RgbReadinessData
+    {
+        public string Status { get; set; } = "";
+        public bool HpKeyboardAvailable { get; set; }
+        public string HpKeyboardBackend { get; set; } = "";
+        public bool HpKeyboardPerKeyActive { get; set; }
+        public bool HpKeyboardPerKeyCapableHardware { get; set; }
+        public string LastApplySurface { get; set; } = "";
+        public string LastApplyStatus { get; set; } = "";
+        public string ObservedSurface { get; set; } = "";
+        public string ObservedAtUtc { get; set; } = "";
+        public string ObservedProbeColor { get; set; } = "";
+        public string ObservedBackend { get; set; } = "";
+        public string ObservedApplyStatus { get; set; } = "";
+        public string ProbeGuidance { get; set; } = "";
+    }
+
+    public class TuningReadinessData
+    {
+        public string Status { get; set; } = "";
+        public string CurrentMode { get; set; } = "";
+        public string[] AvailableModes { get; set; } = Array.Empty<string>();
+        public int ApplyTraceCount { get; set; }
+        public string[] RecentApplyTrace { get; set; } = Array.Empty<string>();
+        public string ReadbackRule { get; set; } = "";
+        public string? ErrorMessage { get; set; }
+    }
+
+    public class MonitoringReadinessData
+    {
+        public string Status { get; set; } = "";
+        public string Source { get; set; } = "";
+        public string LastSampleAgeSeconds { get; set; } = "";
+        public string CadenceReason { get; set; } = "";
+        public bool LowOverheadMode { get; set; }
+    }
+
+    public class HotkeyReadinessData
+    {
+        public string HotkeyStatus { get; set; } = "";
+        public bool WindowHandleReady { get; set; }
+        public int RegisteredHotkeyCount { get; set; }
+        public int PendingHotkeyCount { get; set; }
+        public string[] RegisteredHotkeys { get; set; } = Array.Empty<string>();
+        public string[] PendingHotkeys { get; set; } = Array.Empty<string>();
+        public string OmenKeyStatus { get; set; } = "";
+        public string OmenKeyAction { get; set; } = "";
+        public bool OmenKeyHookActive { get; set; }
+        public bool OmenKeyWmiWatcherActive { get; set; }
+        public bool OmenKeyStrictMode { get; set; }
+        public bool FirmwareFnPProfileCycleEnabled { get; set; }
+        public string LastNeverInterceptKey { get; set; } = "";
+        public string ValidationGuidance { get; set; } = "";
+    }
+
+    public class FanVerificationData
+    {
+        public DateTime CollectionTimestamp { get; set; }
+        public bool Success { get; set; }
+        public string Details { get; set; } = "";
+    }
+}

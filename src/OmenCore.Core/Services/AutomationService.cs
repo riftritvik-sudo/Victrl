@@ -1,0 +1,634 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using OmenCore.Hardware;
+using OmenCore.Models;
+using OmenCore.Services.Diagnostics;
+using OmenCore.Utils;
+
+namespace OmenCore.Services
+{
+    /// <summary>
+    /// Evaluates and executes automation rules based on system conditions.
+    /// Runs background worker that checks all active rules every 5 seconds.
+    /// </summary>
+    public class AutomationService : IDisposable
+    {
+        private readonly LoggingService _logger;
+        private readonly ConfigurationService _configService;
+        private readonly FanService _fanService;
+        private readonly ThermalSensorProvider? _thermalProvider;
+        private readonly NvapiService? _nvapiService;
+        private readonly UndervoltService? _undervoltService;
+        private readonly PerformanceModeService? _performanceModeService;
+        private readonly ProcessMonitoringService _processMonitor;
+        
+        private readonly System.Threading.Timer _evaluationTimer;
+        private readonly HashSet<string> _activeRules = new();
+        private readonly object _lock = new();
+        private bool _isRunning;
+        private int _evaluationInProgress;
+
+        /// <summary>
+        /// Fired when a rule is triggered
+        /// </summary>
+        public event EventHandler<RuleTriggeredEventArgs>? RuleTriggered;
+
+        public AutomationService(
+            LoggingService logger,
+            ConfigurationService configService,
+            FanService fanService,
+            ProcessMonitoringService processMonitor,
+            ThermalSensorProvider? thermalProvider = null,
+            NvapiService? nvapiService = null,
+            UndervoltService? undervoltService = null,
+            PerformanceModeService? performanceModeService = null)
+        {
+            _logger = logger;
+            _configService = configService;
+            _fanService = fanService;
+            _thermalProvider = thermalProvider;
+            _nvapiService = nvapiService;
+            _undervoltService = undervoltService;
+            _performanceModeService = performanceModeService;
+            _processMonitor = processMonitor;
+            
+            _evaluationTimer = new System.Threading.Timer(EvaluateRules, null, Timeout.Infinite, Timeout.Infinite);
+        }
+
+        /// <summary>
+        /// Start automation service
+        /// </summary>
+        public void Start()
+        {
+            if (_isRunning)
+                return;
+
+            _isRunning = true;
+            _evaluationTimer.Change(TimeSpan.Zero, TimeSpan.FromSeconds(5)); // Evaluate every 5 seconds
+            BackgroundTimerRegistry.Register(
+                "AutomationEvaluation",
+                "AutomationService",
+                "Evaluates active automation rules against system conditions",
+                5000,
+                BackgroundTimerTier.Optional);
+            _logger.Info("Automation service started (5s interval)");
+        }
+
+        /// <summary>
+        /// Stop automation service
+        /// </summary>
+        public void Stop()
+        {
+            if (!_isRunning)
+                return;
+
+            _isRunning = false;
+            _evaluationTimer.Change(Timeout.Infinite, Timeout.Infinite);
+            BackgroundTimerRegistry.Unregister("AutomationEvaluation");
+            _logger.Info("Automation service stopped");
+        }
+
+        private void EvaluateRules(object? state)
+        {
+            if (!_isRunning)
+                return;
+
+            // Skip overlapping ticks: WMI trigger reads and rule actions can exceed the
+            // 5 s timer period, and System.Threading.Timer fires callbacks concurrently.
+            if (Interlocked.CompareExchange(ref _evaluationInProgress, 1, 0) != 0)
+                return;
+
+            try
+            {
+                var config = _configService.Config;
+                var enabledRules = config.AutomationRules
+                    .Where(r => r.Enabled)
+                    .OrderBy(r => r.Priority) // Lower priority number = higher priority
+                    .ToList();
+
+                // EvaluateProcessTrigger reads _processMonitor.ActiveProcesses, which only ever
+                // contains processes explicitly registered via TrackProcess() - previously only
+                // GameProfileService did that, so a Process-trigger rule for any executable that
+                // wasn't also a configured Game Profile would silently never fire. Register every
+                // enabled Process-trigger rule's executable here, every tick - TrackProcess() is an
+                // idempotent HashSet add, so re-registering an already-tracked name is a no-op, and
+                // this never un-tracks (matching GameProfileService's own never-untrack behavior),
+                // so it can't undo tracking another owner still relies on.
+                foreach (var processName in GetProcessTriggerExecutableNames(enabledRules))
+                {
+                    _processMonitor.TrackProcess(processName);
+                }
+
+                foreach (var rule in enabledRules)
+                {
+                    try
+                    {
+                        if (!AutomationRuleSchemaValidator.TryValidate(rule, out var validationError))
+                        {
+                            _logger.Warn($"Skipping automation rule '{rule.Name}': {validationError}");
+                            continue;
+                        }
+
+                        var shouldTrigger = EvaluateTrigger(rule);
+                        var ruleKey = rule.Id;
+
+                        lock (_lock)
+                        {
+                            var wasActive = _activeRules.Contains(ruleKey);
+
+                            if (shouldTrigger && !wasActive)
+                            {
+                                // Rule just became active - execute actions
+                                _activeRules.Add(ruleKey);
+                                ExecuteActions(rule);
+                                
+                                // Update statistics
+                                rule.LastTriggeredAt = DateTime.Now;
+                                rule.TriggerCount++;
+                                _configService.Save(config);
+
+                                RuleTriggered?.Invoke(this, new RuleTriggeredEventArgs(rule));
+                                
+                                _logger.Info($"Automation rule triggered: {rule.Name}");
+                            }
+                            else if (!shouldTrigger && wasActive)
+                            {
+                                // Rule is no longer active
+                                _activeRules.Remove(ruleKey);
+                                _logger.Debug($"Automation rule deactivated: {rule.Name}");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error($"Error evaluating automation rule {rule.Name}: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"Error in automation evaluation cycle: {ex.Message}");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _evaluationInProgress, 0);
+            }
+        }
+
+        /// <summary>
+        /// Pure helper (no hardware/service dependency, unit-testable in isolation): the distinct,
+        /// normalized set of executable names any enabled Process-trigger rule needs tracked.
+        /// </summary>
+        internal static IEnumerable<string> GetProcessTriggerExecutableNames(IEnumerable<AutomationRule> rules)
+        {
+            return rules
+                .Where(r => r.Enabled && r.Trigger == TriggerType.Process && !string.IsNullOrWhiteSpace(r.TriggerData?.ProcessName))
+                .Select(r => r.TriggerData.ProcessName!)
+                .Distinct(StringComparer.OrdinalIgnoreCase);
+        }
+
+        private bool EvaluateTrigger(AutomationRule rule)
+        {
+            return rule.Trigger switch
+            {
+                TriggerType.Time => EvaluateTimeTrigger(rule.TriggerData),
+                TriggerType.Battery => EvaluateBatteryTrigger(rule.TriggerData),
+                TriggerType.ACPower => EvaluateACPowerTrigger(rule.TriggerData),
+                TriggerType.Temperature => EvaluateTemperatureTrigger(rule.TriggerData),
+                TriggerType.Process => EvaluateProcessTrigger(rule.TriggerData),
+                TriggerType.Idle => EvaluateIdleTrigger(rule.TriggerData),
+                TriggerType.WiFiSSID => EvaluateWiFiTrigger(rule.TriggerData),
+                TriggerType.LidState => EvaluateLidTrigger(rule.TriggerData),
+                _ => false
+            };
+        }
+
+        private bool EvaluateTimeTrigger(TriggerConfig config)
+        {
+            if (!config.StartTime.HasValue || !config.EndTime.HasValue)
+                return false;
+
+            var now = DateTime.Now;
+            var currentTime = now.TimeOfDay;
+
+            // Check day of week filter
+            if (config.Days != null && config.Days.Count > 0)
+            {
+                if (!config.Days.Contains(now.DayOfWeek))
+                    return false;
+            }
+
+            var start = config.StartTime.Value;
+            var end = config.EndTime.Value;
+
+            // Handle time ranges that cross midnight
+            if (end < start)
+            {
+                return currentTime >= start || currentTime <= end;
+            }
+            else
+            {
+                return currentTime >= start && currentTime <= end;
+            }
+        }
+
+        private bool EvaluateBatteryTrigger(TriggerConfig config)
+        {
+            if (!config.BatteryThreshold.HasValue)
+                return false;
+
+            try
+            {
+                var battery = PowerStatusHelper.GetBatteryLifePercent();
+                // Null means unknown (no battery / sensor failure), which would otherwise make
+                // any "above" rule fire permanently.
+                if (battery == null)
+                    return false;
+
+                var threshold = config.BatteryThreshold.Value;
+
+                return config.BatteryCondition?.ToLowerInvariant() switch
+                {
+                    "below" => battery < threshold,
+                    "above" => battery > threshold,
+                    _ => false
+                };
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool EvaluateACPowerTrigger(TriggerConfig config)
+        {
+            if (!config.ACConnected.HasValue)
+                return false;
+
+            try
+            {
+                var isACConnected = PowerStatusHelper.IsAcPowerOnline();
+                return isACConnected == config.ACConnected.Value;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool EvaluateTemperatureTrigger(TriggerConfig config)
+        {
+            if (!config.TemperatureThreshold.HasValue || _thermalProvider == null)
+                return false;
+
+            try
+            {
+                var temps = _thermalProvider.ReadTemperatures();
+                var sensor = config.TemperatureSensor?.ToLowerInvariant() ?? "cpu";
+                
+                var reading = temps.FirstOrDefault(t => 
+                    t.Sensor.ToLowerInvariant().Contains(sensor));
+
+                if (reading == null || string.IsNullOrEmpty(reading.Sensor) || reading.Celsius <= 0)
+                    return false;
+
+                var threshold = config.TemperatureThreshold.Value;
+
+                return config.TemperatureCondition?.ToLowerInvariant() switch
+                {
+                    "above" => reading.Celsius > threshold,
+                    "below" => reading.Celsius < threshold,
+                    _ => false
+                };
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool EvaluateProcessTrigger(TriggerConfig config)
+        {
+            if (string.IsNullOrWhiteSpace(config.ProcessName))
+                return false;
+
+            var activeProcesses = _processMonitor.ActiveProcesses.Values
+                .Select(p => p.ProcessName.ToLowerInvariant())
+                .ToList();
+
+            var targetProcess = config.ProcessName.ToLowerInvariant();
+            return activeProcesses.Any(p => p.Contains(targetProcess) || targetProcess.Contains(p));
+        }
+
+        private bool EvaluateIdleTrigger(TriggerConfig config)
+        {
+            if (!config.IdleMinutes.HasValue)
+                return false;
+
+            try
+            {
+                // Get last input time from Windows
+                var lastInputInfo = new LASTINPUTINFO { cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(LASTINPUTINFO)) };
+                if (!GetLastInputInfo(ref lastInputInfo))
+                    return false;
+
+                // Use TickCount64 truncated to uint so unsigned subtraction wraps correctly
+                // regardless of system uptime (Environment.TickCount overflows after ~24.9 days).
+                var idleTime = TimeSpan.FromMilliseconds((uint)Environment.TickCount64 - lastInputInfo.dwTime);
+                return idleTime.TotalMinutes >= config.IdleMinutes.Value;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool EvaluateWiFiTrigger(TriggerConfig config)
+        {
+            if (string.IsNullOrWhiteSpace(config.WiFiSSID))
+                return false;
+
+            return WlanSsidHelper.TryGetCurrentConnectedSsid(out var connectedSsid)
+                && string.Equals(connectedSsid, config.WiFiSSID, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool EvaluateLidTrigger(TriggerConfig config)
+        {
+            if (!config.LidClosed.HasValue)
+                return false;
+
+            // Fails closed (false) rather than firing on an assumed state when no lid-change
+            // notification has been observed yet, or on a desktop with no lid at all - matching
+            // every other trigger's "unknown means don't fire" convention in this file.
+            var currentLidClosed = LidSwitchMonitor.IsLidClosed;
+            return currentLidClosed.HasValue && currentLidClosed.Value == config.LidClosed.Value;
+        }
+
+        private void ExecuteActions(AutomationRule rule)
+        {
+            foreach (var action in rule.Actions)
+            {
+                try
+                {
+                    ExecuteAction(action);
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error($"Error executing action {action.Type} for rule {rule.Name}: {ex.Message}");
+                }
+            }
+        }
+
+        private void ExecuteAction(RuleAction action)
+        {
+            switch (action.Type)
+            {
+                case ActionType.SetFanPreset:
+                    if (!string.IsNullOrWhiteSpace(action.Parameter))
+                    {
+                        var config = _configService.Config;
+                        var preset = config.FanPresets?.FirstOrDefault(p =>
+                            string.Equals(p.Name, action.Parameter, StringComparison.OrdinalIgnoreCase));
+                        if (preset != null)
+                        {
+                            _fanService.ApplyPreset(preset);
+                            _logger.Info($"Applied fan preset: {action.Parameter}");
+                        }
+                    }
+                    break;
+
+                case ActionType.SetPerformanceMode:
+                    if (!string.IsNullOrWhiteSpace(action.Parameter) && _performanceModeService != null)
+                    {
+                        _performanceModeService.SetPerformanceMode(action.Parameter);
+                        _logger.Info($"Applied performance mode: {action.Parameter}");
+                    }
+                    break;
+
+                case ActionType.SetGpuOcProfile:
+                    if (!string.IsNullOrWhiteSpace(action.Parameter) && _nvapiService != null)
+                    {
+                        var config = _configService.Config;
+                        var ocProfile = config.GpuOcProfiles?.FirstOrDefault(p =>
+                            string.Equals(p.Name, action.Parameter, StringComparison.OrdinalIgnoreCase));
+                        if (ocProfile != null)
+                        {
+                            _nvapiService.SetCoreClockOffset(ocProfile.CoreClockOffsetMHz);
+                            _nvapiService.SetMemoryClockOffset(ocProfile.MemoryClockOffsetMHz);
+                            _nvapiService.SetPowerLimit(ocProfile.PowerLimitPercent);
+                            _nvapiService.SetVoltageOffset(ocProfile.VoltageOffsetMv);
+                            _logger.Info($"Applied GPU OC profile: {action.Parameter}");
+                        }
+                    }
+                    break;
+
+                case ActionType.SetAmdStapmLimit:
+                    if (action.NumericParameter.HasValue && _undervoltService?.Provider is AmdUndervoltProvider amdProvider)
+                    {
+                        amdProvider.SetStapmLimit((uint)action.NumericParameter.Value * 1000); // W to mW
+                        _logger.Info($"Applied AMD STAPM limit: {action.NumericParameter.Value}W");
+                    }
+                    break;
+
+                case ActionType.SetAmdTempLimit:
+                    if (action.NumericParameter.HasValue && _undervoltService?.Provider is AmdUndervoltProvider amdProvider2)
+                    {
+                        amdProvider2.SetTctlTemp((uint)action.NumericParameter.Value);
+                        _logger.Info($"Applied AMD temp limit: {action.NumericParameter.Value}°C");
+                    }
+                    break;
+
+                case ActionType.ShowNotification:
+                    if (!string.IsNullOrWhiteSpace(action.Parameter))
+                    {
+                        // Would integrate with notification service if available
+                        _logger.Info($"Notification: {action.Parameter}");
+                    }
+                    break;
+            }
+        }
+
+        // P/Invoke for idle time detection
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct LASTINPUTINFO
+        {
+            public uint cbSize;
+            public uint dwTime;
+        }
+
+        public void Dispose()
+        {
+            Stop();
+            _evaluationTimer.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Event args for rule triggered event
+    /// </summary>
+    public class RuleTriggeredEventArgs : EventArgs
+    {
+        public AutomationRule Rule { get; }
+
+        public RuleTriggeredEventArgs(AutomationRule rule)
+        {
+            Rule = rule;
+        }
+    }
+
+    public static class AutomationRuleSchemaValidator
+    {
+        public static IReadOnlyList<TriggerType> SupportedTriggerTypes { get; } = new[]
+        {
+            TriggerType.Time,
+            TriggerType.Battery,
+            TriggerType.ACPower,
+            TriggerType.Temperature,
+            TriggerType.Idle,
+            TriggerType.Process,
+            TriggerType.WiFiSSID,
+            TriggerType.LidState
+        };
+
+        public static bool IsSupportedTriggerType(TriggerType triggerType)
+            => SupportedTriggerTypes.Contains(triggerType);
+
+        public static bool TryValidate(AutomationRule rule, out string error)
+        {
+            if (rule == null)
+            {
+                error = "Rule payload is missing.";
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(rule.Name))
+            {
+                error = "Rule name is required.";
+                return false;
+            }
+
+            if (!IsSupportedTriggerType(rule.Trigger))
+            {
+                error = $"Trigger '{rule.Trigger}' is not shipped yet. Supported triggers: Time, Battery, AC power, Temperature, Idle, Process, WiFi SSID, Lid state.";
+                return false;
+            }
+
+            if (rule.Actions == null || rule.Actions.Count == 0)
+            {
+                error = "At least one action is required.";
+                return false;
+            }
+
+            foreach (var action in rule.Actions)
+            {
+                if (action.Type == ActionType.SetFanPreset || action.Type == ActionType.SetPerformanceMode || action.Type == ActionType.ShowNotification)
+                {
+                    if (string.IsNullOrWhiteSpace(action.Parameter))
+                    {
+                        error = $"Action '{action.Type}' requires a text parameter.";
+                        return false;
+                    }
+                }
+            }
+
+            switch (rule.Trigger)
+            {
+                case TriggerType.Time:
+                    if (!rule.TriggerData.StartTime.HasValue || !rule.TriggerData.EndTime.HasValue)
+                    {
+                        error = "Time rules require both start and end time.";
+                        return false;
+                    }
+                    break;
+
+                case TriggerType.Battery:
+                    if (!rule.TriggerData.BatteryThreshold.HasValue ||
+                        rule.TriggerData.BatteryThreshold.Value < 1 ||
+                        rule.TriggerData.BatteryThreshold.Value > 100)
+                    {
+                        error = "Battery rules require a threshold between 1 and 100.";
+                        return false;
+                    }
+
+                    if (!string.Equals(rule.TriggerData.BatteryCondition, "Below", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(rule.TriggerData.BatteryCondition, "Above", StringComparison.OrdinalIgnoreCase))
+                    {
+                        error = "Battery rules require condition 'Below' or 'Above'.";
+                        return false;
+                    }
+                    break;
+
+                case TriggerType.ACPower:
+                    if (!rule.TriggerData.ACConnected.HasValue)
+                    {
+                        error = "AC power rules must specify connected or disconnected.";
+                        return false;
+                    }
+                    break;
+
+                case TriggerType.Temperature:
+                    if (!rule.TriggerData.TemperatureThreshold.HasValue ||
+                        rule.TriggerData.TemperatureThreshold.Value < 1 ||
+                        rule.TriggerData.TemperatureThreshold.Value > 110)
+                    {
+                        error = "Temperature rules require a threshold between 1 and 110°C.";
+                        return false;
+                    }
+
+                    if (!string.Equals(rule.TriggerData.TemperatureCondition, "Above", StringComparison.OrdinalIgnoreCase) &&
+                        !string.Equals(rule.TriggerData.TemperatureCondition, "Below", StringComparison.OrdinalIgnoreCase))
+                    {
+                        error = "Temperature rules require condition 'Above' or 'Below'.";
+                        return false;
+                    }
+                    // TemperatureSensor is deliberately not required here - EvaluateTemperatureTrigger
+                    // already defaults a null/empty sensor to "cpu", matching every other optional
+                    // field in this validator that has a safe runtime default.
+                    break;
+
+                case TriggerType.Idle:
+                    if (!rule.TriggerData.IdleMinutes.HasValue ||
+                        rule.TriggerData.IdleMinutes.Value < 1 ||
+                        rule.TriggerData.IdleMinutes.Value > 999)
+                    {
+                        error = "Idle rules require a threshold between 1 and 999 minutes.";
+                        return false;
+                    }
+                    break;
+
+                case TriggerType.Process:
+                    if (string.IsNullOrWhiteSpace(rule.TriggerData.ProcessName))
+                    {
+                        error = "Process rules require an executable name.";
+                        return false;
+                    }
+                    break;
+
+                case TriggerType.WiFiSSID:
+                    if (string.IsNullOrWhiteSpace(rule.TriggerData.WiFiSSID))
+                    {
+                        error = "WiFi rules require an SSID.";
+                        return false;
+                    }
+                    break;
+
+                case TriggerType.LidState:
+                    if (!rule.TriggerData.LidClosed.HasValue)
+                    {
+                        error = "Lid state rules must specify open or closed.";
+                        return false;
+                    }
+                    break;
+            }
+
+            error = string.Empty;
+            return true;
+        }
+    }
+}
