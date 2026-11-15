@@ -1040,10 +1040,10 @@ namespace OmenCore
             while (current != null)
             {
                 yield return Path.Combine(current.FullName, "OmenCore.HardwareWorker.exe");
-                yield return Path.Combine(current.FullName, "src", "OmenCore.HardwareWorker", "bin", "Release", "net8.0-windows", "OmenCore.HardwareWorker.exe");
-                yield return Path.Combine(current.FullName, "src", "OmenCore.HardwareWorker", "bin", "Release", "net8.0-windows", "win-x64", "OmenCore.HardwareWorker.exe");
-                yield return Path.Combine(current.FullName, "src", "OmenCore.HardwareWorker", "bin", "Debug", "net8.0-windows", "OmenCore.HardwareWorker.exe");
-                yield return Path.Combine(current.FullName, "src", "OmenCore.HardwareWorker", "bin", "Debug", "net8.0-windows", "win-x64", "OmenCore.HardwareWorker.exe");
+                yield return Path.Combine(current.FullName, "src", "OmenCore.HardwareWorker", "bin", "Release", "net10.0-windows", "OmenCore.HardwareWorker.exe");
+                yield return Path.Combine(current.FullName, "src", "OmenCore.HardwareWorker", "bin", "Release", "net10.0-windows", "win-x64", "OmenCore.HardwareWorker.exe");
+                yield return Path.Combine(current.FullName, "src", "OmenCore.HardwareWorker", "bin", "Debug", "net10.0-windows", "OmenCore.HardwareWorker.exe");
+                yield return Path.Combine(current.FullName, "src", "OmenCore.HardwareWorker", "bin", "Debug", "net10.0-windows", "win-x64", "OmenCore.HardwareWorker.exe");
                 yield return Path.Combine(current.FullName, "publish", "win-x64", "OmenCore.HardwareWorker.exe");
                 current = current.Parent;
             }

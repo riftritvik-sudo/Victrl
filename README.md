@@ -10,7 +10,7 @@ This computer reports Victus board `8DD0`. OmenCore's model database includes th
 
 ## Build
 
-On Windows with the .NET 8 SDK installed:
+On Windows with the .NET 10 SDK installed:
 
 ```powershell
 dotnet build src/OmenCoreApp/OmenCoreApp.csproj -c Release

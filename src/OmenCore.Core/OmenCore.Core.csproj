@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>OmenCore.Core</AssemblyName>
@@ -12,7 +12,7 @@
     Hardware/service layer extracted out of OmenCoreApp (see docs/ROADMAP_v4.2.1.md,
     "v4.3.0 candidate slate" item 1). No UseWPF here - that's the entire point: this is the
     dependency a Windows CLI or a local HTTP/named-pipe control API can reference without
-    dragging WPF into a console app. Targets the same net8.0-windows10.0.19041.0 as
+    dragging WPF into a console app. Targets the same net10.0-windows10.0.19041.0 as
     OmenCoreApp (not plain net8.0-windows) because a couple of services fall back to WinRT
     (Windows.Devices.Power.Battery) when the primary detection path fails - that projection
     needs the Windows SDK-versioned TFM, which is unrelated to WPF.

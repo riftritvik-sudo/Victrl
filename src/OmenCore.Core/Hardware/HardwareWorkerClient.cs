@@ -379,11 +379,11 @@ namespace OmenCore.Hardware
                 return workerPath;
             
             // Check debug/dev paths
-            var devPath = Path.Combine(appDir, "..", "..", "..", "OmenCore.HardwareWorker", "bin", "Release", "net8.0-windows", WorkerExeName);
+            var devPath = Path.Combine(appDir, "..", "..", "..", "OmenCore.HardwareWorker", "bin", "Release", "net10.0-windows", WorkerExeName);
             if (File.Exists(devPath))
                 return Path.GetFullPath(devPath);
             
-            devPath = Path.Combine(appDir, "..", "..", "..", "OmenCore.HardwareWorker", "bin", "Debug", "net8.0-windows", WorkerExeName);
+            devPath = Path.Combine(appDir, "..", "..", "..", "OmenCore.HardwareWorker", "bin", "Debug", "net10.0-windows", WorkerExeName);
             if (File.Exists(devPath))
                 return Path.GetFullPath(devPath);
             
